@@ -1,0 +1,17 @@
+.git
+.gitignore
+build
+build-cuda
+build-cuda-work
+build-cuda-new
+build-cuda-docker
+build-cuda-local
+build-cuda-patch
+Testing
+weights
+ref
+dist
+.cache
+.venv
+**/__pycache__
+**/*.pyc

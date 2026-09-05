@@ -1,0 +1,16 @@
+/build/
+/build-cuda/
+/build-cuda-*/
+/build-cuda-work/
+/build-cuda-new/
+/build-cuda-patch/
+/Testing/
+/dist/
+/weights/
+/models/
+/ref/
+/.cache/
+/.venv/
+__pycache__/
+*.py[cod]
+compile_commands.json

@@ -1,0 +1,37 @@
+# Optional legacy Pixal3D/PyTorch reference environment.
+# Keep this separate from the C++ image because the Python dependencies are
+# large and are not needed to compile the ggml scaffold.
+
+ARG PYTHON_IMAGE=nvidia/cuda:12.4.1-devel-ubuntu22.04
+FROM ${PYTHON_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        python3 \
+        python3-pip \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+WORKDIR /workspace
+COPY ref/Pixal3D/requirements.txt /tmp/pixal3d-requirements.txt
+
+# Opt in explicitly because this pulls large CUDA/PyTorch and third-party
+# wheels. The image remains useful as a shell without installing them.
+ARG INSTALL_PIXAL3D_DEPS=OFF
+RUN if [ "${INSTALL_PIXAL3D_DEPS}" = "ON" ]; then \
+        pip install --upgrade pip && \
+        pip install --no-cache-dir -r /tmp/pixal3d-requirements.txt; \
+    fi
+
+COPY . .
+WORKDIR /workspace/ref/Pixal3D
+CMD ["bash"]
