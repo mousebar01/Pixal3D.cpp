@@ -1,4 +1,5 @@
 #include "pixal3d/pipeline.h"
+#include "pixal3d/mesh_topology.h"
 
 #include <array>
 #include <cmath>
@@ -78,6 +79,33 @@ bool quantize_at_resolution(const SparseTensorF32 & input,
 }
 
 } // namespace
+
+bool normalize_slat_f32(
+    const SparseTensorF32 & input,
+    const SLatNormalizationF32 & normalization,
+    SparseTensorF32 & output,
+    std::string * error) {
+    output = SparseTensorF32{};
+    if (!input.valid(error) || !valid_normalization(normalization, input.channels, error)) {
+        return false;
+    }
+    output = input;
+    for (std::size_t point = 0; point < output.points(); ++point) {
+        float * row = output.feats.data() + point * static_cast<std::size_t>(output.channels);
+        for (int channel = 0; channel < output.channels; ++channel) {
+            const std::size_t index = static_cast<std::size_t>(channel);
+            const float value = (row[channel] - normalization.mean[index]) /
+                                normalization.std[index];
+            if (!std::isfinite(value)) {
+                output = SparseTensorF32{};
+                set_error(error, "SLat normalization produced a non-finite value");
+                return false;
+            }
+            row[channel] = value;
+        }
+    }
+    return true;
+}
 
 bool run_slat_stage_f32(
     SLatFlowModel & flow_model,
@@ -495,10 +523,16 @@ bool run_pixal3d_cascade_f32(
                          texture_condition, error)) return false;
     std::cerr << "pixal3d: texture_1024 SLat flow points="
               << output.high_coords.size() / 4 << std::endl;
+    SparseTensorF32 texture_shape_condition;
+    if (!normalize_slat_f32(output.shape_slat_high.latent,
+                            config.shape_normalization,
+                            texture_shape_condition, error)) {
+        return false;
+    }
     if (!run_slat_stage_f32(texture_flow, texture_noise, texture_condition,
                             config.texture_sampler, config.texture_normalization,
                             output.texture_slat, error,
-                            &output.shape_slat_high.latent)) return false;
+                            &texture_shape_condition)) return false;
 
     if (!shape_decoder.decode(output.shape_slat_high.latent, nullptr,
                               output.shape_decoded, &output.shape_subdivisions, error)) {
@@ -519,6 +553,13 @@ bool run_pixal3d_cascade_f32(
     if (!flexi_dual_grid_decode_mesh_f32(
             output.shape_decoded, output.resolution, config.voxel_margin,
             output.meshes, error)) return false;
+    for (DualGridMeshF32 & mesh : output.meshes) {
+        std::string hole_error;
+        if (!fill_mesh_holes_f32(mesh, 3.0e-2f, &hole_error)) {
+            set_error(error, "mesh hole filling failed: " + hole_error);
+            return false;
+        }
+    }
     return true;
 }
 

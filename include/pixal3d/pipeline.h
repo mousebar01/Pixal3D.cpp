@@ -44,6 +44,14 @@ struct SLatNormalizationF32 {
     std::vector<float> std;
 };
 
+// Convert a denormalized SLat tensor back to the normalized representation
+// consumed by a downstream concat-conditioned flow model.
+bool normalize_slat_f32(
+    const SparseTensorF32 & input,
+    const SLatNormalizationF32 & normalization,
+    SparseTensorF32 & output,
+    std::string * error = nullptr);
+
 struct SLatStageOutputF32 {
     FlowEulerSampleF32 flow;
     SparseTensorF32 latent;

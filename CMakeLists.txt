@@ -70,6 +70,7 @@ add_library(pixal3d_core
     src/flow_sampler.cpp
     src/inference.cpp
     src/dual_grid.cpp
+    src/mesh_topology.cpp
     src/pack.cpp
     src/pipeline.cpp
     src/projection.cpp
@@ -230,6 +231,11 @@ if(BUILD_TESTING AND PIXAL3D_BUILD_CLI)
     target_compile_features(pixal3d_dual_grid_fixture PRIVATE cxx_std_17)
     target_link_libraries(pixal3d_dual_grid_fixture PRIVATE pixal3d_core)
     add_test(NAME pixal3d_dual_grid_fixture COMMAND pixal3d_dual_grid_fixture)
+    add_executable(pixal3d_mesh_topology_test tests/mesh_topology_test.cpp)
+    target_compile_features(pixal3d_mesh_topology_test PRIVATE cxx_std_17)
+    target_link_libraries(pixal3d_mesh_topology_test PRIVATE pixal3d_core)
+    add_test(NAME pixal3d_mesh_topology COMMAND pixal3d_mesh_topology_test)
+    set_tests_properties(pixal3d_mesh_topology PROPERTIES LABELS "unit;cpu")
     add_executable(pixal3d_sparse_transformer_fixture
         tests/sparse_transformer_numeric_fixture.cpp)
     target_compile_features(pixal3d_sparse_transformer_fixture PRIVATE cxx_std_17)

@@ -401,13 +401,18 @@ def main() -> int:
     texture_noise = stage_noise("texture_slat", high_coords, 3, 64)
     texture_global, texture_projected = stage_condition("texture_slat", high_coords, 64)
     with torch.no_grad():
+        # The texture flow consumes the shape latent in normalized space;
+        # shape decoding below still uses the denormalized high_latent.
+        texture_shape_condition = high_latent.replace(
+            (high_latent.feats - torch.from_numpy(SHAPE_MEAN)) /
+            torch.from_numpy(SHAPE_STD))
         tex_sample = sampler.sample(
             texture_flow, texture_noise,
             (texture_global, texture_projected),
             (texture_global.replace(torch.zeros_like(texture_global.feats)),
              texture_projected.replace(torch.zeros_like(texture_projected.feats))),
             steps=1, rescale_t=1.0, guidance_strength=1.0,
-            concat_cond=high_latent, verbose=False)
+            concat_cond=texture_shape_condition, verbose=False)
         tex_latent = tex_sample.samples.replace(
             tex_sample.samples.feats * torch.from_numpy(TEXTURE_STD) + torch.from_numpy(TEXTURE_MEAN))
         shape_decoded, shape_subs = shape_decoder(high_latent, return_subs=True)

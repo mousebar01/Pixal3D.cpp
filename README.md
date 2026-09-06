@@ -251,10 +251,10 @@ keep CPU, CUDA, and container build directories separate.
 ## Tests and validation
 
 CTest is authoritative for registered tests. The default testing build
-registers 18 tests covering CLI startup, projection, flow primitives and
+registers 19 tests covering CLI startup, projection, flow primitives and
 sampler, pack reading, DINO, backend management, image/condition helpers,
-inference utilities, occupancy coordinates, Dual Grid, and the registered SLat
-fixtures. Run them with:
+inference utilities, occupancy coordinates, Dual Grid, bounded mesh hole
+filling, and the registered SLat fixtures. Run them with:
 
 ```sh
 (cd build && ctest --output-on-failure)
@@ -276,6 +276,10 @@ mesh topology near occupancy thresholds are not claimed.
 
 - Wavefront OBJ output contains geometry only. Texture voxel attributes remain
   in memory; material and texture sidecar output is not implemented.
+- Cascade mesh output applies a CPU bounded boundary-loop fan fill matching the
+  observable CuMesh `fill_holes(0.03)` contract. It is not the Python CuMesh
+  implementation and does not include the separate Python remesh/decimation
+  postprocess.
 - Native image inference has no hidden rembg/matting, MoGe camera estimation,
   or Python preprocessing step.
 - GPU execution is partial and capability-driven. `auto` uses scheduler-managed
