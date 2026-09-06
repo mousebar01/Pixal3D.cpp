@@ -1,5 +1,6 @@
 #include "pixal3d/ss_flow.h"
 
+#include "pixal3d/backend.h"
 #include "pixal3d/flow.h"
 #include "pixal3d/pack.h"
 
@@ -115,23 +116,6 @@ SparseTensorF32 zero_sparse_like(const SparseTensorF32 & input) {
     return output;
 }
 
-ggml_backend_t init_best_backend(std::string & name_out) {
-    for (std::size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t device = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-            continue;
-        }
-        ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
-        if (backend) {
-            const char * description = ggml_backend_dev_description(device);
-            name_out = description ? description : ggml_backend_dev_name(device);
-            return backend;
-        }
-    }
-    name_out = "CPU";
-    return ggml_backend_cpu_init();
-}
-
 bool prefix_name(const std::string & name, const char * prefix) {
     const std::size_t length = std::strlen(prefix);
     return name.size() >= length && name.compare(0, length, prefix) == 0;
@@ -200,7 +184,7 @@ struct SSFlowModel::Impl {
     Pixal3DPackReader reader;
     SSFlowHParams hp;
     ggml_context * weights_ctx = nullptr;
-    ggml_backend_t backend = nullptr;
+    BackendManager backend_manager;
     ggml_backend_buffer_t weights_buffer = nullptr;
     std::string backend_name;
     bool has_data = false;
@@ -215,10 +199,7 @@ struct SSFlowModel::Impl {
             ggml_backend_buffer_free(weights_buffer);
             weights_buffer = nullptr;
         }
-        if (backend) {
-            ggml_backend_free(backend);
-            backend = nullptr;
-        }
+        backend_manager.close();
         if (weights_ctx) {
             ggml_free(weights_ctx);
             weights_ctx = nullptr;
@@ -304,13 +285,13 @@ bool SSFlowModel::load(const std::string & path,
     }
 
     if (load_tensors) {
-        impl->backend = init_best_backend(impl->backend_name);
-        if (!impl->backend) {
-            set_error(error, "failed to initialize ggml backend");
+        if (!impl->backend_manager.initialize_from_environment(
+                "PIXAL3D_SS_FLOW_BACKEND", error)) {
             return false;
         }
+        impl->backend_name = impl->backend_manager.primary_name();
         impl->weights_buffer = ggml_backend_alloc_ctx_tensors(
-            impl->weights_ctx, impl->backend);
+            impl->weights_ctx, impl->backend_manager.primary());
         if (!impl->weights_buffer) {
             set_error(error, "failed to allocate SS-flow weights on backend " +
                              impl->backend_name);
@@ -318,6 +299,9 @@ bool SSFlowModel::load(const std::string & path,
         }
         ggml_backend_buffer_set_usage(impl->weights_buffer,
                                       GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        impl->backend_manager.log_buffer(
+            "weights_allocated", impl->backend_manager.primary(),
+            ggml_backend_buffer_get_size(impl->weights_buffer));
         std::vector<std::uint8_t> payload;
         for (const Pixal3DTensorInfo & info : impl->reader.info().tensors) {
             if (!prefix_name(info.name, "ss.")) {
@@ -666,17 +650,18 @@ bool SSFlowModel::forward(const float * x,
         return false;
     }
     ggml_build_forward_expand(graph, result);
-    ggml_gallocr_t allocator = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(impl_->backend));
-    if (!allocator || !ggml_gallocr_alloc_graph(allocator, graph)) {
-        if (allocator) ggml_gallocr_free(allocator);
+    std::string scheduler_error;
+    BackendScheduler scheduler(impl_->backend_manager, 32768, false, true,
+                                &scheduler_error, "SS-flow");
+    if (!scheduler.valid() ||
+        (impl_->backend_manager.requires_primary_backend() &&
+         !scheduler.require_primary_graph(graph, &scheduler_error)) ||
+        !scheduler.allocate_graph(graph, &scheduler_error)) {
         ggml_free(ctx);
-        set_error(error, "failed to allocate SS-flow compute graph");
+        set_error(error, "failed to allocate SS-flow compute graph: " + scheduler_error);
         return false;
     }
-    if (ggml_backend_is_cpu(impl_->backend)) {
-        ggml_backend_cpu_set_n_threads(impl_->backend, 4);
-    }
+    impl_->backend_manager.set_n_threads(4);
     ggml_backend_tensor_set(x_t, x, 0,
                             static_cast<std::size_t>(hp.in_channels) * points * sizeof(float));
     ggml_backend_tensor_set(temb, embedding.data(), 0, embedding.size() * sizeof(float));
@@ -692,16 +677,15 @@ bool SSFlowModel::forward(const float * x,
                                 static_cast<std::size_t>(projected_channels) * points *
                                 sizeof(float));
     }
-    const ggml_status status = ggml_backend_graph_compute(impl_->backend, graph);
+    const ggml_status status = scheduler.compute(graph, &scheduler_error);
     bool ok = status == GGML_STATUS_SUCCESS;
     if (ok) {
         ggml_backend_tensor_get(result, out, 0,
                                 static_cast<std::size_t>(hp.out_channels) * points *
                                 sizeof(float));
     } else {
-        set_error(error, "SS-flow graph compute failed");
+        set_error(error, "SS-flow graph compute failed: " + scheduler_error);
     }
-    ggml_gallocr_free(allocator);
     ggml_free(ctx);
     return ok;
 }

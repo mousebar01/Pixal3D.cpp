@@ -84,6 +84,44 @@ For model or numerical changes, use this order:
 Do not hide a numerical mismatch behind a relaxed threshold. Explain the
 source of the mismatch and record the chosen tolerance.
 
+### Backend policy and multi-backend execution
+
+Use ggml's backend registry as the only source of device discovery. New model
+code must not enumerate CUDA, CPU, or other backends with separate hard-coded
+selection loops. The shared backend manager must:
+
+- expose an explicit policy: `auto`, `cpu`, or `gpu:<index>`; future
+  accelerators must be additive rather than changing the meaning of `cpu`;
+- enumerate devices with `ggml_backend_dev_count()`, report device type and
+  description, and treat GPU, IGPU, ACCEL, and CPU as distinct device classes;
+- always keep a CPU backend available as the final fallback;
+- make forced modes fail loudly when the requested backend is unavailable or
+  does not support the graph, while `auto` may fall back only after logging the
+  reason;
+- return the selected backend list and policy to every pipeline stage so that
+  backend choice is not hidden in a model constructor.
+
+Production graphs must use `ggml_backend_sched` for placement, allocation, and
+cross-backend copies. Model code should build the graph once, allocate or size
+the scheduler buffers once, compute through the scheduler, and reset/reuse it
+per invocation. Direct calls to `ggml_backend_graph_compute()` are restricted
+to small isolated probes and temporary migration code; do not add new direct
+backend paths. Existing direct paths are migration debt and must be listed in
+the change summary until they are moved behind the shared scheduler.
+
+Weights must be placed according to backend capability. Before assigning a
+weight buffer, check the required operation with `ggml_backend_dev_supports_op`
+or the equivalent ggml backend API. Unsupported operations must be reported
+with the stage, operation, tensor, and backend name; never silently assume that
+all GPU backends implement the same operation set.
+
+Every backend initialization and graph execution must log the policy,
+selected device/backend, weight-buffer sizes, compute-buffer sizes, and any
+fallback. Backend options and compile definitions must be verified against the
+pinned official ggml commit; an option whose macro or API is absent upstream
+must be removed, marked unsupported, or covered by an explicit downstream
+patch and test.
+
 ### Precision policy
 
 Keep these two decisions separate:
@@ -131,6 +169,11 @@ the actual converter argument and the metadata inspection output.
   or API invariants there.
 - Maintain CPU portability. Backend-specific code must have a clear fallback
   or an explicit build-time requirement.
+
+Do not put backend-specific `#ifdef` branches in model math when a ggml
+backend API or scheduler can express the same behavior. Backend-specific code
+belongs in the backend manager, build configuration, or a narrowly scoped
+capability probe.
 
 ggml conventions are part of the API, not implementation details:
 
@@ -191,6 +234,46 @@ equivalent C++ test replaces it. When porting a module:
 Projection attention, sparse tensors, 3D convolutions, pixel shuffle, and
 RoPE are high-risk areas. Do not substitute a superficially similar ggml
 operation without a reference comparison.
+
+## Test taxonomy and CI
+
+CTest is the authoritative list of automated tests. Every fixture executable
+that is intended to be a regression test must have a matching `add_test()`;
+building a `*_fixture` target without registering it does not count as test
+coverage. Assign stable labels to each test, at minimum:
+
+- `unit`: no model files, network, GPU, or nondeterministic input;
+- `loader`: GGUF metadata, tensor names, layout, dtype, and truncated-file
+  rejection;
+- `parity`: a fixed fixture compared with the Python oracle or a golden F32
+  result;
+- `cpu` and `cuda`: tests that explicitly force the corresponding backend;
+- `integration`: real model or image smoke tests, allowed to be skipped when
+  declared assets are absent.
+
+Keep tests in progressively more expensive tiers:
+
+1. cheap unit and shape/finite checks run on every build;
+2. loader and component numerical fixtures run on CPU with deterministic
+   inputs and recorded fingerprints;
+3. CPU/CUDA (and later other backend) parity uses the same graph, input, seed,
+   and explicitly documented tolerances;
+4. real-weight/image smoke tests check finite values and mesh structural gates;
+5. quality and performance benchmarks remain separate from the default CTest
+   pass and record backend, device, timings, memory, and output checksums.
+
+Forced CPU and forced GPU tests must be separate from `auto` tests. `auto`
+must never hide a failed GPU path by making the only test pass on CPU. Tests
+that need downloaded models must declare their asset requirement and be
+filterable by label, following the `ctest -L <label>` pattern used by
+whisper.cpp.
+
+CI must keep a portable CPU job as the required baseline, then add backend
+jobs for CUDA and other enabled backends when the runner provides them. At
+minimum, exercise one Debug and one Release build, a sanitizer job, and the
+configured backend's CTest labels. Docker images may provide reproducible
+backend build environments, but an image build is not a numerical or runtime
+parity test.
 
 ## Docker and local development
 

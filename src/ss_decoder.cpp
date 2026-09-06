@@ -1,5 +1,6 @@
 #include "pixal3d/ss_decoder.h"
 
+#include "pixal3d/backend.h"
 #include "pixal3d/pack.h"
 
 #include "ggml-alloc.h"
@@ -44,6 +45,11 @@ bool checked_cube(int resolution, std::size_t & points, std::string * error) {
     return true;
 }
 
+bool checked_cube(int resolution, std::string * error) {
+    std::size_t points = 0;
+    return checked_cube(resolution, points, error);
+}
+
 bool sparse_dense_to_channel_major(const SparseTensorF32 & latent,
                                    int resolution,
                                    int channels,
@@ -82,60 +88,6 @@ bool sparse_dense_to_channel_major(const SparseTensorF32 & latent,
         }
     }
     return true;
-}
-
-ggml_backend_t init_best_backend(std::string & name_out) {
-    for (std::size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t device = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
-        ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
-        if (!backend) continue;
-
-        // The SS decoder graph contains 3-D convolutions.  The direct Conv3D
-        // op is not implemented by every ggml GPU backend, but the equivalent
-        // im2col-3d plus matmul recipe is widely available.  Probe both
-        // primitive nodes before committing the model weights to a GPU
-        // buffer; otherwise fall back cleanly to the CPU backend.
-        ggml_init_params params{};
-        params.mem_size = ggml_tensor_overhead() * 4 + 4096;
-        params.mem_buffer = nullptr;
-        params.no_alloc = true;
-        ggml_context * context = ggml_init(params);
-        bool supports_conv3d = false;
-        if (context) {
-            ggml_tensor * weight = ggml_new_tensor_4d(context, GGML_TYPE_F32,
-                                                       3, 3, 3, 1);
-            ggml_tensor * input = ggml_new_tensor_4d(context, GGML_TYPE_F32,
-                                                      4, 4, 4, 1);
-            ggml_tensor * im2col = weight && input
-                ? ggml_im2col_3d(context, weight, input, 1,
-                                 1, 1, 1, 0, 0, 0, 1, 1, 1, GGML_TYPE_F32)
-                : nullptr;
-            ggml_tensor * im2col_matrix = im2col
-                ? ggml_reshape_2d(context, im2col, im2col->ne[0],
-                                  im2col->ne[1] * im2col->ne[2] * im2col->ne[3])
-                : nullptr;
-            ggml_tensor * weight_matrix = weight
-                ? ggml_reshape_2d(context, weight,
-                                  weight->ne[0] * weight->ne[1] * weight->ne[2],
-                                  weight->ne[3])
-                : nullptr;
-            ggml_tensor * product = weight_matrix && im2col_matrix
-                ? ggml_mul_mat(context, weight_matrix, im2col_matrix) : nullptr;
-            supports_conv3d = im2col && product &&
-                ggml_backend_supports_op(backend, im2col) &&
-                ggml_backend_supports_op(backend, product);
-            ggml_free(context);
-        }
-        if (supports_conv3d) {
-            const char * description = ggml_backend_dev_description(device);
-            name_out = description ? description : ggml_backend_dev_name(device);
-            return backend;
-        }
-        ggml_backend_free(backend);
-    }
-    name_out = "CPU";
-    return ggml_backend_cpu_init();
 }
 
 bool read_hparams(const Pixal3DPackReader & reader,
@@ -178,8 +130,7 @@ bool read_hparams(const Pixal3DPackReader & reader,
         }
         hp.channels.push_back(static_cast<int>(value));
     }
-    std::size_t ignored = 0;
-    return checked_cube(hp.resolution, ignored, error);
+    return checked_cube(hp.resolution, error);
 }
 
 } // namespace
@@ -197,8 +148,7 @@ bool ss_occupancy_to_coords_f32(const float * occupancy_logits,
         set_error(error, "invalid occupancy grid arguments");
         return false;
     }
-    std::size_t output_points = 0;
-    if (!checked_cube(output_resolution, output_points, error)) return false;
+    if (!checked_cube(output_resolution, error)) return false;
     const int target = target_resolution <= 0 ? output_resolution : target_resolution;
     if (target <= 0 || target > output_resolution || output_resolution % target != 0) {
         set_error(error, "occupancy target resolution must divide decoder resolution");
@@ -246,7 +196,6 @@ bool ss_occupancy_to_coords_f32(const float * occupancy_logits,
             }
         }
     }
-    (void) output_points;
     return true;
 }
 
@@ -254,7 +203,7 @@ struct SSDecoderModel::Impl {
     Pixal3DPackReader reader;
     SSDecoderHParams hp;
     ggml_context * weights_ctx = nullptr;
-    ggml_backend_t backend = nullptr;
+    BackendManager backend_manager;
     ggml_backend_buffer_t weights_buffer = nullptr;
     std::string backend_name;
     bool has_data = false;
@@ -267,10 +216,7 @@ struct SSDecoderModel::Impl {
             ggml_backend_buffer_free(weights_buffer);
             weights_buffer = nullptr;
         }
-        if (backend) {
-            ggml_backend_free(backend);
-            backend = nullptr;
-        }
+        backend_manager.close();
         if (weights_ctx) {
             ggml_free(weights_ctx);
             weights_ctx = nullptr;
@@ -345,13 +291,13 @@ bool SSDecoderModel::load(const std::string & path,
         impl->tensors.emplace(info.name, tensor);
     }
     if (load_tensors) {
-        impl->backend = init_best_backend(impl->backend_name);
-        if (!impl->backend) {
-            set_error(error, "failed to initialize ggml backend");
+        if (!impl->backend_manager.initialize_from_environment(
+                "PIXAL3D_SS_DECODER_BACKEND", error)) {
             return false;
         }
+        impl->backend_name = impl->backend_manager.primary_name();
         impl->weights_buffer = ggml_backend_alloc_ctx_tensors(
-            impl->weights_ctx, impl->backend);
+            impl->weights_ctx, impl->backend_manager.primary());
         if (!impl->weights_buffer) {
             set_error(error, "failed to allocate ss-decoder weights on backend " +
                              impl->backend_name);
@@ -359,6 +305,9 @@ bool SSDecoderModel::load(const std::string & path,
         }
         ggml_backend_buffer_set_usage(impl->weights_buffer,
                                       GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        impl->backend_manager.log_buffer(
+            "weights_allocated", impl->backend_manager.primary(),
+            ggml_backend_buffer_get_size(impl->weights_buffer));
         std::vector<std::uint8_t> payload;
         for (const Pixal3DTensorInfo & info : impl->reader.info().tensors) {
             if (!prefix_name(info.name, "ss_decoder.")) continue;
@@ -456,14 +405,12 @@ bool SSDecoderModel::decode(const float * latent,
             }
         }
         if (level + 1 < hp.channels.size()) {
-            const int next = hp.channels[level + 1];
             if (!require("blocks." + std::to_string(block) + ".conv.weight") ||
                 !require("blocks." + std::to_string(block) + ".conv.bias")) {
                 set_error(error, "missing ss-decoder tensor: " + missing);
                 return false;
             }
             ++block;
-            (void) next;
         }
     }
 
@@ -500,7 +447,7 @@ bool SSDecoderModel::decode(const float * latent,
                     int channels_in, int channels_out) {
         ggml_tensor * weight = W(local_name + ".weight");
         ggml_tensor * bias = W(local_name + ".bias");
-        if (ggml_backend_is_cpu(impl_->backend)) {
+        if (ggml_backend_is_cpu(impl_->backend_manager.primary())) {
             // The CPU backend has a dedicated Conv3d implementation which
             // accepts the native F16-kernel path.  Keep it for the validated
             // reference/fallback route; only CUDA needs the explicit recipe
@@ -510,15 +457,14 @@ bool SSDecoderModel::decode(const float * latent,
             return ggml_add(ctx, result,
                             ggml_reshape_4d(ctx, bias, 1, 1, 1, channels_out));
         }
-        // Keep the im2col activation matrix in F32 even when the serialized
-        // decoder kernel is F16.  The CUDA im2col kernel supports both types,
-        // but F16 intermediate activations can overflow in the deep decoder
-        // before the following LayerNorm brings them back to scale.  The
-        // weight matrix remains in its stored type and ggml's matmul promotes
-        // the accumulation to F32, matching the CPU Conv3d reference.
+        // The CUDA matmul path requires both operands to have the same
+        // storage dtype.  Keep the source activation tensor in F32, but use
+        // the kernel dtype for the im2col staging tensor, matching ggml's
+        // reference Conv3d recipe.  ggml_mul_mat still returns F32 and is
+        // explicitly configured for F32 accumulation below.
         ggml_tensor * im2col = ggml_im2col_3d(
             ctx, weight, in, channels_in, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-            GGML_TYPE_F32);
+            weight->type);
         ggml_tensor * im2col_matrix = ggml_reshape_2d(
             ctx, im2col, im2col->ne[0],
             im2col->ne[3] * im2col->ne[2] * im2col->ne[1]);
@@ -526,6 +472,7 @@ bool SSDecoderModel::decode(const float * latent,
             ctx, weight, weight->ne[0] * weight->ne[1] * weight->ne[2] *
             channels_in, weight->ne[3] / channels_in);
         ggml_tensor * result = ggml_mul_mat(ctx, im2col_matrix, weight_matrix);
+        ggml_mul_mat_set_prec(result, GGML_PREC_F32);
         const int64_t output_depth = im2col->ne[3] / (in->ne[3] / channels_in);
         result = ggml_reshape_4d(ctx, result,
                                  im2col->ne[1] * im2col->ne[2],
@@ -609,30 +556,30 @@ bool SSDecoderModel::decode(const float * latent,
         return false;
     }
     ggml_build_forward_expand(graph, h);
-    ggml_gallocr_t allocator = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(impl_->backend));
-    if (!allocator || !ggml_gallocr_alloc_graph(allocator, graph)) {
-        if (allocator) ggml_gallocr_free(allocator);
+    std::string scheduler_error;
+    BackendScheduler scheduler(impl_->backend_manager, 8192, false, true,
+                                &scheduler_error, "SS-decoder");
+    if (!scheduler.valid() ||
+        (impl_->backend_manager.requires_primary_backend() &&
+         !scheduler.require_primary_graph(graph, &scheduler_error)) ||
+        !scheduler.allocate_graph(graph, &scheduler_error)) {
         ggml_free(ctx);
-        set_error(error, "failed to allocate ss-decoder compute graph");
+        set_error(error, "failed to allocate ss-decoder compute graph: " + scheduler_error);
         return false;
     }
-    if (ggml_backend_is_cpu(impl_->backend)) {
-        ggml_backend_cpu_set_n_threads(impl_->backend, 4);
-    }
+    impl_->backend_manager.set_n_threads(4);
     ggml_backend_tensor_set(input, latent, 0,
                             static_cast<std::size_t>(hp.latent_channels) *
                             input_points * sizeof(float));
-    const ggml_status status = ggml_backend_graph_compute(impl_->backend, graph);
+    const ggml_status status = scheduler.compute(graph, &scheduler_error);
     bool ok = status == GGML_STATUS_SUCCESS;
     if (ok) {
         ggml_backend_tensor_get(h, output, 0,
                                 static_cast<std::size_t>(hp.out_channels) *
                                 output_points * sizeof(float));
     } else {
-        set_error(error, "ss-decoder graph compute failed");
+        set_error(error, "ss-decoder graph compute failed: " + scheduler_error);
     }
-    ggml_gallocr_free(allocator);
     ggml_free(ctx);
     return ok;
 }

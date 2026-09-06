@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -12,6 +15,69 @@ namespace {
 
 void set_error(std::string * error, const std::string & message) {
     if (error) *error = message;
+}
+
+bool flow_diagnostics_enabled() {
+    const char * value = std::getenv("PIXAL3D_FLOW_NONFINITE_TRACE");
+    return value && *value && std::string(value) != "0";
+}
+
+bool trace_features(const SparseTensorF32 & tensor,
+                    const char * label,
+                    const char * branch,
+                    int step,
+                    float timestep,
+                    std::string * error) {
+    std::size_t nonfinite_count = 0;
+    std::size_t first_nonfinite = 0;
+    float first_value = 0.0f;
+    float minimum = std::numeric_limits<float>::infinity();
+    float maximum = -std::numeric_limits<float>::infinity();
+    float maximum_abs = 0.0f;
+    long double sum = 0.0L;
+    for (std::size_t index = 0; index < tensor.feats.size(); ++index) {
+        const float value = tensor.feats[index];
+        if (!std::isfinite(value)) {
+            if (nonfinite_count == 0) {
+                first_nonfinite = index;
+                first_value = value;
+            }
+            ++nonfinite_count;
+            continue;
+        }
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+        maximum_abs = std::max(maximum_abs, std::fabs(value));
+        sum += static_cast<long double>(value);
+    }
+    const double mean = tensor.feats.empty()
+        ? 0.0
+        : static_cast<double>(sum / static_cast<long double>(tensor.feats.size()));
+    std::cerr << "pixal3d: flow trace step=" << step
+              << " timestep=" << timestep
+              << " branch=" << (branch && *branch ? branch : "unknown")
+              << " tensor=" << (label && *label ? label : "features")
+              << " points=" << tensor.points()
+              << " values=" << tensor.feats.size()
+              << " min=" << (tensor.feats.empty() ? 0.0f : minimum)
+              << " max=" << (tensor.feats.empty() ? 0.0f : maximum)
+              << " max_abs=" << maximum_abs
+              << " mean=" << mean
+              << " nonfinite=" << nonfinite_count;
+    if (nonfinite_count != 0) {
+        std::cerr << " first_bad_index=" << first_nonfinite
+                  << " first_bad_value=" << first_value;
+    }
+    std::cerr << std::endl;
+    if (nonfinite_count != 0) {
+        set_error(error, std::string("flow ") +
+                  (label && *label ? label : "features") +
+                  " contains non-finite values at step " + std::to_string(step) +
+                  " (branch=" + (branch && *branch ? branch : "unknown") +
+                  ", first index=" + std::to_string(first_nonfinite) + ")");
+        return false;
+    }
+    return true;
 }
 
 bool same_shape(const SparseTensorF32 & left, const SparseTensorF32 & right) {
@@ -159,6 +225,10 @@ bool flow_euler_sample_f32(
     }
 
     SparseTensorF32 state = noise;
+    const bool diagnostics = flow_diagnostics_enabled();
+    if (diagnostics && !trace_features(state, "state_before", "initial", -1, 1.0f, error)) {
+        return false;
+    }
     if (config.record_trajectory) {
         output.pred_x_t.reserve(static_cast<std::size_t>(config.steps));
         output.pred_x_0.reserve(static_cast<std::size_t>(config.steps));
@@ -187,31 +257,49 @@ bool flow_euler_sample_f32(
         if (guidance == 1.0f) {
             if (!model(state, 1000.0f * timestep, true, prediction, error) ||
                 !check_model_output(state, prediction, error)) return false;
+            if (diagnostics && !trace_features(prediction, "prediction", "conditional", step,
+                                               timestep, error)) return false;
         } else if (guidance == 0.0f) {
             if (!model(state, 1000.0f * timestep, false, prediction, error) ||
                 !check_model_output(state, prediction, error)) return false;
+            if (diagnostics && !trace_features(prediction, "prediction", "unconditional", step,
+                                               timestep, error)) return false;
         } else {
             SparseTensorF32 positive;
             SparseTensorF32 negative;
             if (!model(state, 1000.0f * timestep, true, positive, error) ||
-                !check_model_output(state, positive, error) ||
-                !model(state, 1000.0f * timestep, false, negative, error) ||
+                !check_model_output(state, positive, error)) return false;
+            if (diagnostics && !trace_features(positive, "prediction", "conditional", step,
+                                               timestep, error)) return false;
+            if (!model(state, 1000.0f * timestep, false, negative, error) ||
                 !check_model_output(state, negative, error)) return false;
+            if (diagnostics && !trace_features(negative, "prediction", "unconditional", step,
+                                               timestep, error)) return false;
             blend_guidance(positive, negative, guidance, prediction);
+            if (diagnostics && !trace_features(prediction, "cfg_blend", "guided", step,
+                                               timestep, error)) return false;
             if (config.guidance_rescale > 0.0f &&
                 !apply_guidance_rescale(state, timestep, config, positive, prediction, error)) {
                 return false;
             }
+            if (diagnostics && config.guidance_rescale > 0.0f &&
+                !trace_features(prediction, "guidance_rescale", "guided", step,
+                                timestep, error)) return false;
         }
 
         SparseTensorF32 x0;
         if (config.record_trajectory) {
             pred_to_xstart(state, timestep, config.sigma_min, prediction, x0);
+            if (diagnostics && !trace_features(x0, "x0", "guided", step, timestep, error)) {
+                return false;
+            }
         }
         const float delta = timestep - next_timestep;
         for (std::size_t index = 0; index < state.feats.size(); ++index) {
             state.feats[index] -= delta * prediction.feats[index];
         }
+        if (diagnostics && !trace_features(state, "state_after", "euler", step,
+                                           next_timestep, error)) return false;
         if (config.record_trajectory) {
             output.pred_x_t.push_back(state);
             output.pred_x_0.push_back(std::move(x0));

@@ -1,5 +1,6 @@
 #include "pixal3d/slat_flow.h"
 
+#include "pixal3d/backend.h"
 #include "pixal3d/flow.h"
 #include "pixal3d/pack.h"
 
@@ -248,6 +249,102 @@ bool slat_flow_forward_f32(
 
 namespace {
 
+struct SLatFiniteProbe {
+    std::string component;
+    std::string error;
+    std::vector<std::uint8_t> raw;
+    std::vector<float> values;
+    std::size_t ordinal = 0;
+    bool bad = false;
+};
+
+bool slat_view_op(enum ggml_op op) noexcept {
+    switch (op) {
+        case GGML_OP_VIEW:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool slat_finite_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * probe = static_cast<SLatFiniteProbe *>(user_data);
+    if (!probe || probe->bad) return false;
+    if (!tensor || tensor->op == GGML_OP_NONE) return false;
+    if (ask) return !slat_view_op(tensor->op);
+    if (slat_view_op(tensor->op)) return true;
+    const std::size_t bytes = ggml_nbytes(tensor);
+    if (bytes == 0) return true;
+    if (!tensor->buffer || !tensor->data || !ggml_is_contiguous(tensor) ||
+        (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 &&
+         tensor->type != GGML_TYPE_BF16)) {
+        probe->bad = true;
+        probe->error = "SLat finite probe cannot inspect tensor " +
+            std::string(ggml_get_name(tensor) && *ggml_get_name(tensor)
+                ? ggml_get_name(tensor) : "<unnamed>") +
+            " type=" + ggml_type_name(tensor->type);
+        return false;
+    }
+    const std::size_t count = static_cast<std::size_t>(ggml_nelements(tensor));
+    if (count == 0) return true;
+    ++probe->ordinal;
+    probe->values.resize(count);
+    if (tensor->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(tensor, probe->values.data(), 0, bytes);
+    } else {
+        probe->raw.resize(bytes);
+        ggml_backend_tensor_get(tensor, probe->raw.data(), 0, bytes);
+        if (tensor->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(probe->raw.data()),
+                                  probe->values.data(), static_cast<std::int64_t>(count));
+        } else {
+            ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(probe->raw.data()),
+                                   probe->values.data(), static_cast<std::int64_t>(count));
+        }
+    }
+    float minimum = std::numeric_limits<float>::infinity();
+    float maximum = -std::numeric_limits<float>::infinity();
+    std::size_t nonfinite = 0;
+    std::size_t first_bad = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        const float value = probe->values[index];
+        if (!std::isfinite(value)) {
+            if (nonfinite == 0) first_bad = index;
+            ++nonfinite;
+        } else {
+            minimum = std::min(minimum, value);
+            maximum = std::max(maximum, value);
+        }
+    }
+    const char * name = ggml_get_name(tensor);
+    const char * backend = tensor->buffer ?
+        ggml_backend_buffer_name(tensor->buffer) : nullptr;
+    std::cerr << "pixal3d: SLat finite probe component=" << probe->component
+              << " ordinal=" << probe->ordinal
+              << " op=" << ggml_op_name(tensor->op)
+              << " name=" << (name && *name ? name : "<unnamed>")
+              << " type=" << ggml_type_name(tensor->type)
+              << " min=" << (count ? minimum : 0.0f)
+              << " max=" << (count ? maximum : 0.0f)
+              << " nonfinite=" << nonfinite
+              << " backend=" << (backend && *backend ? backend : "unknown")
+              << std::endl;
+    if (nonfinite != 0) {
+        probe->bad = true;
+        probe->error = "SLat non-finite graph node component=" + probe->component +
+            " ordinal=" + std::to_string(probe->ordinal) +
+            " op=" + std::string(ggml_op_name(tensor->op)) +
+            " name=" + std::string(name && *name ? name : "<unnamed>") +
+            " index=" + std::to_string(first_bad) +
+            " value=" + std::to_string(probe->values[first_bad]);
+        return false;
+    }
+    return true;
+}
+
 bool has_prefix(const std::string & value, const std::string & prefix) {
     return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
 }
@@ -337,7 +434,9 @@ struct SLatFlowModel::Impl {
     SLatFlowHParams hp;
     std::string alias;
     std::unordered_map<std::string, std::vector<float>> tensors;
+    std::unordered_map<std::string, std::vector<std::uint8_t>> reduced_payloads;
     ggml_context * weights_ctx = nullptr;
+    BackendManager backend_manager;
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_t weights_buffer = nullptr;
     std::string backend_name;
@@ -353,10 +452,8 @@ struct SLatFlowModel::Impl {
             ggml_backend_buffer_free(weights_buffer);
             weights_buffer = nullptr;
         }
-        if (backend) {
-            ggml_backend_free(backend);
-            backend = nullptr;
-        }
+        backend = nullptr;
+        backend_manager.close();
         if (weights_ctx) {
             ggml_free(weights_ctx);
             weights_ctx = nullptr;
@@ -391,21 +488,19 @@ bool SLatFlowModel::Impl::init_gpu(std::string * error) {
     if (backend && weights_buffer) return true;
     close_gpu();
 
-    ggml_backend_t selected = nullptr;
-    std::string selected_name;
-    for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
-        ggml_backend_dev_t device = ggml_backend_dev_get(index);
-        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
-        selected = ggml_backend_dev_init(device, nullptr);
-        if (!selected) continue;
-        const char * description = ggml_backend_dev_description(device);
-        selected_name = description ? description : ggml_backend_dev_name(device);
-        break;
-    }
-    if (!selected) {
-        set_error(error, "no ggml GPU backend is available for SLat flow");
+    if (!backend_manager.initialize_from_environment("PIXAL3D_SLAT_BACKEND", error)) {
         return false;
     }
+    backend = backend_manager.primary();
+    if (!backend || backend_manager.devices().empty() ||
+        (backend_manager.devices().front().type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+         backend_manager.devices().front().type != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+        backend = nullptr;
+        set_error(error, "SLat flow backend policy did not select a GPU backend");
+        backend_manager.close();
+        return false;
+    }
+    backend_name = backend_manager.primary_name();
 
     std::size_t count = 0;
     for (const Pixal3DTensorInfo & info : reader.info().tensors) {
@@ -413,8 +508,8 @@ bool SLatFlowModel::Impl::init_gpu(std::string * error) {
     }
     if (count == 0 || count > std::numeric_limits<std::size_t>::max() /
                                       ggml_tensor_overhead()) {
-        ggml_backend_free(selected);
         set_error(error, "invalid SLat flow tensor count for GPU weights");
+        close_gpu();
         return false;
     }
 
@@ -423,50 +518,56 @@ bool SLatFlowModel::Impl::init_gpu(std::string * error) {
     params.no_alloc = true;
     weights_ctx = ggml_init(params);
     if (!weights_ctx) {
-        ggml_backend_free(selected);
         set_error(error, "failed to allocate SLat flow GPU tensor context");
+        close_gpu();
         return false;
     }
     for (const Pixal3DTensorInfo & info : reader.info().tensors) {
         if (!has_prefix(info.name, alias + ".")) continue;
         const auto found = tensors.find(info.name);
         if (found == tensors.end()) {
-            close_gpu();
-            ggml_backend_free(selected);
             set_error(error, "missing host SLat flow tensor for GPU upload: " + info.name);
+            close_gpu();
             return false;
         }
-        ggml_tensor * tensor = ggml_new_tensor(weights_ctx, GGML_TYPE_F32,
-                                               info.n_dims, info.ne);
+        const ggml_type type = static_cast<ggml_type>(info.ggml_type);
+        ggml_tensor * tensor = ggml_new_tensor(weights_ctx, type, info.n_dims, info.ne);
         if (!tensor || ggml_nelements(tensor) !=
                             static_cast<int64_t>(found->second.size()) ||
-            ggml_nbytes(tensor) != found->second.size() * sizeof(float)) {
+            ggml_nbytes(tensor) != info.n_bytes) {
+            set_error(error, "SLat flow GPU tensor shape or byte-size mismatch: " + info.name);
             close_gpu();
-            ggml_backend_free(selected);
-            set_error(error, "SLat flow GPU tensor shape mismatch: " + info.name);
             return false;
         }
         ggml_set_name(tensor, info.name.c_str());
         backend_tensors.emplace(info.name, tensor);
     }
 
-    backend = selected;
-    backend_name = std::move(selected_name);
     weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, backend);
     if (!weights_buffer) {
+        set_error(error, "failed to allocate SLat flow weights on GPU backend " + backend_name);
         close_gpu();
-        set_error(error, "failed to allocate SLat flow weights on GPU backend");
         return false;
     }
     ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    for (const auto & entry : tensors) {
-        const auto found = backend_tensors.find(entry.first);
-        if (found == backend_tensors.end()) continue;
-        ggml_backend_tensor_set(found->second, entry.second.data(), 0,
-                                entry.second.size() * sizeof(float));
+    backend_manager.log_buffer(
+        "weights_allocated", backend, ggml_backend_buffer_get_size(weights_buffer));
+    for (const Pixal3DTensorInfo & info : reader.info().tensors) {
+        if (!has_prefix(info.name, alias + ".")) continue;
+        const auto found = backend_tensors.find(info.name);
+        const auto host = tensors.find(info.name);
+        if (found == backend_tensors.end() || host == tensors.end()) continue;
+        const auto raw = reduced_payloads.find(info.name);
+        if (raw != reduced_payloads.end()) {
+            ggml_backend_tensor_set(found->second, raw->second.data(), 0, raw->second.size());
+        } else {
+            ggml_backend_tensor_set(found->second, host->second.data(), 0,
+                                    host->second.size() * sizeof(float));
+        }
     }
-    std::cerr << "pixal3d: " << hp.component << " SLat CUDA weights ready ("
-              << backend_name << ")" << std::endl;
+    std::cerr << "pixal3d: " << hp.component << " SLat GPU weights ready ("
+              << backend_name << ", storage=" <<
+              (reduced_payloads.empty() ? "F32" : "native") << ")" << std::endl;
     return true;
 }
 
@@ -582,8 +683,16 @@ bool SLatFlowModel::Impl::forward_gpu(
         if (!common || !self_norm || !cross_norm || !projection) return false;
     }
 
-    const std::size_t graph_memory = ggml_tensor_overhead() * 32768 +
-                                     ggml_graph_overhead_custom(32768, false);
+    const std::size_t query_chunks =
+        (points + 511) / 512;
+    // Chunked long-sequence attention adds graph nodes for every query chunk
+    // in every transformer block.  Keep the compact graph for short inputs,
+    // but size the metadata arena from the actual point count so shape_1024
+    // graphs are not truncated at the old fixed 32768-node limit.
+    const std::size_t graph_capacity = std::max<std::size_t>(
+        32768, 16384 + query_chunks * static_cast<std::size_t>(hp.num_blocks) * 64);
+    const std::size_t graph_memory = ggml_tensor_overhead() * graph_capacity +
+                                     ggml_graph_overhead_custom(graph_capacity, false);
     ggml_init_params graph_params{};
     graph_params.mem_size = graph_memory;
     graph_params.no_alloc = true;
@@ -592,7 +701,7 @@ bool SLatFlowModel::Impl::forward_gpu(
         set_error(error, "failed to allocate SLat flow GPU graph context");
         return false;
     }
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32768, false);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_capacity, false);
     if (!graph) {
         ggml_free(ctx);
         set_error(error, "failed to allocate SLat flow GPU graph");
@@ -619,9 +728,15 @@ bool SLatFlowModel::Impl::forward_gpu(
     ggml_set_input(cnd);
     if (proj) ggml_set_input(proj);
 
+    auto f32_weight = [&](const std::string & local_name) {
+        ggml_tensor * tensor = W(local_name);
+        if (!tensor || tensor->type == GGML_TYPE_F32) return tensor;
+        return ggml_cast(ctx, tensor, GGML_TYPE_F32);
+    };
     auto lin = [&](ggml_tensor * input_tensor, const std::string & local_name) {
         ggml_tensor * result = ggml_mul_mat(ctx, W(local_name + ".weight"), input_tensor);
-        ggml_tensor * bias = W(local_name + ".bias");
+        if (result) ggml_mul_mat_set_prec(result, GGML_PREC_F32);
+        ggml_tensor * bias = f32_weight(local_name + ".bias");
         return bias ? ggml_add(ctx, result, bias) : result;
     };
     auto modulate = [&](ggml_tensor * input_tensor, ggml_tensor * scale,
@@ -629,7 +744,8 @@ bool SLatFlowModel::Impl::forward_gpu(
         return ggml_add(ctx, ggml_add(ctx, ggml_mul(ctx, input_tensor, scale), input_tensor), shift);
     };
     auto qk_norm = [&](ggml_tensor * input_tensor, const std::string & gamma_name) {
-        return ggml_mul(ctx, ggml_rms_norm(ctx, input_tensor, 1e-12f), W(gamma_name));
+        return ggml_mul(ctx, ggml_rms_norm(ctx, input_tensor, 1e-12f),
+                        f32_weight(gamma_name));
     };
     auto rope = [&](ggml_tensor * input_tensor) {
         ggml_tensor * reshaped = ggml_reshape_4d(ctx, input_tensor, 2, hd / 2, H, N);
@@ -657,27 +773,43 @@ bool SLatFlowModel::Impl::forward_gpu(
         // qp/kp are [head_dim, sequence, heads, batch].
         if (qp->ne[1] <= 4096 && kp->ne[1] <= 4096) {
             ggml_tensor * scores = ggml_mul_mat(ctx, kp, qp);
+            if (scores) ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
             scores = ggml_soft_max_ext(ctx, scores, nullptr,
                                        attention_scale, 0.0f);
             ggml_tensor * vt = ggml_cont(ctx, ggml_permute(ctx, vp, 1, 0, 2, 3));
             ggml_tensor * result = ggml_mul_mat(ctx, vt, scores);
+            if (result) ggml_mul_mat_set_prec(result, GGML_PREC_F32);
             result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));
             return ggml_reshape_2d(ctx, result, C, result->ne[2]);
         }
 
-        // Development/reference packs are F32.  Keep the attention inputs in
-        // F32 here so the CUDA graph is numerically comparable with the CPU
-        // oracle.  The CUDA backend's F32 flash path can still use a fast
-        // F16 K/V kernel for long sequences; the build therefore disables
-        // TF32 globally and the long-sequence path is audited separately.
-        ggml_tensor * result = ggml_flash_attn_ext(
-            ctx, qp, kp, vp, nullptr, attention_scale, 0.0f, 0.0f);
-        // Keep attention accumulation in F32.  The flow weights and all graph
-        // inputs are F32; the CUDA backend's default fast-F16 attention can
-        // otherwise introduce avoidable drift that is amplified by the 30
-        // denoiser blocks and the Euler sampler.
-        ggml_flash_attn_ext_set_prec(result, GGML_PREC_F32);
-        result = ggml_cont(ctx, result);
+        // Do not use ggml_flash_attn_ext for this path.  On Ada Lovelace the
+        // selected long-sequence MMA kernel stages F32 K/V through F16, and
+        // the resulting values can become non-finite even though the graph
+        // tensors and precision request are F32.  Query-chunked generic
+        // attention preserves the reference's F32 softmax while bounding the
+        // temporary score matrix to [key_sequence, query_chunk].
+        constexpr int query_chunk = 512;
+        ggml_tensor * result = nullptr;
+        const int64_t query_length = qp->ne[1];
+        for (int64_t query_start = 0; query_start < query_length;
+             query_start += query_chunk) {
+            const int64_t query_size = std::min<int64_t>(
+                query_chunk, query_length - query_start);
+            ggml_tensor * q_chunk = ggml_view_4d(
+                ctx, qp, qp->ne[0], query_size, qp->ne[2], qp->ne[3],
+                qp->nb[1], qp->nb[2], qp->nb[3],
+                static_cast<std::size_t>(query_start) * qp->nb[1]);
+            ggml_tensor * scores = ggml_mul_mat(ctx, kp, q_chunk);
+            if (scores) ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+            scores = ggml_soft_max_ext(ctx, scores, nullptr,
+                                       attention_scale, 0.0f);
+            ggml_tensor * vt = ggml_cont(ctx, ggml_permute(ctx, vp, 1, 0, 2, 3));
+            ggml_tensor * chunk = ggml_mul_mat(ctx, vt, scores);
+            if (chunk) ggml_mul_mat_set_prec(chunk, GGML_PREC_F32);
+            chunk = ggml_cont(ctx, ggml_permute(ctx, chunk, 0, 2, 1, 3));
+            result = result ? ggml_concat(ctx, result, chunk, 2) : chunk;
+        }
         return ggml_reshape_2d(ctx, result, C, result->ne[2]);
     };
     auto split_heads = [&](ggml_tensor * value, int offset, int sequence) {
@@ -741,7 +873,7 @@ bool SLatFlowModel::Impl::forward_gpu(
     for (int block = 0; block < hp.num_blocks; ++block) {
         const std::string p = "blocks." + std::to_string(block);
         const std::string cross = p + ".cross_attn.cross_attn_block";
-        ggml_tensor * mods = ggml_add(ctx, W(p + ".modulation"), tmod);
+        ggml_tensor * mods = ggml_add(ctx, f32_weight(p + ".modulation"), tmod);
         auto chunk = [&](int index) {
             return ggml_view_1d(ctx, mods, C,
                                 static_cast<std::size_t>(index) * C * ggml_element_size(mods));
@@ -769,8 +901,9 @@ bool SLatFlowModel::Impl::forward_gpu(
         h = ggml_add(ctx, h, ggml_mul(ctx, self_out, gate_msa));
 
         ggml_tensor * cross_input = ggml_norm(ctx, h, hp.norm_eps);
-        cross_input = ggml_add(ctx, ggml_mul(ctx, cross_input, W(p + ".norm2.weight")),
-                               W(p + ".norm2.bias"));
+        cross_input = ggml_add(ctx, ggml_mul(ctx, cross_input,
+                                              f32_weight(p + ".norm2.weight")),
+                               f32_weight(p + ".norm2.bias"));
         ggml_tensor * cross_q = split_heads(lin(cross_input, cross + ".to_q"), 0, N);
         ggml_tensor * cross_kv = lin(cnd, cross + ".to_kv");
         ggml_tensor * cross_k = split_heads(cross_kv, 0, Lkv);
@@ -799,6 +932,18 @@ bool SLatFlowModel::Impl::forward_gpu(
     ggml_tensor * result = ggml_cont(ctx, h);
     ggml_set_output(result);
     ggml_build_forward_expand(graph, result);
+    std::string scheduler_error;
+    BackendScheduler scheduler(backend_manager, graph_capacity, false, true,
+                                &scheduler_error, hp.component.c_str());
+    if (!scheduler.valid() ||
+        (backend_manager.requires_primary_backend() &&
+         !scheduler.require_primary_graph(graph, &scheduler_error)) ||
+        !scheduler.allocate_graph(graph, &scheduler_error)) {
+        set_error(error, scheduler_error.empty()
+            ? "failed to allocate SLat flow GPU compute graph" : scheduler_error);
+        ggml_free(ctx);
+        return false;
+    }
     if (std::getenv("PIXAL3D_SLAT_TRACE")) {
         const int graph_nodes = ggml_graph_n_nodes(graph);
         std::cerr << "pixal3d: SLat GPU graph built nodes=" << graph_nodes
@@ -817,19 +962,17 @@ bool SLatFlowModel::Impl::forward_gpu(
         std::cerr << "pixal3d: SLat GPU unsupported count=" << unsupported
                   << std::endl;
     }
-    ggml_gallocr_t allocator = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(backend));
-    if (std::getenv("PIXAL3D_SLAT_TRACE")) {
-        std::cerr << "pixal3d: SLat GPU graph allocation start" << std::endl;
-    }
-    if (!allocator || !ggml_gallocr_alloc_graph(allocator, graph)) {
-        if (allocator) ggml_gallocr_free(allocator);
-        ggml_free(ctx);
-        set_error(error, "failed to allocate SLat flow GPU compute graph");
-        return false;
-    }
     if (std::getenv("PIXAL3D_SLAT_TRACE")) {
         std::cerr << "pixal3d: SLat GPU graph allocation complete" << std::endl;
+    }
+    SLatFiniteProbe finite_probe;
+    if (const char * value = std::getenv("PIXAL3D_SLAT_NONFINITE_TRACE")) {
+        if (*value && std::strcmp(value, "0") != 0) {
+            finite_probe.component = hp.component;
+            scheduler.set_eval_callback(slat_finite_callback, &finite_probe);
+            std::cerr << "pixal3d: SLat finite probe enabled component="
+                      << hp.component << std::endl;
+        }
     }
 
     ggml_backend_tensor_set(x_t, channel_major_input.data(), 0,
@@ -850,13 +993,18 @@ bool SLatFlowModel::Impl::forward_gpu(
     if (std::getenv("PIXAL3D_SLAT_TRACE")) {
         std::cerr << "pixal3d: SLat GPU graph compute start" << std::endl;
     }
-    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    const ggml_status status = scheduler.compute(graph, &scheduler_error);
     if (std::getenv("PIXAL3D_SLAT_TRACE")) {
         std::cerr << "pixal3d: SLat GPU graph compute complete status="
                   << static_cast<int>(status) << std::endl;
     }
     std::vector<float> backend_output(points * static_cast<std::size_t>(hp.out_channels));
     bool ok = status == GGML_STATUS_SUCCESS;
+    if (finite_probe.bad) {
+        set_error(error, finite_probe.error.empty()
+            ? "SLat finite probe found a non-finite graph node" : finite_probe.error);
+        ok = false;
+    }
     if (ok) {
         ggml_backend_tensor_get(result, backend_output.data(), 0,
                                 backend_output.size() * sizeof(float));
@@ -872,10 +1020,10 @@ bool SLatFlowModel::Impl::forward_gpu(
                 ? "SLat flow GPU output contains a non-finite value" : finite_error);
             ok = false;
         }
-    } else {
-        set_error(error, "SLat flow GPU graph compute failed");
+    } else if (!finite_probe.bad) {
+        set_error(error, "SLat flow GPU graph compute failed" +
+                  (scheduler_error.empty() ? std::string{} : ": " + scheduler_error));
     }
-    ggml_gallocr_free(allocator);
     ggml_free(ctx);
     return ok;
 }
@@ -920,6 +1068,12 @@ bool SLatFlowModel::load(const std::string & path, const std::string & component
             std::vector<float> values;
             if (!read_tensor_f32(impl->reader, info, values, error)) return false;
             impl->tensors.emplace(info.name, std::move(values));
+            const ggml_type type = static_cast<ggml_type>(info.ggml_type);
+            if (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) {
+                if (!impl->reader.read_tensor(info.name, impl->reduced_payloads[info.name], error)) {
+                    return false;
+                }
+            }
         }
         impl->has_data = true;
     }
@@ -964,8 +1118,10 @@ bool SLatFlowModel::forward(const SparseTensorF32 & input,
     // Production cascade stages are batch-1.  Keep the established CPU/F32
     // implementation for batched fixtures and as a safe fallback when a GPU
     // backend cannot allocate or execute the sparse graph.
-    const char * backend_mode = std::getenv("PIXAL3D_SLAT_BACKEND");
-    const bool force_cpu = backend_mode && std::string(backend_mode) == "cpu";
+    BackendPolicy policy = BackendPolicy::from_environment("PIXAL3D_SLAT_BACKEND", nullptr, error);
+    if (error && !error->empty()) return false;
+    const bool force_cpu = policy.kind == BackendPolicyKind::cpu;
+    const bool force_gpu = policy.kind == BackendPolicyKind::gpu;
     if (!force_cpu && input.batch_size == 1 && global_context.batch_size == 1) {
         std::string gpu_error;
         if (impl_->init_gpu(&gpu_error) &&
@@ -974,11 +1130,20 @@ bool SLatFlowModel::forward(const SparseTensorF32 & input,
                                concat_condition)) {
             return true;
         }
+        if (force_gpu) {
+            set_error(error, "SLat flow forced GPU execution failed" +
+                             (gpu_error.empty() ? std::string{} : ": " + gpu_error));
+            impl_->close_gpu();
+            return false;
+        }
         if (std::getenv("PIXAL3D_SLAT_VERBOSE")) {
             std::cerr << "pixal3d: SLat GPU forward unavailable; using CPU fallback"
                       << (gpu_error.empty() ? "" : ": " + gpu_error) << std::endl;
         }
         impl_->close_gpu();
+    } else if (force_gpu) {
+        set_error(error, "SLat flow forced GPU execution requires batch-1 inputs");
+        return false;
     }
     SLatFlowWeightsF32 weights;
     weights.input_weight = impl_->tensor("input_layer.weight", error);

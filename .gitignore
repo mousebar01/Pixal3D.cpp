@@ -1,6 +1,9 @@
 /build/
 /build-cuda/
 /build-cuda-*/
+/build-backend-test/
+/build-backend-cuda/
+/.zcode/
 /build-cuda-work/
 /build-cuda-new/
 /build-cuda-patch/

@@ -61,6 +61,7 @@ else()
 endif()
 
 add_library(pixal3d_core
+    src/backend.cpp
     src/condition.cpp
     src/dino.cpp
     src/dino_vit.cpp
@@ -147,6 +148,22 @@ if(BUILD_TESTING AND PIXAL3D_BUILD_CLI)
     target_compile_features(pixal3d_dino_test PRIVATE cxx_std_17)
     target_link_libraries(pixal3d_dino_test PRIVATE pixal3d_core)
     add_test(NAME pixal3d_dino COMMAND pixal3d_dino_test)
+    set_tests_properties(pixal3d_dino PROPERTIES LABELS "unit;cpu")
+    add_executable(pixal3d_backend_manager_test tests/backend_manager_test.cpp)
+    target_compile_features(pixal3d_backend_manager_test PRIVATE cxx_std_17)
+    target_link_libraries(pixal3d_backend_manager_test PRIVATE pixal3d_core)
+    add_test(NAME pixal3d_backend_manager COMMAND pixal3d_backend_manager_test)
+    set_tests_properties(pixal3d_backend_manager PROPERTIES LABELS "unit;backend;cpu")
+    if(PIXAL3D_ENABLE_CUDA)
+        add_executable(pixal3d_backend_cuda_matmul_test
+            tests/backend_cuda_matmul_test.cpp)
+        target_compile_features(pixal3d_backend_cuda_matmul_test PRIVATE cxx_std_17)
+        target_link_libraries(pixal3d_backend_cuda_matmul_test PRIVATE pixal3d_core)
+        add_test(NAME pixal3d_backend_cuda_matmul
+                 COMMAND pixal3d_backend_cuda_matmul_test)
+        set_tests_properties(pixal3d_backend_cuda_matmul
+            PROPERTIES LABELS "backend;cuda;parity;f16")
+    endif()
     add_executable(pixal3d_dino_vit_numeric_fixture
         tests/dino_vit_numeric_fixture.cpp)
     target_compile_features(pixal3d_dino_vit_numeric_fixture PRIVATE cxx_std_17)

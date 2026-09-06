@@ -1,5 +1,6 @@
 #include "pixal3d/naf.h"
 
+#include "pixal3d/backend.h"
 #include "pixal3d/pack.h"
 
 #include "ggml-alloc.h"
@@ -67,6 +68,7 @@ struct NafGpuState {
     ggml_backend_buffer_t weights_buffer = nullptr;
     std::string backend_name;
     std::unordered_map<const float *, ggml_tensor *> tensors;
+    BackendManager * backend_manager = nullptr;
     bool attempted = false;
 
     ~NafGpuState() { close(); }
@@ -77,10 +79,8 @@ struct NafGpuState {
             ggml_backend_buffer_free(weights_buffer);
             weights_buffer = nullptr;
         }
-        if (backend) {
-            ggml_backend_free(backend);
-            backend = nullptr;
-        }
+        backend = nullptr;
+        backend_manager = nullptr;
         if (weights_ctx) {
             ggml_free(weights_ctx);
             weights_ctx = nullptr;
@@ -98,6 +98,9 @@ struct NafGpuState {
     }
 
     bool init(const std::unordered_map<std::string, TensorF32> & host,
+              ggml_backend_t selected_backend,
+              const std::string & selected_name,
+              BackendManager * manager,
               std::string * error) {
         if (ready()) return true;
         if (attempted) {
@@ -142,55 +145,11 @@ struct NafGpuState {
             tensors.emplace(source.data.data(), tensor);
         }
 
-        // Do not select a GPU that can merely allocate weights: every op in
-        // run_conv_reflect must be supported by the selected backend.
-        for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
-            ggml_backend_dev_t device = ggml_backend_dev_get(index);
-            if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
-            ggml_backend_t candidate = ggml_backend_dev_init(device, nullptr);
-            if (!candidate) continue;
-            ggml_init_params probe_params{};
-            probe_params.mem_size = ggml_tensor_overhead() * 32 + 4096;
-            probe_params.no_alloc = true;
-            ggml_context * probe = ggml_init(probe_params);
-            bool supported = false;
-            if (probe) {
-                ggml_tensor * weight = ggml_new_tensor_4d(probe, GGML_TYPE_F32,
-                                                          3, 3, 1, 1);
-                ggml_tensor * input = ggml_new_tensor_4d(probe, GGML_TYPE_F32,
-                                                         8, 8, 1, 1);
-                ggml_tensor * pad_x = weight && input
-                    ? ggml_pad_reflect_1d(probe, input, 1, 1) : nullptr;
-                ggml_tensor * swap = pad_x
-                    ? ggml_cont(probe, ggml_permute(probe, pad_x, 1, 0, 2, 3)) : nullptr;
-                ggml_tensor * pad_y = swap
-                    ? ggml_pad_reflect_1d(probe, swap, 1, 1) : nullptr;
-                ggml_tensor * padded = pad_y
-                    ? ggml_cont(probe, ggml_permute(probe, pad_y, 1, 0, 2, 3)) : nullptr;
-                ggml_tensor * conv = weight && padded
-                    ? ggml_conv_2d_direct(probe, weight, padded,
-                                          1, 1, 0, 0, 1, 1) : nullptr;
-                ggml_tensor * bias = ggml_new_tensor_1d(probe, GGML_TYPE_F32, 1);
-                ggml_tensor * biased = conv && bias
-                    ? ggml_add(probe, conv, ggml_reshape_4d(probe, bias, 1, 1, 1, 1))
-                    : nullptr;
-                supported = pad_x && swap && pad_y && padded && conv && biased &&
-                    ggml_backend_supports_op(candidate, pad_x) &&
-                    ggml_backend_supports_op(candidate, pad_y) &&
-                    ggml_backend_supports_op(candidate, conv) &&
-                    ggml_backend_supports_op(candidate, biased);
-                ggml_free(probe);
-            }
-            if (supported) {
-                backend = candidate;
-                const char * description = ggml_backend_dev_description(device);
-                backend_name = description ? description : ggml_backend_dev_name(device);
-                break;
-            }
-            ggml_backend_free(candidate);
-        }
-        if (!backend) {
-            if (error) *error = "no GPU backend supports NAF convolution recipe";
+        backend = selected_backend;
+        backend_name = selected_name;
+        backend_manager = manager;
+        if (!backend || !backend_manager) {
+            if (error) *error = "NAF GPU backend selection is unavailable";
             close();
             return false;
         }
@@ -201,6 +160,8 @@ struct NafGpuState {
             return false;
         }
         ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        backend_manager->log_buffer(
+            "weights_allocated", backend, ggml_backend_buffer_get_size(weights_buffer));
         for (const auto & entry : host) {
             ggml_backend_tensor_set(tensor(entry.second.data.data()), entry.second.data.data(),
                                     0, entry.second.data.size() * sizeof(float));
@@ -268,17 +229,21 @@ struct NafGpuState {
         }
         ggml_set_output(result);
         ggml_build_forward_expand(graph, result);
-        ggml_gallocr_t allocator = ggml_gallocr_new(
-            ggml_backend_get_default_buffer_type(backend));
-        if (!allocator || !ggml_gallocr_alloc_graph(allocator, graph)) {
-            if (allocator) ggml_gallocr_free(allocator);
+        std::string scheduler_error;
+        BackendScheduler scheduler(*backend_manager, 128, false, true,
+                                   &scheduler_error, "NAF convolution");
+        if (!scheduler.valid() ||
+            (backend_manager->requires_primary_backend() &&
+             !scheduler.require_primary_graph(graph, &scheduler_error)) ||
+            !scheduler.allocate_graph(graph, &scheduler_error)) {
             ggml_free(ctx);
-            if (error) *error = "failed to allocate NAF GPU convolution graph";
+            if (error) *error = scheduler_error.empty()
+                ? "failed to allocate NAF GPU convolution graph" : scheduler_error;
             return false;
         }
         ggml_backend_tensor_set(input_tensor, input.data(), 0,
                                 input.size() * sizeof(float));
-        const ggml_status status = ggml_backend_graph_compute(backend, graph);
+        const ggml_status status = scheduler.compute(graph, &scheduler_error);
         bool ok = status == GGML_STATUS_SUCCESS;
         output.resize(static_cast<std::size_t>(out_channels) * height * width);
         if (ok) {
@@ -292,9 +257,9 @@ struct NafGpuState {
                 }
             }
         } else if (error) {
-            *error = "NAF GPU convolution graph compute failed";
+            *error = "NAF GPU convolution graph compute failed" +
+                     (scheduler_error.empty() ? std::string{} : ": " + scheduler_error);
         }
-        ggml_gallocr_free(allocator);
         ggml_free(ctx);
         return ok;
     }
@@ -522,12 +487,15 @@ struct NafModel::Impl {
     NafHParams hp;
     std::unordered_map<std::string, TensorF32> tensors;
     mutable NafGpuState gpu;
+    mutable BackendManager backend_manager;
     bool has_data = false;
 
     ~Impl() { close(); }
 
     void close() noexcept {
+        gpu.close();
         tensors.clear();
+        backend_manager.close();
         has_data = false;
         hp = NafHParams{};
         reader.close();
@@ -543,7 +511,24 @@ struct NafModel::Impl {
             if (error) *error = "NAF model was loaded metadata-only";
             return false;
         }
-        return gpu.init(tensors, error);
+        if (!backend_manager.initialize_from_environment("PIXAL3D_NAF_BACKEND", error)) {
+            return false;
+        }
+        if (backend_manager.policy().kind == BackendPolicyKind::cpu) {
+            if (error) error->clear();
+            backend_manager.close();
+            return false;
+        }
+        const bool is_gpu = !backend_manager.devices().empty() &&
+            (backend_manager.devices().front().type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+             backend_manager.devices().front().type == GGML_BACKEND_DEVICE_TYPE_IGPU);
+        if (!is_gpu) {
+            if (error) *error = "NAF backend policy did not select a GPU backend";
+            backend_manager.close();
+            return false;
+        }
+        return gpu.init(tensors, backend_manager.primary(),
+                        backend_manager.primary_name(), &backend_manager, error);
     }
 };
 
@@ -758,9 +743,19 @@ bool NafModel::upsample(const float * image,
     }
 
     std::string gpu_error;
-    const char * backend_mode = std::getenv("PIXAL3D_NAF_BACKEND");
-    bool use_gpu = !(backend_mode && std::string(backend_mode) == "cpu") &&
-                   impl_->init_gpu(&gpu_error);
+    const BackendPolicy policy = BackendPolicy::from_environment(
+        "PIXAL3D_NAF_BACKEND", nullptr, error);
+    if (error && !error->empty()) return false;
+    const bool force_cpu = policy.kind == BackendPolicyKind::cpu;
+    const bool force_gpu = policy.kind == BackendPolicyKind::gpu;
+    bool use_gpu = !force_cpu && impl_->init_gpu(&gpu_error);
+    if (force_gpu && !use_gpu) {
+        set_error(error, "NAF forced GPU initialization failed" +
+                  (gpu_error.empty() ? std::string{} : ": " + gpu_error));
+        impl_->gpu.close();
+        impl_->backend_manager.close();
+        return false;
+    }
 
     auto run_stack_gpu = [&](const std::string & stack, int kernel,
                              std::vector<float> & stack_output) -> bool {
@@ -856,9 +851,20 @@ bool NafModel::upsample(const float * image,
     if (use_gpu) {
         use_gpu = run_stack_gpu("encoder", 1, linear_stack) &&
                   run_stack_gpu("sem_encoder", 3, semantic_stack);
-        if (!use_gpu && std::getenv("PIXAL3D_SLAT_VERBOSE")) {
+        if (!use_gpu && force_gpu) {
+            set_error(error, "NAF forced GPU convolution failed" +
+                      (gpu_error.empty() ? std::string{} : ": " + gpu_error));
+            impl_->gpu.close();
+            impl_->backend_manager.close();
+            return false;
+        }
+        if (!use_gpu && std::getenv("PIXAL3D_NAF_VERBOSE")) {
             std::cerr << "pixal3d: NAF GPU convolution unavailable; using CPU fallback: "
                       << gpu_error << std::endl;
+        }
+        if (!use_gpu) {
+            impl_->gpu.close();
+            impl_->backend_manager.close();
         }
     }
     if (!use_gpu && (!run_stack("encoder", 1, linear_stack) ||

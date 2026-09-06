@@ -1,9 +1,9 @@
 #include "pixal3d/dino_vit.h"
 
+#include "pixal3d/backend.h"
 #include "pixal3d/pack.h"
 
 #include "ggml-alloc.h"
-#include "ggml-cpu.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -24,21 +24,6 @@ namespace {
 
 void set_error(std::string * error, const std::string & message) {
     if (error) *error = message;
-}
-
-ggml_backend_t init_best_backend(std::string & name_out) {
-    for (std::size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t device = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
-        ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
-        if (backend) {
-            const char * description = ggml_backend_dev_description(device);
-            name_out = description ? description : ggml_backend_dev_name(device);
-            return backend;
-        }
-    }
-    name_out = "CPU";
-    return ggml_backend_cpu_init();
 }
 
 bool prefix_name(const std::string & name, const char * prefix) {
@@ -117,9 +102,8 @@ struct DinoV3Model::Impl {
     Pixal3DPackReader reader;
     DinoV3HParams hp;
     ggml_context * weights_ctx = nullptr;
-    ggml_backend_t backend = nullptr;
+    BackendManager backend_manager;
     ggml_backend_buffer_t weights_buffer = nullptr;
-    std::string backend_name;
     bool has_data = false;
     std::unordered_map<std::string, ggml_tensor *> tensors;
 
@@ -130,16 +114,12 @@ struct DinoV3Model::Impl {
             ggml_backend_buffer_free(weights_buffer);
             weights_buffer = nullptr;
         }
-        if (backend) {
-            ggml_backend_free(backend);
-            backend = nullptr;
-        }
+        backend_manager.close();
         if (weights_ctx) {
             ggml_free(weights_ctx);
             weights_ctx = nullptr;
         }
         tensors.clear();
-        backend_name.clear();
         has_data = false;
         hp = DinoV3HParams{};
         reader.close();
@@ -207,20 +187,25 @@ bool DinoV3Model::load(const std::string & path,
         impl->tensors.emplace(info.name, tensor);
     }
     if (load_tensors) {
-        impl->backend = init_best_backend(impl->backend_name);
-        if (!impl->backend) {
-            set_error(error, "failed to initialize ggml backend for DINOv3");
+        if (!impl->backend_manager.initialize_from_environment(
+                "PIXAL3D_DINO_BACKEND", error)) {
+            if (error && error->empty()) {
+                set_error(error, "failed to initialize ggml backend for DINOv3");
+            }
             return false;
         }
         impl->weights_buffer = ggml_backend_alloc_ctx_tensors(impl->weights_ctx,
-                                                               impl->backend);
+                                                               impl->backend_manager.primary());
         if (!impl->weights_buffer) {
             set_error(error, "failed to allocate DINOv3 weights on backend " +
-                             impl->backend_name);
+                             impl->backend_manager.primary_name());
             return false;
         }
         ggml_backend_buffer_set_usage(impl->weights_buffer,
                                       GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        impl->backend_manager.log_buffer(
+            "weights_allocated", impl->backend_manager.primary(),
+            ggml_backend_buffer_get_size(impl->weights_buffer));
         std::vector<std::uint8_t> payload;
         for (const Pixal3DTensorInfo & info : impl->reader.info().tensors) {
             if (!prefix_name(info.name, "dino.")) continue;
@@ -242,7 +227,8 @@ const DinoV3HParams & DinoV3Model::hparams() const noexcept {
 }
 const std::string & DinoV3Model::backend_name() const noexcept {
     static const std::string none = "none";
-    return impl_ && !impl_->backend_name.empty() ? impl_->backend_name : none;
+    return impl_ && impl_->backend_manager.initialized()
+        ? impl_->backend_manager.primary_name() : none;
 }
 int DinoV3Model::tensor_count() const noexcept {
     return impl_ ? static_cast<int>(impl_->tensors.size()) : 0;
@@ -499,17 +485,19 @@ bool DinoV3Model::encode(const float * pixels,
     ggml_build_forward_expand(graph, result);
     std::cerr << "pixal3d: DINO graph built (nodes=" << ggml_graph_n_nodes(graph)
               << ")" << std::endl;
-    ggml_backend_t backend = impl_->backend;
-    ggml_gallocr_t allocator = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(backend));
-    if (!allocator || !ggml_gallocr_alloc_graph(allocator, graph)) {
-        if (allocator) ggml_gallocr_free(allocator);
+    std::string scheduler_error;
+    BackendScheduler scheduler(impl_->backend_manager, 65536, false, true,
+                                &scheduler_error, "DINOv3");
+    if (!scheduler.valid() ||
+        (impl_->backend_manager.requires_primary_backend() &&
+         !scheduler.require_primary_graph(graph, &scheduler_error)) ||
+        !scheduler.allocate_graph(graph, &scheduler_error)) {
         ggml_free(ctx);
-        set_error(error, "failed to allocate DINOv3 compute graph");
+        set_error(error, "failed to allocate DINOv3 compute graph: " + scheduler_error);
         return false;
     }
     std::cerr << "pixal3d: DINO graph allocated" << std::endl;
-    if (ggml_backend_is_cpu(backend)) ggml_backend_cpu_set_n_threads(backend, 4);
+    impl_->backend_manager.set_n_threads(4);
     ggml_backend_tensor_set(patches, patch_values.data(), 0,
                             patch_values.size() * sizeof(float));
     ggml_backend_tensor_set(cos_t, cos_values.data(), 0,
@@ -517,16 +505,16 @@ bool DinoV3Model::encode(const float * pixels,
     ggml_backend_tensor_set(sin_t, sin_values.data(), 0,
                             sin_values.size() * sizeof(float));
     std::cerr << "pixal3d: DINO graph compute start" << std::endl;
-    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    const ggml_status status = scheduler.compute(graph, &scheduler_error);
     std::cerr << "pixal3d: DINO graph compute complete" << std::endl;
     std::vector<float> raw(static_cast<std::size_t>(C) * token_count);
     bool ok = status == GGML_STATUS_SUCCESS;
     if (ok) {
         ggml_backend_tensor_get(result, raw.data(), 0, raw.size() * sizeof(float));
     } else {
-        set_error(error, "DINOv3 graph compute failed");
+        set_error(error, "DINOv3 graph compute failed: " + scheduler_error);
     }
-    ggml_gallocr_free(allocator);
+    scheduler.synchronize();
     ggml_free(ctx);
     if (!ok) return false;
 

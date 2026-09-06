@@ -1,5 +1,6 @@
 #include "pixal3d/slat_decoder.h"
 
+#include "pixal3d/backend.h"
 #include "pixal3d/pack.h"
 
 #include "ggml.h"
@@ -439,6 +440,7 @@ struct SLatDecoderGpuState {
     std::string backend_name;
     std::unordered_map<std::string, ggml_tensor *> tensors;
     std::unordered_map<const float *, ggml_tensor *> host_tensors;
+    BackendManager * backend_manager = nullptr;
     bool attempted = false;
 
     ~SLatDecoderGpuState() { close(); }
@@ -450,10 +452,8 @@ struct SLatDecoderGpuState {
             ggml_backend_buffer_free(weights_buffer);
             weights_buffer = nullptr;
         }
-        if (backend) {
-            ggml_backend_free(backend);
-            backend = nullptr;
-        }
+        backend = nullptr;
+        backend_manager = nullptr;
         if (weights_ctx) {
             ggml_free(weights_ctx);
             weights_ctx = nullptr;
@@ -471,6 +471,9 @@ struct SLatDecoderGpuState {
     bool init(const Pixal3DPackReader & reader,
               const std::string & component,
               const std::unordered_map<std::string, std::vector<float>> & host,
+              ggml_backend_t selected_backend,
+              const std::string & selected_name,
+              BackendManager * manager,
               std::string * error) {
         if (ready()) return true;
         if (attempted) {
@@ -504,10 +507,15 @@ struct SLatDecoderGpuState {
                 close();
                 return false;
             }
-            ggml_tensor * tensor = ggml_new_tensor(weights_ctx, GGML_TYPE_F32,
+            // Decoder sparse CUDA convolution uses F32 gathered activations and
+            // F32 accumulation.  Keep decoder weights F32 on this path as well;
+            // flow weights retain their native reduced storage, but the large
+            // decoder view/CONT/MUL_MAT combination is not stable for native F16
+            // tensors at production token counts.
+            const ggml_type type = GGML_TYPE_F32;
+            ggml_tensor * tensor = ggml_new_tensor(weights_ctx, type,
                                                    info.n_dims, info.ne);
-            if (!tensor || ggml_nbytes(tensor) !=
-                found->second.size() * sizeof(float)) {
+            if (!tensor || ggml_nelements(tensor) != static_cast<int64_t>(found->second.size())) {
                 set_error(error, "SLat decoder GPU tensor shape mismatch: " + info.name);
                 close();
                 return false;
@@ -516,39 +524,9 @@ struct SLatDecoderGpuState {
             tensors.emplace(info.name, tensor);
         }
 
-        // Only select a real GPU backend.  CPU builds and systems without a
-        // CUDA/Vulkan device cleanly use the existing sparse CPU reference.
-        for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
-            ggml_backend_dev_t device = ggml_backend_dev_get(index);
-            if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
-            ggml_backend_t candidate = ggml_backend_dev_init(device, nullptr);
-            if (!candidate) continue;
-            ggml_init_params probe_params{};
-            probe_params.mem_size = ggml_tensor_overhead() * 8 + 4096;
-            probe_params.no_alloc = true;
-            ggml_context * probe_ctx = ggml_init(probe_params);
-            bool supports_sparse_recipe = false;
-            if (probe_ctx) {
-                ggml_tensor * values = ggml_new_tensor_2d(probe_ctx, GGML_TYPE_F32, 4, 4);
-                ggml_tensor * indices = ggml_new_tensor_1d(probe_ctx, GGML_TYPE_I32, 4);
-                ggml_tensor * gathered = values && indices
-                    ? ggml_get_rows(probe_ctx, values, indices) : nullptr;
-                ggml_tensor * matrix = ggml_new_tensor_2d(probe_ctx, GGML_TYPE_F32, 4, 4);
-                ggml_tensor * product = matrix && gathered
-                    ? ggml_mul_mat(probe_ctx, matrix, gathered) : nullptr;
-                supports_sparse_recipe = gathered && product &&
-                    ggml_backend_supports_op(candidate, gathered) &&
-                    ggml_backend_supports_op(candidate, product);
-                ggml_free(probe_ctx);
-            }
-            if (supports_sparse_recipe) {
-                backend = candidate;
-                const char * description = ggml_backend_dev_description(device);
-                backend_name = description ? description : ggml_backend_dev_name(device);
-                break;
-            }
-            ggml_backend_free(candidate);
-        }
+        backend = selected_backend;
+        backend_name = selected_name;
+        backend_manager = manager;
         if (!backend) {
             set_error(error, "no GPU backend supports SLat sparse gather/matmul");
             close();
@@ -562,6 +540,8 @@ struct SLatDecoderGpuState {
             return false;
         }
         ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        backend_manager->log_buffer(
+            "weights_allocated", backend, ggml_backend_buffer_get_size(weights_buffer));
         for (const auto & entry : tensors) {
             const auto found = host.find(entry.first);
             ggml_backend_tensor_set(entry.second, found->second.data(), 0,
@@ -655,6 +635,7 @@ struct SLatDecoderGpuState {
             indices.emplace(DecoderCoord{input.coords[point * 4 + 0], input.coords[point * 4 + 1],
                                   input.coords[point * 4 + 2], input.coords[point * 4 + 3]}, point);
         }
+
         const std::size_t graph_memory = ggml_tensor_overhead() * 4096 +
                                          ggml_graph_overhead_custom(4096, false);
         ggml_init_params params{};
@@ -664,6 +645,9 @@ struct SLatDecoderGpuState {
         if (!ctx) {
             set_error(error, "failed to allocate SLat decoder GPU convolution graph");
             return false;
+        }
+        if (bias_tensor->type != GGML_TYPE_F32) {
+            bias_tensor = ggml_cast(ctx, bias_tensor, GGML_TYPE_F32);
         }
         ggml_cgraph * graph = ggml_new_graph_custom(ctx, 4096, false);
         ggml_tensor * input_tensor = ggml_new_tensor_2d(
@@ -693,10 +677,9 @@ struct SLatDecoderGpuState {
                     ggml_tensor * gathered = ggml_get_rows(ctx, input_tensor, index_tensor);
                     ggml_tensor * kernel_weight_view = ggml_view_2d(
                         ctx, weight_tensor, input.channels, out_channels,
-                        weight_tensor->nb[1],
-                        static_cast<std::size_t>(kernel) *
-                            static_cast<std::size_t>(input.channels) *
-                            static_cast<std::size_t>(out_channels) * sizeof(float));
+                            weight_tensor->nb[1],
+                            static_cast<std::size_t>(kernel) * weight_tensor->nb[2]);
+
                     // Materialise the slice before GEMM.  This keeps the
                     // operation valid on CUDA backends that require a
                     // strictly contiguous matrix source for MUL_MAT.
@@ -716,12 +699,16 @@ struct SLatDecoderGpuState {
         accumulator = ggml_cont(ctx, accumulator);
         ggml_set_output(accumulator);
         ggml_build_forward_expand(graph, accumulator);
-        ggml_gallocr_t allocator = ggml_gallocr_new(
-            ggml_backend_get_default_buffer_type(backend));
-        if (!allocator || !ggml_gallocr_alloc_graph(allocator, graph)) {
-            if (allocator) ggml_gallocr_free(allocator);
+        std::string scheduler_error;
+        BackendScheduler scheduler(*backend_manager, 4096, false, true,
+                                   &scheduler_error, "SLat decoder");
+        if (!scheduler.valid() ||
+            (backend_manager->requires_primary_backend() &&
+             !scheduler.require_primary_graph(graph, &scheduler_error)) ||
+            !scheduler.allocate_graph(graph, &scheduler_error)) {
             ggml_free(ctx);
-            set_error(error, "failed to allocate SLat decoder GPU convolution graph");
+            set_error(error, scheduler_error.empty()
+                ? "failed to allocate SLat decoder GPU convolution graph" : scheduler_error);
             return false;
         }
         ggml_backend_tensor_set(input_tensor, padded_values.data(), 0,
@@ -749,7 +736,7 @@ struct SLatDecoderGpuState {
             ggml_backend_tensor_set(index_tensors[index], index_values.data(), 0,
                                     index_values.size() * sizeof(std::int32_t));
         }
-        const ggml_status status = ggml_backend_graph_compute(backend, graph);
+        const ggml_status status = scheduler.compute(graph, &scheduler_error);
         bool ok = status == GGML_STATUS_SUCCESS;
         std::vector<float> result_values(points * static_cast<std::size_t>(out_channels));
         if (ok) {
@@ -757,9 +744,9 @@ struct SLatDecoderGpuState {
                                     result_values.size() * sizeof(float));
             ok = finish_sparse(input, out_channels, result_values, output, error);
         } else {
-            set_error(error, "SLat decoder GPU convolution graph compute failed");
+            set_error(error, "SLat decoder GPU convolution graph compute failed" +
+                      (scheduler_error.empty() ? std::string{} : ": " + scheduler_error));
         }
-        ggml_gallocr_free(allocator);
         ggml_free(ctx);
         return ok;
     }
@@ -772,6 +759,7 @@ struct SLatDecoderModel::Impl {
     SLatDecoderHParams hp;
     std::string component;
     std::unordered_map<std::string, std::vector<float>> tensors;
+    BackendManager backend_manager;
     SLatDecoderGpuState gpu;
     int tensor_count = 0;
     bool has_data = false;
@@ -800,7 +788,21 @@ struct SLatDecoderModel::Impl {
             set_error(error, "SLat decoder model was loaded metadata-only");
             return false;
         }
-        return gpu.init(reader, component, tensors, error);
+        if (gpu.ready()) return true;
+        if (!backend_manager.initialize_from_environment("PIXAL3D_SLAT_DECODER_BACKEND", error)) {
+            return false;
+        }
+        if (backend_manager.policy().kind == BackendPolicyKind::cpu ||
+            !backend_manager.primary() || backend_manager.devices().empty() ||
+            (backend_manager.devices().front().type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+             backend_manager.devices().front().type != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+            set_error(error, "SLat decoder backend policy did not select a GPU backend");
+            backend_manager.close();
+            return false;
+        }
+        return gpu.init(reader, component, tensors,
+                        backend_manager.primary(), backend_manager.primary_name(),
+                        &backend_manager, error);
     }
 };
 
@@ -1183,8 +1185,11 @@ bool SLatDecoderModel::decode(
         return false;
     }
 
-    const char * backend_mode = std::getenv("PIXAL3D_SLAT_DECODER_BACKEND");
-    const bool force_cpu = backend_mode && std::string(backend_mode) == "cpu";
+    BackendPolicy policy = BackendPolicy::from_environment(
+        "PIXAL3D_SLAT_DECODER_BACKEND", nullptr, error);
+    if (error && !error->empty()) return false;
+    const bool force_cpu = policy.kind == BackendPolicyKind::cpu;
+    const bool force_gpu = policy.kind == BackendPolicyKind::gpu;
     const bool verbose = std::getenv("PIXAL3D_SLAT_VERBOSE") != nullptr;
     if (!force_cpu) {
         std::string gpu_error;
@@ -1199,10 +1204,19 @@ bool SLatDecoderModel::decode(
                 return true;
             }
         }
+        if (force_gpu) {
+            set_error(error, "SLat decoder forced GPU execution failed" +
+                             (gpu_error.empty() ? std::string{} : ": " + gpu_error));
+            impl_->gpu.close();
+            impl_->backend_manager.close();
+            return false;
+        }
         if (verbose && !gpu_error.empty()) {
             std::cerr << "pixal3d: SLat decoder GPU unavailable; using CPU fallback: "
                       << gpu_error << std::endl;
         }
+        impl_->gpu.close();
+        impl_->backend_manager.close();
     }
 
     SLatDecoderWeightsF32 weights;
@@ -1262,8 +1276,11 @@ bool SLatDecoderModel::upsample_coords(const SparseTensorF32 & input,
         set_error(error, "SLat decoder upsample latent shape does not match metadata");
         return false;
     }
-    const char * backend_mode = std::getenv("PIXAL3D_SLAT_DECODER_BACKEND");
-    const bool force_cpu = backend_mode && std::string(backend_mode) == "cpu";
+    BackendPolicy policy = BackendPolicy::from_environment(
+        "PIXAL3D_SLAT_DECODER_BACKEND", nullptr, error);
+    if (error && !error->empty()) return false;
+    const bool force_cpu = policy.kind == BackendPolicyKind::cpu;
+    const bool force_gpu = policy.kind == BackendPolicyKind::gpu;
     const bool verbose = std::getenv("PIXAL3D_SLAT_VERBOSE") != nullptr;
     if (!force_cpu) {
         std::string gpu_error;
@@ -1271,10 +1288,19 @@ bool SLatDecoderModel::upsample_coords(const SparseTensorF32 & input,
             impl_->upsample_coords_gpu(input, upsample_times, output, &gpu_error)) {
             return true;
         }
+        if (force_gpu) {
+            set_error(error, "SLat decoder forced GPU coordinate upsample failed" +
+                             (gpu_error.empty() ? std::string{} : ": " + gpu_error));
+            impl_->gpu.close();
+            impl_->backend_manager.close();
+            return false;
+        }
         if (verbose && !gpu_error.empty()) {
             std::cerr << "pixal3d: SLat decoder coordinate upsample GPU unavailable; "
                       << "using CPU fallback: " << gpu_error << std::endl;
         }
+        impl_->gpu.close();
+        impl_->backend_manager.close();
     }
     SLatDecoderWeightsF32 weights;
     if (!impl_->make_weights(weights, error)) return false;
