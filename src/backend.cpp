@@ -269,6 +269,16 @@ bool BackendManager::initialize(const BackendPolicy & policy,
         return false;
     }
 
+    const auto register_backend = [this](const DeviceEntry & entry,
+                                         ggml_backend_t backend,
+                                         bool make_primary) {
+        backends_.push_back(backend);
+        devices_.push_back(entry.info);
+        if (make_primary || primary_name_.empty()) {
+            primary_name_ = entry.info.description;
+        }
+    };
+
     if (policy.kind != BackendPolicyKind::cpu && selected_gpu_entry != no_entry) {
         const DeviceEntry & entry = inventory[selected_gpu_entry];
         ggml_backend_t backend = ggml_backend_dev_init(entry.device, nullptr);
@@ -281,9 +291,7 @@ bool BackendManager::initialize(const BackendPolicy & policy,
             std::cerr << "pixal3d: GPU backend " << entry.info.description
                       << " failed to initialize; falling back" << std::endl;
         } else {
-            backends_.push_back(backend);
-            devices_.push_back(entry.info);
-            primary_name_ = entry.info.description;
+            register_backend(entry, backend, true);
             std::cerr << "pixal3d: using " << primary_name_ << " backend"
                       << " (policy=" << policy.name() << ")" << std::endl;
         }
@@ -298,9 +306,7 @@ bool BackendManager::initialize(const BackendPolicy & policy,
                           << " failed to initialize; skipping" << std::endl;
                 continue;
             }
-            if (backends_.empty()) primary_name_ = entry.info.description;
-            backends_.push_back(backend);
-            devices_.push_back(entry.info);
+            register_backend(entry, backend, false);
             std::cerr << "pixal3d: using " << entry.info.description
                       << " backend (ACCEL)" << std::endl;
         }
@@ -318,9 +324,7 @@ bool BackendManager::initialize(const BackendPolicy & policy,
         close();
         return false;
     }
-    backends_.push_back(cpu_backend);
-    devices_.push_back(cpu.info);
-    if (primary_name_.empty()) primary_name_ = cpu.info.description;
+    register_backend(cpu, cpu_backend, false);
     initialized_ = true;
     std::cerr << "pixal3d: backend manager ready (policy=" << policy.name()
               << ", backends=" << backends_.size() << ")" << std::endl;

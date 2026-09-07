@@ -117,6 +117,22 @@ int main() {
     if (!check(!manager.primary_name().empty(),
                "CPU backend manager has no primary name")) return 1;
 
+    pixal3d::BackendManager auto_manager;
+    error.clear();
+    if (!check(auto_manager.initialize(
+                   {pixal3d::BackendPolicyKind::auto_select, 0}, &error),
+               error.empty() ? "auto backend manager initialization failed"
+                             : error.c_str())) return 1;
+    if (!check(auto_manager.initialized() &&
+                   auto_manager.backends().size() == auto_manager.devices().size() &&
+                   !auto_manager.backends().empty(),
+               "auto backend manager has inconsistent device state")) return 1;
+    if (!check(auto_manager.devices().back().type == GGML_BACKEND_DEVICE_TYPE_CPU,
+               "auto backend manager did not keep CPU as the final fallback")) return 1;
+    if (!check(!auto_manager.primary_name().empty(),
+               "auto backend manager has no primary name")) return 1;
+    auto_manager.close();
+
     ggml_init_params params{};
     params.mem_size = ggml_tensor_overhead() * 8 +
                       ggml_graph_overhead_custom(8, false);
