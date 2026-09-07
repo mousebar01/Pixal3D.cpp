@@ -429,6 +429,33 @@ bool read_hparams(const Pixal3DPackReader & reader, const std::string & componen
 
 } // namespace
 
+struct SLatFlowGpuRuntimeKey {
+    std::size_t points = 0;
+    std::size_t context_tokens = 0;
+    bool projection_mode = false;
+    int projection_channels = 0;
+    int concat_channels = 0;
+    std::string component;
+    std::string backend_policy;
+    std::string backend;
+
+    bool matches(std::size_t points_value,
+                 std::size_t context_tokens_value,
+                 bool projection_mode_value,
+                 int projection_channels_value,
+                 int concat_channels_value,
+                 const std::string & component_value,
+                 const std::string & backend_policy_value,
+                 const std::string & backend_value) const noexcept {
+        return points == points_value && context_tokens == context_tokens_value &&
+               projection_mode == projection_mode_value &&
+               projection_channels == projection_channels_value &&
+               concat_channels == concat_channels_value &&
+               component == component_value && backend_policy == backend_policy_value &&
+               backend == backend_value;
+    }
+};
+
 struct SLatFlowModel::Impl {
     Pixal3DPackReader reader;
     SLatFlowHParams hp;
@@ -441,12 +468,49 @@ struct SLatFlowModel::Impl {
     ggml_backend_buffer_t weights_buffer = nullptr;
     std::string backend_name;
     std::unordered_map<std::string, ggml_tensor *> backend_tensors;
+    SLatFlowGpuRuntimeKey runtime_key;
+    BackendScheduler runtime_scheduler;
+    ggml_context * runtime_ctx = nullptr;
+    ggml_cgraph * runtime_graph = nullptr;
+    ggml_tensor * runtime_x = nullptr;
+    ggml_tensor * runtime_temb = nullptr;
+    ggml_tensor * runtime_cos = nullptr;
+    ggml_tensor * runtime_sin = nullptr;
+    ggml_tensor * runtime_context = nullptr;
+    ggml_tensor * runtime_projection = nullptr;
+    ggml_tensor * runtime_result = nullptr;
+    SLatFiniteProbe runtime_finite_probe;
+    bool runtime_ready = false;
     int tensor_count = 0;
     bool has_data = false;
 
     ~Impl() { close_gpu(); }
 
+    void close_runtime() noexcept {
+        // The scheduler owns the graph allocations.  Synchronize before
+        // releasing it, then release it before the graph context so no
+        // scheduler tensor references become dangling.
+        runtime_scheduler.synchronize();
+        runtime_scheduler = BackendScheduler{};
+        if (runtime_ctx) {
+            ggml_free(runtime_ctx);
+            runtime_ctx = nullptr;
+        }
+        runtime_graph = nullptr;
+        runtime_x = nullptr;
+        runtime_temb = nullptr;
+        runtime_cos = nullptr;
+        runtime_sin = nullptr;
+        runtime_context = nullptr;
+        runtime_projection = nullptr;
+        runtime_result = nullptr;
+        runtime_finite_probe = SLatFiniteProbe{};
+        runtime_key = SLatFlowGpuRuntimeKey{};
+        runtime_ready = false;
+    }
+
     void close_gpu() noexcept {
+        close_runtime();
         backend_tensors.clear();
         if (weights_buffer) {
             ggml_backend_buffer_free(weights_buffer);
@@ -685,6 +749,76 @@ bool SLatFlowModel::Impl::forward_gpu(
 
     const std::size_t query_chunks =
         (points + 511) / 512;
+    const int concat_channels = concat_condition ? concat_condition->channels : 0;
+    const bool projection_mode = hp.image_attn_mode == "proj";
+    const int projection_channels = projection_mode ? hp.proj_in_channels : 0;
+    const std::string backend_policy = backend_manager.policy().name();
+    const bool runtime_hit = runtime_ready && runtime_key.matches(
+        points, context_tokens, projection_mode, projection_channels,
+        concat_channels, hp.component, backend_policy, backend_name);
+
+    // These host-side inputs are refreshed for every invocation while the
+    // graph and its device allocations remain stage-local and shape-fixed.
+    std::vector<float> channel_major_input(points * static_cast<std::size_t>(hp.in_channels));
+    for (std::size_t point = 0; point < points; ++point) {
+        for (int channel = 0; channel < hp.in_channels; ++channel) {
+            channel_major_input[static_cast<std::size_t>(channel) * points + point] =
+                input_for_model->feats[point * static_cast<std::size_t>(hp.in_channels) +
+                                        static_cast<std::size_t>(channel)];
+        }
+    }
+    std::vector<float> embedding;
+    if (!timestep_embedding(timesteps, 1, 256, 10000, embedding, error)) return false;
+    std::vector<float> cos_values(points * static_cast<std::size_t>(hd), 1.0f);
+    std::vector<float> sin_values(points * static_cast<std::size_t>(hd), 0.0f);
+    const int rope_freq_dim = hd / 2 / 3;
+    const int rope_pairs = hd / 2;
+    std::vector<float> frequencies(static_cast<std::size_t>(std::max(rope_freq_dim, 0)));
+    for (int index = 0; index < rope_freq_dim; ++index) {
+        frequencies[static_cast<std::size_t>(index)] = hp.rope_freq_min /
+            std::pow(hp.rope_freq_base, static_cast<float>(index) /
+                     static_cast<float>(rope_freq_dim));
+    }
+    for (std::size_t point = 0; point < points; ++point) {
+        const int coordinate[3] = {
+            input_for_model->coords[point * 4 + 1],
+            input_for_model->coords[point * 4 + 2],
+            input_for_model->coords[point * 4 + 3]};
+        for (int pair = 0; pair < rope_pairs; ++pair) {
+            float phase = 0.0f;
+            if (rope_freq_dim > 0 && pair < 3 * rope_freq_dim) {
+                phase = static_cast<float>(coordinate[pair / rope_freq_dim]) *
+                        frequencies[static_cast<std::size_t>(pair % rope_freq_dim)];
+            }
+            const std::size_t base = point * static_cast<std::size_t>(hd) +
+                                     static_cast<std::size_t>(pair * 2);
+            cos_values[base] = cos_values[base + 1] = std::cos(phase);
+            sin_values[base] = sin_values[base + 1] = std::sin(phase);
+        }
+    }
+
+    ggml_context * ctx = runtime_ctx;
+    ggml_cgraph * graph = runtime_graph;
+    ggml_tensor * x_t = runtime_x;
+    ggml_tensor * temb = runtime_temb;
+    ggml_tensor * cos_t = runtime_cos;
+    ggml_tensor * sin_t = runtime_sin;
+    ggml_tensor * cnd = runtime_context;
+    ggml_tensor * proj = runtime_projection;
+    ggml_tensor * result = runtime_result;
+    std::string scheduler_error;
+    if (!runtime_hit) {
+        close_runtime();
+        ctx = nullptr;
+        graph = nullptr;
+        x_t = nullptr;
+        temb = nullptr;
+        cos_t = nullptr;
+        sin_t = nullptr;
+        cnd = nullptr;
+        proj = nullptr;
+        result = nullptr;
+        const double graph_build_start = backend_time_now_ms();
     // Chunked long-sequence attention adds graph nodes for every query chunk
     // in every transformer block.  Keep the compact graph for short inputs,
     // but size the metadata arena from the actual point count so shape_1024
@@ -696,24 +830,24 @@ bool SLatFlowModel::Impl::forward_gpu(
     ggml_init_params graph_params{};
     graph_params.mem_size = graph_memory;
     graph_params.no_alloc = true;
-    ggml_context * ctx = ggml_init(graph_params);
+    ctx = ggml_init(graph_params);
     if (!ctx) {
         set_error(error, "failed to allocate SLat flow GPU graph context");
         return false;
     }
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_capacity, false);
+    graph = ggml_new_graph_custom(ctx, graph_capacity, false);
     if (!graph) {
         ggml_free(ctx);
         set_error(error, "failed to allocate SLat flow GPU graph");
         return false;
     }
 
-    ggml_tensor * x_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, hp.in_channels);
-    ggml_tensor * temb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
-    ggml_tensor * cos_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, 1, N);
-    ggml_tensor * sin_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, 1, N);
-    ggml_tensor * cnd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.cond_channels, Lkv);
-    ggml_tensor * proj = hp.image_attn_mode == "proj"
+    x_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, hp.in_channels);
+    temb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
+    cos_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, 1, N);
+    sin_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, 1, N);
+    cnd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.cond_channels, Lkv);
+    proj = hp.image_attn_mode == "proj"
         ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.proj_in_channels, N) : nullptr;
     if (!x_t || !temb || !cos_t || !sin_t || !cnd ||
         (hp.image_attn_mode == "proj" && !proj)) {
@@ -790,6 +924,10 @@ bool SLatFlowModel::Impl::forward_gpu(
         // attention preserves the reference's F32 softmax while bounding the
         // temporary score matrix to [key_sequence, query_chunk].
         constexpr int query_chunk = 512;
+        // This permutation is independent of the query window.  Building it
+        // once avoids one large contiguous layout conversion per chunk while
+        // preserving the existing F32 attention graph and output ordering.
+        ggml_tensor * vt = ggml_cont(ctx, ggml_permute(ctx, vp, 1, 0, 2, 3));
         ggml_tensor * result = nullptr;
         const int64_t query_length = qp->ne[1];
         for (int64_t query_start = 0; query_start < query_length;
@@ -804,7 +942,6 @@ bool SLatFlowModel::Impl::forward_gpu(
             if (scores) ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
             scores = ggml_soft_max_ext(ctx, scores, nullptr,
                                        attention_scale, 0.0f);
-            ggml_tensor * vt = ggml_cont(ctx, ggml_permute(ctx, vp, 1, 0, 2, 3));
             ggml_tensor * chunk = ggml_mul_mat(ctx, vt, scores);
             if (chunk) ggml_mul_mat_set_prec(chunk, GGML_PREC_F32);
             chunk = ggml_cont(ctx, ggml_permute(ctx, chunk, 0, 2, 1, 3));
@@ -819,47 +956,6 @@ bool SLatFlowModel::Impl::forward_gpu(
             static_cast<std::size_t>(offset) * C * element_size);
         return ggml_reshape_3d(ctx, ggml_cont(ctx, view), hd, H, sequence);
     };
-
-    std::vector<float> channel_major_input(points * static_cast<std::size_t>(hp.in_channels));
-    for (std::size_t point = 0; point < points; ++point) {
-        for (int channel = 0; channel < hp.in_channels; ++channel) {
-            channel_major_input[static_cast<std::size_t>(channel) * points + point] =
-                input_for_model->feats[point * static_cast<std::size_t>(hp.in_channels) +
-                                        static_cast<std::size_t>(channel)];
-        }
-    }
-    std::vector<float> embedding;
-    if (!timestep_embedding(timesteps, 1, 256, 10000, embedding, error)) {
-        ggml_free(ctx);
-        return false;
-    }
-    std::vector<float> cos_values(points * static_cast<std::size_t>(hd), 1.0f);
-    std::vector<float> sin_values(points * static_cast<std::size_t>(hd), 0.0f);
-    const int rope_freq_dim = hd / 2 / 3;
-    const int rope_pairs = hd / 2;
-    std::vector<float> frequencies(static_cast<std::size_t>(std::max(rope_freq_dim, 0)));
-    for (int index = 0; index < rope_freq_dim; ++index) {
-        frequencies[static_cast<std::size_t>(index)] = hp.rope_freq_min /
-            std::pow(hp.rope_freq_base, static_cast<float>(index) /
-                     static_cast<float>(rope_freq_dim));
-    }
-    for (std::size_t point = 0; point < points; ++point) {
-        const int coordinate[3] = {
-            input_for_model->coords[point * 4 + 1],
-            input_for_model->coords[point * 4 + 2],
-            input_for_model->coords[point * 4 + 3]};
-        for (int pair = 0; pair < rope_pairs; ++pair) {
-            float phase = 0.0f;
-            if (rope_freq_dim > 0 && pair < 3 * rope_freq_dim) {
-                phase = static_cast<float>(coordinate[pair / rope_freq_dim]) *
-                        frequencies[static_cast<std::size_t>(pair % rope_freq_dim)];
-            }
-            const std::size_t base = point * static_cast<std::size_t>(hd) +
-                                     static_cast<std::size_t>(pair * 2);
-            cos_values[base] = cos_values[base + 1] = std::cos(phase);
-            sin_values[base] = sin_values[base + 1] = std::sin(phase);
-        }
-    }
 
     ggml_tensor * h = ggml_cont(ctx, ggml_transpose(ctx, x_t));
     h = lin(h, "input_layer");
@@ -929,10 +1025,11 @@ bool SLatFlowModel::Impl::forward_gpu(
     }
     h = ggml_norm(ctx, h, 1e-5f);
     h = lin(h, "out_layer");
-    ggml_tensor * result = ggml_cont(ctx, h);
+    result = ggml_cont(ctx, h);
     ggml_set_output(result);
     ggml_build_forward_expand(graph, result);
-    std::string scheduler_error;
+    backend_log_timing(hp.component.c_str(), "graph_build",
+                       backend_time_now_ms() - graph_build_start);
     BackendScheduler scheduler(backend_manager, graph_capacity, false, true,
                                 &scheduler_error, hp.component.c_str());
     if (!scheduler.valid() ||
@@ -942,6 +1039,7 @@ bool SLatFlowModel::Impl::forward_gpu(
         set_error(error, scheduler_error.empty()
             ? "failed to allocate SLat flow GPU compute graph" : scheduler_error);
         ggml_free(ctx);
+        close_runtime();
         return false;
     }
     if (std::getenv("PIXAL3D_SLAT_TRACE")) {
@@ -965,49 +1063,76 @@ bool SLatFlowModel::Impl::forward_gpu(
     if (std::getenv("PIXAL3D_SLAT_TRACE")) {
         std::cerr << "pixal3d: SLat GPU graph allocation complete" << std::endl;
     }
-    SLatFiniteProbe finite_probe;
-    if (const char * value = std::getenv("PIXAL3D_SLAT_NONFINITE_TRACE")) {
-        if (*value && std::strcmp(value, "0") != 0) {
-            finite_probe.component = hp.component;
-            scheduler.set_eval_callback(slat_finite_callback, &finite_probe);
-            std::cerr << "pixal3d: SLat finite probe enabled component="
-                      << hp.component << std::endl;
-        }
+    runtime_scheduler = std::move(scheduler);
+    runtime_ctx = ctx;
+    runtime_graph = graph;
+    runtime_x = x_t;
+    runtime_temb = temb;
+    runtime_cos = cos_t;
+    runtime_sin = sin_t;
+    runtime_context = cnd;
+    runtime_projection = proj;
+    runtime_result = result;
+    runtime_key = SLatFlowGpuRuntimeKey{
+        points, context_tokens, projection_mode, projection_channels,
+        concat_channels, hp.component, backend_policy, backend_name};
+    runtime_ready = true;
     }
 
-    ggml_backend_tensor_set(x_t, channel_major_input.data(), 0,
+    runtime_finite_probe = SLatFiniteProbe{};
+    if (const char * value = std::getenv("PIXAL3D_SLAT_NONFINITE_TRACE")) {
+        if (*value && std::strcmp(value, "0") != 0) {
+            runtime_finite_probe.component = hp.component;
+            runtime_scheduler.set_eval_callback(slat_finite_callback,
+                                                &runtime_finite_probe);
+            std::cerr << "pixal3d: SLat finite probe enabled component="
+                      << hp.component << std::endl;
+        } else {
+            runtime_scheduler.set_eval_callback(nullptr, nullptr);
+        }
+    } else {
+        runtime_scheduler.set_eval_callback(nullptr, nullptr);
+    }
+
+    const double upload_start = backend_time_now_ms();
+    ggml_backend_tensor_set(runtime_x, channel_major_input.data(), 0,
                             channel_major_input.size() * sizeof(float));
-    ggml_backend_tensor_set(temb, embedding.data(), 0, embedding.size() * sizeof(float));
-    ggml_backend_tensor_set(cos_t, cos_values.data(), 0, cos_values.size() * sizeof(float));
-    ggml_backend_tensor_set(sin_t, sin_values.data(), 0, sin_values.size() * sizeof(float));
+    ggml_backend_tensor_set(runtime_temb, embedding.data(), 0, embedding.size() * sizeof(float));
+    ggml_backend_tensor_set(runtime_cos, cos_values.data(), 0, cos_values.size() * sizeof(float));
+    ggml_backend_tensor_set(runtime_sin, sin_values.data(), 0, sin_values.size() * sizeof(float));
     // The public condition buffers are row-major [token, channel] / [point,
     // channel].  With ggml tensors shaped [channel, token/point], that byte
     // order is exactly the required contiguous layout (ne[0] is the channel
     // dimension), so upload the buffers directly as in the reference graph.
-    ggml_backend_tensor_set(cnd, global_context.feats.data(), 0,
+    ggml_backend_tensor_set(runtime_context, global_context.feats.data(), 0,
                             global_context.feats.size() * sizeof(float));
-    if (proj) {
-        ggml_backend_tensor_set(proj, projection_context->feats.data(), 0,
+    if (runtime_projection) {
+        ggml_backend_tensor_set(runtime_projection, projection_context->feats.data(), 0,
                                 projection_context->feats.size() * sizeof(float));
     }
+    backend_log_timing(hp.component.c_str(), "input_upload",
+                       backend_time_now_ms() - upload_start);
     if (std::getenv("PIXAL3D_SLAT_TRACE")) {
         std::cerr << "pixal3d: SLat GPU graph compute start" << std::endl;
     }
-    const ggml_status status = scheduler.compute(graph, &scheduler_error);
+    const ggml_status status = runtime_scheduler.compute(runtime_graph, &scheduler_error);
     if (std::getenv("PIXAL3D_SLAT_TRACE")) {
         std::cerr << "pixal3d: SLat GPU graph compute complete status="
                   << static_cast<int>(status) << std::endl;
     }
     std::vector<float> backend_output(points * static_cast<std::size_t>(hp.out_channels));
     bool ok = status == GGML_STATUS_SUCCESS;
-    if (finite_probe.bad) {
-        set_error(error, finite_probe.error.empty()
-            ? "SLat finite probe found a non-finite graph node" : finite_probe.error);
+    if (runtime_finite_probe.bad) {
+        set_error(error, runtime_finite_probe.error.empty()
+            ? "SLat finite probe found a non-finite graph node" : runtime_finite_probe.error);
         ok = false;
     }
     if (ok) {
-        ggml_backend_tensor_get(result, backend_output.data(), 0,
+        const double download_start = backend_time_now_ms();
+        ggml_backend_tensor_get(runtime_result, backend_output.data(), 0,
                                 backend_output.size() * sizeof(float));
+        backend_log_timing(hp.component.c_str(), "output_download",
+                           backend_time_now_ms() - download_start);
         output = *input_for_model;
         output.channels = hp.out_channels;
         // The final graph tensor is already returned in the public
@@ -1020,11 +1145,10 @@ bool SLatFlowModel::Impl::forward_gpu(
                 ? "SLat flow GPU output contains a non-finite value" : finite_error);
             ok = false;
         }
-    } else if (!finite_probe.bad) {
+    } else if (!runtime_finite_probe.bad) {
         set_error(error, "SLat flow GPU graph compute failed" +
                   (scheduler_error.empty() ? std::string{} : ": " + scheduler_error));
     }
-    ggml_free(ctx);
     return ok;
 }
 

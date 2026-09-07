@@ -71,6 +71,19 @@ The point cap and changed threshold are diagnostic controls. `run-image`
 additionally accepts `--vision-resolution N` (>=16, divisible by 16) as a small
 smoke-test override.
 
+### Mesh coordinate frames
+
+The decoded `DualGridMeshF32` vertices stay in the canonical decoder AABB
+frame, with axes corresponding to the sparse `[x, y, z]` grid.  The OBJ writer
+applies the same final export rotation as the Python reference:
+`(x, y, z) -> (-x, -z, -y)`.  Face indices and winding are preserved because
+this transform has positive determinant.  Preview tools should therefore read
+the exported OBJ in its final frame rather than applying another axis swap.
+
+This export conversion is only a coordinate-frame change; it does not fill
+missing geometry or replace the Python CuMesh remesh/decimation postprocess.
+
+
 ## Resolution support
 
 The cascade resolution is not the same thing as the resolution of every model
@@ -180,16 +193,20 @@ The native bridge applies the reference relative-camera transform and average
 fusion, projecting only the sparse coordinates requested by the sampler.
 
 `run-image` reads PNG/JPEG when those libraries were found at configure time;
-otherwise use PNM. Native image inference does not perform background matting
-or MoGe camera estimation. For photographs, the optional helper can prepare an
-explicit input using rembg:
+otherwise use PNM. RGBA PNG inputs now follow the reference foreground path:
+longest-side cap, alpha foreground crop with 10% square margin, and black
+background compositing. RGB/JPEG inputs still do not run rembg, and native
+image inference does not perform MoGe camera estimation. For photographs, the
+optional helper can prepare an explicit input using rembg:
 
 ```sh
 python3 scripts/preprocess_pixal3d_image.py input.png prepared.png
 ```
 
 The native path uses manual front-camera defaults or the camera options above;
-`run-image` requires DINO and NAF GGUFs.
+`run-image` requires DINO and NAF GGUFs. Set
+`PIXAL3D_CASCADE_SPATIAL_TRACE=1` to print x/y/z occupancy buckets after SS,
+coordinate upsampling, high-resolution quantization, and shape decoding.
 
 ## Backend selection
 
@@ -272,16 +289,35 @@ experimental F16 flow pack. It checks finite OBJ geometry only. Full 30-block
 production parity, unrestricted image quality, and bitwise-identical GPU/CPU
 mesh topology near occupancy thresholds are not claimed.
 
+The deterministic SLat decoder parity tool uses a three-level decoder fixture
+and compares every subdivision level, strict `logit > 0` mask, coordinate set,
+and final features against the Python module graph:
+
+```sh
+python3 scripts/compare_slat_decoder.py
+```
+
+The fixture is also registered as `pixal3d_slat_decoder_fixture` with
+`unit;parity;cpu` labels. For a real cascade, set
+`PIXAL3D_SLAT_DECODER_VERBOSE=1` to log shape-high coordinate fingerprints,
+per-level decoder point/active counts, and final decoded coordinate
+fingerprints. This is diagnostic only and does not change decoder precision or
+backend placement.
+
 ## Current limitations
 
 - Wavefront OBJ output contains geometry only. Texture voxel attributes remain
   in memory; material and texture sidecar output is not implemented.
 - Cascade mesh output applies a CPU bounded boundary-loop fan fill matching the
-  observable CuMesh `fill_holes(0.03)` contract. It is not the Python CuMesh
-  implementation and does not include the separate Python remesh/decimation
-  postprocess.
-- Native image inference has no hidden rembg/matting, MoGe camera estimation,
-  or Python preprocessing step.
+  observable CuMesh `fill_holes(0.03)` contract. A separate
+  `repair_non_manifold_edges_f32()` helper can split vertices for export-stage
+  diagnostics, but it is not enabled by default: on the 1024/12-step diagnostic
+  mesh it removed 218,118 over-shared edges while increasing the mesh from 10
+  to 57,343 connected components. It is not the Python CuMesh implementation
+  and does not include the separate Python remesh/decimation postprocess.
+- Native image inference now applies the alpha-aware RGBA crop and black matte
+  used by the reference. It still has no rembg fallback for RGB inputs and no
+  MoGe camera estimation.
 - GPU execution is partial and capability-driven. `auto` uses scheduler-managed
   CPU/GPU cooperation; forced GPU reports failures for required core nodes.
   CPU-resident preprocessing, sampling, sparse topology, and mesh extraction

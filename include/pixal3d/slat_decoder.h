@@ -38,6 +38,10 @@ struct SLatDecoderBlockWeightsF32 {
     int mlp_hidden = 0;
 };
 
+// The final decoder normalization mirrors Python's F.layer_norm call without
+// an explicit eps argument; intermediate block normalizations use norm_eps.
+constexpr float k_slat_decoder_final_layer_norm_eps = 1.0e-5f;
+
 struct SLatDecoderConfig {
     int latent_channels = 0;
     int out_channels = 0;

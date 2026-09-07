@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <chrono>
 #include <utility>
 
 namespace pixal3d {
@@ -94,6 +95,22 @@ const char * backend_device_type_name(enum ggml_backend_dev_type type) noexcept 
         case GGML_BACKEND_DEVICE_TYPE_ACCEL: return "ACCEL";
     }
     return "UNKNOWN";
+}
+
+double backend_time_now_ms() noexcept {
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration<double, std::milli>(
+        clock::now().time_since_epoch()).count();
+}
+
+void backend_log_timing(const char * stage,
+                        const char * phase,
+                        double elapsed_ms) noexcept {
+    if (!trace_enabled()) return;
+    std::cerr << "pixal3d: backend timing stage="
+              << (stage && *stage ? stage : "unknown")
+              << " phase=" << (phase && *phase ? phase : "unknown")
+              << " elapsed_ms=" << elapsed_ms << std::endl;
 }
 
 bool BackendPolicy::parse(const std::string & value,
@@ -540,10 +557,15 @@ bool BackendScheduler::allocate_graph(ggml_cgraph * graph, std::string * error) 
     for (ggml_tensor * node : required_nodes_) {
         ggml_backend_sched_set_tensor_backend(scheduler_, node, manager_->primary());
     }
+    const double allocation_start = backend_time_now_ms();
     if (!ggml_backend_sched_alloc_graph(scheduler_, graph)) {
+        backend_log_timing(stage_.c_str(), "scheduler_allocate",
+                           backend_time_now_ms() - allocation_start);
         set_error(error, "failed to allocate ggml graph on configured backends");
         return false;
     }
+    backend_log_timing(stage_.c_str(), "scheduler_allocate",
+                       backend_time_now_ms() - allocation_start);
     if (!validate_placement(graph, error)) return false;
     log_trace(graph, "allocated");
     return true;
@@ -561,7 +583,10 @@ ggml_status BackendScheduler::compute(ggml_cgraph * graph, std::string * error) 
     if (!preflight(graph, error) || !validate_placement(graph, error)) {
         return GGML_STATUS_FAILED;
     }
+    const double compute_start = backend_time_now_ms();
     const ggml_status status = ggml_backend_sched_graph_compute(scheduler_, graph);
+    backend_log_timing(stage_.c_str(), "scheduler_compute",
+                       backend_time_now_ms() - compute_start);
     if (status != GGML_STATUS_SUCCESS) {
         set_error(error, "ggml backend scheduler graph compute failed");
     }

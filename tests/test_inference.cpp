@@ -17,10 +17,12 @@ int main() {
         config.cascade.texture_sampler.guidance_strength != 1.0f) return 1;
 
     pixal3d::DualGridMeshF32 mesh;
-    mesh.vertices = {0.0f, 0.0f, 0.0f,
-                     1.0f, 0.0f, 0.0f,
-                     0.0f, 1.0f, 0.0f};
+    mesh.vertices = {1.0f, 2.0f, 3.0f,
+                     4.0f, 5.0f, 6.0f,
+                     7.0f, 8.0f, 9.0f};
     mesh.faces = {0, 1, 2};
+    const std::vector<float> original_vertices = mesh.vertices;
+    const std::vector<std::int32_t> original_faces = mesh.faces;
     const std::string path = "/tmp/pixal3d-inference-test.obj";
     std::string error;
     if (!pixal3d::write_pixal3d_obj(mesh, path, &error)) return 1;
@@ -28,8 +30,11 @@ int main() {
     std::stringstream contents;
     contents << file.rdbuf();
     const std::string text = contents.str();
-    if (text.find("v 0") == std::string::npos ||
-        text.find("f 1 2 3") == std::string::npos) return 1;
+    if (text.find("v -1 -3 -2\n") == std::string::npos ||
+        text.find("v -4 -6 -5\n") == std::string::npos ||
+        text.find("v -7 -9 -8\n") == std::string::npos ||
+        text.find("f 1 2 3\n") == std::string::npos ||
+        mesh.vertices != original_vertices || mesh.faces != original_faces) return 1;
     std::remove(path.c_str());
 
     pixal3d::Pixal3DCascadeOutputF32 output;

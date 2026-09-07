@@ -283,7 +283,9 @@ bool slat_decoder_forward_f32(
         return false;
     }
     SparseTensorF32 normalized;
-    if (!sparse_layer_norm(hidden, config.norm_eps, nullptr, nullptr, normalized, error) ||
+    if (!sparse_layer_norm(hidden, k_slat_decoder_final_layer_norm_eps,
+                           nullptr, nullptr,
+                           normalized, error) ||
         !sparse_linear(normalized, weights.output_weight, weights.output_bias,
                        config.out_channels, output, error)) return false;
     return true;
@@ -963,7 +965,9 @@ bool SLatDecoderModel::Impl::decode_gpu(
         return false;
     }
     SparseTensorF32 normalized;
-    if (!sparse_layer_norm(hidden, config.norm_eps, nullptr, nullptr, normalized, error) ||
+    if (!sparse_layer_norm(hidden, k_slat_decoder_final_layer_norm_eps,
+                           nullptr, nullptr,
+                           normalized, error) ||
         !sparse_linear(normalized, weights.output_weight, weights.output_bias,
                        config.out_channels, output, error)) return false;
     return true;

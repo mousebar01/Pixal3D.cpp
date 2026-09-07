@@ -511,6 +511,7 @@ struct NafModel::Impl {
             if (error) *error = "NAF model was loaded metadata-only";
             return false;
         }
+        if (gpu.ready() && backend_manager.initialized()) return true;
         if (!backend_manager.initialize_from_environment("PIXAL3D_NAF_BACKEND", error)) {
             return false;
         }

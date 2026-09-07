@@ -3,6 +3,12 @@
 
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <iostream>
 #include <set>
@@ -13,6 +19,254 @@ namespace {
 
 void set_error(std::string * error, const std::string & message) {
     if (error) *error = message;
+}
+
+bool slat_decoder_verbose() {
+    const char * value = std::getenv("PIXAL3D_SLAT_DECODER_VERBOSE");
+    return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+std::uint64_t fnv1a_bytes(const void * data, std::size_t size) {
+    const auto * bytes = static_cast<const std::uint8_t *>(data);
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (std::size_t index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::uint64_t sparse_coords_fingerprint(const std::vector<std::int32_t> & coords) {
+    return fnv1a_bytes(coords.data(), coords.size() * sizeof(std::int32_t));
+}
+
+struct SubdivisionStats {
+    std::size_t positive = 0;
+    std::size_t negative = 0;
+    std::size_t near_zero = 0;
+    float minimum = std::numeric_limits<float>::infinity();
+    float maximum = -std::numeric_limits<float>::infinity();
+};
+
+SubdivisionStats subdivision_stats(const SparseTensorF32 & subdivision) {
+    SubdivisionStats stats;
+    for (float value : subdivision.feats) {
+        if (value > 0.0f) {
+            ++stats.positive;
+        } else {
+            ++stats.negative;
+        }
+        if (std::fabs(value) <= 1.0e-4f) ++stats.near_zero;
+        stats.minimum = std::min(stats.minimum, value);
+        stats.maximum = std::max(stats.maximum, value);
+    }
+    return stats;
+}
+
+std::size_t active_subdivision_count(const SparseTensorF32 & subdivision) {
+    return subdivision_stats(subdivision).positive;
+}
+
+bool cascade_spatial_trace_enabled() {
+    const char * value = std::getenv("PIXAL3D_CASCADE_SPATIAL_TRACE");
+    return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+void log_spatial_buckets(const char * label,
+                         const std::vector<std::int32_t> & coords,
+                         int resolution) {
+    if (!cascade_spatial_trace_enabled() || resolution <= 0 || coords.size() % 4 != 0) return;
+    constexpr int kBuckets = 8;
+    std::array<std::size_t, kBuckets> x{};
+    std::array<std::size_t, kBuckets> y{};
+    std::array<std::size_t, kBuckets> z{};
+    for (std::size_t point = 0; point < coords.size() / 4; ++point) {
+        for (int axis = 0; axis < 3; ++axis) {
+            const int value = coords[point * 4 + 1 + static_cast<std::size_t>(axis)];
+            const int bucket = std::max(0, std::min(kBuckets - 1,
+                value * kBuckets / std::max(1, resolution)));
+            (axis == 0 ? x : axis == 1 ? y : z)[static_cast<std::size_t>(bucket)]++;
+        }
+    }
+    const auto print = [](const std::array<std::size_t, kBuckets> & values) {
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            if (index != 0) std::cerr << ',';
+            std::cerr << values[index];
+        }
+    };
+    std::cerr << "pixal3d: cascade_spatial label=" << label
+              << " points=" << coords.size() / 4 << " resolution=" << resolution
+              << " x=";
+    print(x);
+    std::cerr << " y=";
+    print(y);
+    std::cerr << " z=";
+    print(z);
+    std::cerr << std::endl;
+}
+
+void log_decoder_diagnostics(const char * label,
+                             const SparseTensorF32 & input,
+                             const std::vector<SparseTensorF32> & subdivisions,
+                             const SparseTensorF32 & output) {
+    if (!slat_decoder_verbose()) return;
+    std::cerr << "pixal3d: " << label << " input_points=" << input.points()
+              << " input_coords=0x" << std::hex << sparse_coords_fingerprint(input.coords)
+              << std::dec << " subdivisions=" << subdivisions.size() << std::endl;
+    for (std::size_t level = 0; level < subdivisions.size(); ++level) {
+        const SparseTensorF32 & subdivision = subdivisions[level];
+        const SubdivisionStats stats = subdivision_stats(subdivision);
+        std::cerr << "pixal3d: " << label << " subdiv[" << level << "] points="
+                  << subdivision.points() << " positive=" << stats.positive
+                  << " negative=" << stats.negative << " near_zero=" << stats.near_zero
+                  << " min=" << stats.minimum << " max=" << stats.maximum
+                  << " coords=0x" << std::hex << sparse_coords_fingerprint(subdivision.coords)
+                  << std::dec << std::endl;
+    }
+    std::cerr << "pixal3d: " << label << " output_points=" << output.points()
+              << " output_coords=0x" << std::hex << sparse_coords_fingerprint(output.coords)
+              << std::dec << std::endl;
+}
+
+bool write_sparse_dump(const std::filesystem::path & directory,
+                       const std::string & name,
+                       const SparseTensorF32 & tensor,
+                       std::string * error) {
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(directory, filesystem_error);
+    if (filesystem_error) {
+        set_error(error, "failed to create cascade dump directory: " + filesystem_error.message());
+        return false;
+    }
+    std::ofstream stream(directory / (name + ".bin"), std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        set_error(error, "failed to open cascade dump: " + (directory / (name + ".bin")).string());
+        return false;
+    }
+    const std::uint32_t version = 1;
+    const std::int32_t shape[5] = {
+        static_cast<std::int32_t>(tensor.batch_size),
+        static_cast<std::int32_t>(tensor.channels),
+        static_cast<std::int32_t>(tensor.spatial_x),
+        static_cast<std::int32_t>(tensor.spatial_y),
+        static_cast<std::int32_t>(tensor.spatial_z),
+    };
+    const std::uint64_t points = tensor.points();
+    const std::uint64_t feature_count = tensor.feats.size();
+    stream.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    stream.write(reinterpret_cast<const char *>(shape), sizeof(shape));
+    stream.write(reinterpret_cast<const char *>(&points), sizeof(points));
+    stream.write(reinterpret_cast<const char *>(&feature_count), sizeof(feature_count));
+    stream.write(reinterpret_cast<const char *>(tensor.coords.data()),
+                 static_cast<std::streamsize>(tensor.coords.size() * sizeof(std::int32_t)));
+    stream.write(reinterpret_cast<const char *>(tensor.feats.data()),
+                 static_cast<std::streamsize>(tensor.feats.size() * sizeof(float)));
+    if (!stream) {
+        set_error(error, "failed while writing cascade dump: " + (directory / (name + ".bin")).string());
+        return false;
+    }
+    return true;
+}
+
+bool write_i32_dump(const std::filesystem::path & directory,
+                    const std::string & name,
+                    const std::vector<std::int32_t> & values,
+                    std::string * error) {
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(directory, filesystem_error);
+    if (filesystem_error) {
+        set_error(error, "failed to create cascade dump directory: " + filesystem_error.message());
+        return false;
+    }
+    std::ofstream stream(directory / (name + ".i32"), std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        set_error(error, "failed to open cascade coordinate dump: " +
+                          (directory / (name + ".i32")).string());
+        return false;
+    }
+    const std::uint32_t version = 1;
+    const std::uint64_t count = values.size();
+    stream.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    stream.write(reinterpret_cast<const char *>(&count), sizeof(count));
+    stream.write(reinterpret_cast<const char *>(values.data()),
+                 static_cast<std::streamsize>(values.size() * sizeof(std::int32_t)));
+    if (!stream) {
+        set_error(error, "failed while writing cascade coordinate dump: " +
+                          (directory / (name + ".i32")).string());
+        return false;
+    }
+    return true;
+}
+
+bool write_condition_f32_dump(const std::filesystem::path & directory,
+                              const std::string & name,
+                              const std::vector<float> & values,
+                              std::string * error) {
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(directory, filesystem_error);
+    if (filesystem_error) {
+        set_error(error, "failed to create condition dump directory: " +
+                          filesystem_error.message());
+        return false;
+    }
+    std::ofstream stream(directory / (name + ".f32"),
+                        std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        set_error(error, "failed to open condition dump: " +
+                          (directory / (name + ".f32")).string());
+        return false;
+    }
+    stream.write(reinterpret_cast<const char *>(values.data()),
+                 static_cast<std::streamsize>(values.size() * sizeof(float)));
+    if (!stream) {
+        set_error(error, "failed while writing condition dump: " +
+                          (directory / (name + ".f32")).string());
+        return false;
+    }
+    return true;
+}
+
+bool dump_ss_condition(const Pixal3DImageConditionF32 & condition,
+                       std::string * error) {
+    const char * directory = std::getenv("PIXAL3D_CONDITION_DUMP_DIR");
+    if (!directory || directory[0] == '\0') return true;
+    const std::filesystem::path root(directory);
+    return write_condition_f32_dump(root, "ss_global", condition.global.feats, error) &&
+           write_condition_f32_dump(root, "ss_projection", condition.projection.feats, error);
+}
+
+bool dump_cascade_ss_coords(const Pixal3DCascadeOutputF32 & output,
+                            std::string * error) {
+    const char * directory = std::getenv("PIXAL3D_CASCADE_DUMP_DIR");
+    if (!directory || directory[0] == '\0') return true;
+    const std::filesystem::path root(directory);
+    return write_sparse_dump(root, "ss_flow", output.sparse_structure.flow.samples, error) &&
+           write_i32_dump(root, "ss_coords", output.sparse_structure.coords, error);
+}
+
+bool dump_cascade_shape_tensors(const Pixal3DCascadeOutputF32 & output,
+                                std::string * error) {
+    const char * directory = std::getenv("PIXAL3D_CASCADE_DUMP_DIR");
+    if (!directory || directory[0] == '\0') return true;
+    const std::filesystem::path root(directory);
+    return write_i32_dump(root, "ss_coords", output.sparse_structure.coords, error) &&
+           write_sparse_dump(root, "shape_slat_low", output.shape_slat_low.latent, error) &&
+           write_sparse_dump(root, "shape_upsampled", output.shape_upsampled, error) &&
+           write_i32_dump(root, "high_coords", output.high_coords, error) &&
+           write_sparse_dump(root, "shape_slat_high", output.shape_slat_high.latent, error);
+}
+
+bool dump_cascade_decoder_tensors(const Pixal3DCascadeOutputF32 & output,
+                                  std::string * error) {
+    const char * directory = std::getenv("PIXAL3D_CASCADE_DUMP_DIR");
+    if (!directory || directory[0] == '\0') return true;
+    const std::filesystem::path root(directory);
+    if (!write_sparse_dump(root, "shape_decoded", output.shape_decoded, error)) return false;
+    for (std::size_t level = 0; level < output.shape_subdivisions.size(); ++level) {
+        if (!write_sparse_dump(root, "shape_subdiv_" + std::to_string(level),
+                               output.shape_subdivisions[level], error)) return false;
+    }
+    return true;
 }
 
 bool valid_normalization(const SLatNormalizationF32 & normalization,
@@ -408,6 +662,7 @@ bool run_pixal3d_cascade_f32(
     Pixal3DImageConditionF32 ss_condition;
     if (!build_condition(condition_builder, Pixal3DCascadeStage::sparse_structure,
                          ss_coords, ss_hp.resolution, ss_condition, error)) return false;
+    if (!dump_ss_condition(ss_condition, error)) return false;
     SparseStructureStageConfig structure_config = config.sparse_structure;
     if (structure_config.target_resolution <= 0) {
         structure_config.target_resolution = shape_low_hp.resolution;
@@ -420,6 +675,9 @@ bool run_pixal3d_cascade_f32(
         set_error(error, "sparse structure stage produced no active coordinates");
         return false;
     }
+    if (!dump_cascade_ss_coords(output, error)) return false;
+    log_spatial_buckets("ss_coords", output.sparse_structure.coords,
+                        structure_config.target_resolution);
     if (config.max_structure_points > 0 &&
         output.sparse_structure.coords.size() / 4 > config.max_structure_points) {
         if (config.max_structure_points >
@@ -484,6 +742,16 @@ bool run_pixal3d_cascade_f32(
     if (!shape_decoder.upsample_coords(output.shape_slat_low.latent,
                                        config.decoder_upsample_times,
                                        output.shape_upsampled, error)) return false;
+    if (slat_decoder_verbose()) {
+        std::cerr << "pixal3d: shape_decoder upsample_times="
+                  << config.decoder_upsample_times
+                  << " points=" << output.shape_upsampled.points()
+                  << " coords=0x" << std::hex
+                  << sparse_coords_fingerprint(output.shape_upsampled.coords)
+                  << std::dec << std::endl;
+    }
+    log_spatial_buckets("shape_upsampled", output.shape_upsampled.coords,
+                        output.shape_upsampled.spatial_x);
     if (!quantize_slat_coords_f32(
             output.shape_upsampled, output.shape_upsampled.spatial_x,
             config.requested_resolution, config.max_num_tokens,
@@ -492,6 +760,15 @@ bool run_pixal3d_cascade_f32(
         set_error(error, "shape decoder upsample produced no high-resolution coordinates");
         return false;
     }
+    if (slat_decoder_verbose()) {
+        std::cerr << "pixal3d: shape_high quantized_points="
+                  << output.high_coords.size() / 4
+                  << " resolution=" << output.resolution
+                  << " coords=0x" << std::hex
+                  << sparse_coords_fingerprint(output.high_coords)
+                  << std::dec << std::endl;
+    }
+    log_spatial_buckets("high_coords", output.high_coords, output.resolution / 16);
     const int high_grid_resolution = output.resolution / 16;
     SparseTensorF32 shape_high_noise;
     if (!build_noise(noise_builder, Pixal3DCascadeStage::shape_slat_high,
@@ -506,6 +783,7 @@ bool run_pixal3d_cascade_f32(
     if (!run_slat_stage_f32(shape_flow_high, shape_high_noise, shape_high_condition,
                             config.shape_sampler, config.shape_normalization,
                             output.shape_slat_high, error)) return false;
+    if (!dump_cascade_shape_tensors(output, error)) return false;
 
     const int texture_noise_channels = texture_hp.in_channels -
                                        output.shape_slat_high.latent.channels;
@@ -538,8 +816,15 @@ bool run_pixal3d_cascade_f32(
                               output.shape_decoded, &output.shape_subdivisions, error)) {
         return false;
     }
+    log_decoder_diagnostics("shape_decoder", output.shape_slat_high.latent,
+                           output.shape_subdivisions, output.shape_decoded);
+    if (!dump_cascade_decoder_tensors(output, error)) return false;
+    log_spatial_buckets("shape_decoded", output.shape_decoded.coords,
+                        output.shape_decoded.spatial_x);
     if (!texture_decoder.decode(output.texture_slat.latent, &output.shape_subdivisions,
                                 output.texture_decoded, nullptr, error)) return false;
+    log_decoder_diagnostics("texture_decoder", output.texture_slat.latent,
+                           std::vector<SparseTensorF32>{}, output.texture_decoded);
     // Pixal3DImageTo3DPipeline.decode_tex_slat() maps decoder channels from
     // the trained [-1, 1] range to material/voxel attributes in [0, 1].
     for (float & value : output.texture_decoded.feats) {

@@ -77,9 +77,11 @@ bool run_pixal3d_from_multiview_condition_stages(
     Pixal3DCascadeOutputF32 & output,
     std::string * error = nullptr);
 
-// Write one decoded mesh as an ordinary 1-indexed Wavefront OBJ.  Texture
-// voxel attributes remain available in Pixal3DCascadeOutputF32::texture_decoded
-// for a future material/voxel sidecar writer.
+// Write one decoded mesh as an ordinary 1-indexed Wavefront OBJ.  Vertices
+// are emitted in the Python reference export frame (x, y, z) -> (-x, -z, -y);
+// DualGridMeshF32 remains in the canonical decoder mesh frame.  Texture voxel
+// attributes remain available in Pixal3DCascadeOutputF32::texture_decoded for
+// a future material/voxel sidecar writer.
 bool write_pixal3d_obj(const DualGridMeshF32 & mesh,
                        const std::string & path,
                        std::string * error = nullptr);

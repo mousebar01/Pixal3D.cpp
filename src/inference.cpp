@@ -9,6 +9,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <cstdlib>
 #include <utility>
 
 namespace pixal3d {
@@ -151,8 +152,34 @@ bool run_pixal3d_with_condition_builder(
 
     std::mt19937_64 generator(config.seed);
     std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> ss_noise_override;
+    const char * ss_noise_path = std::getenv("PIXAL3D_SS_NOISE_F32");
+    if (ss_noise_path && ss_noise_path[0] != '\0') {
+        std::ifstream stream(ss_noise_path, std::ios::binary);
+        if (!stream) {
+            set_error(error, "failed to open PIXAL3D_SS_NOISE_F32: " +
+                               std::string(ss_noise_path));
+            return false;
+        }
+        stream.seekg(0, std::ios::end);
+        const std::streamoff bytes = stream.tellg();
+        stream.seekg(0, std::ios::beg);
+        if (bytes < 0 || static_cast<std::size_t>(bytes) % sizeof(float) != 0) {
+            set_error(error, "PIXAL3D_SS_NOISE_F32 is not a raw F32 file");
+            return false;
+        }
+        ss_noise_override.resize(static_cast<std::size_t>(bytes) / sizeof(float));
+        stream.read(reinterpret_cast<char *>(ss_noise_override.data()), bytes);
+        if (!stream) {
+            set_error(error, "failed to read PIXAL3D_SS_NOISE_F32: " +
+                               std::string(ss_noise_path));
+            return false;
+        }
+        std::cerr << "pixal3d: loaded SS noise override values="
+                  << ss_noise_override.size() << std::endl;
+    }
     const Pixal3DNoiseBuilderF32 noise_builder =
-        [&generator, &normal](Pixal3DCascadeStage,
+        [&generator, &normal, &ss_noise_override](Pixal3DCascadeStage stage,
                               const std::vector<std::int32_t> & coords,
                               int channels,
                               int grid_resolution,
@@ -169,7 +196,26 @@ bool run_pixal3d_with_condition_builder(
             result.spatial_x = result.spatial_y = result.spatial_z = grid_resolution;
             result.coords = coords;
             result.feats.resize(result.points() * static_cast<std::size_t>(channels));
-            for (float & value : result.feats) value = normal(generator);
+            if (stage == Pixal3DCascadeStage::sparse_structure &&
+                !ss_noise_override.empty()) {
+                const std::size_t expected = result.points() *
+                                             static_cast<std::size_t>(channels);
+                if (ss_noise_override.size() != expected) {
+                    set_error(error, "PIXAL3D_SS_NOISE_F32 element count does not match "
+                                      "the sparse-structure noise request");
+                    return false;
+                }
+                for (std::size_t point = 0; point < result.points(); ++point) {
+                    for (int channel = 0; channel < channels; ++channel) {
+                        result.feats[point * static_cast<std::size_t>(channels) +
+                                     static_cast<std::size_t>(channel)] =
+                            ss_noise_override[static_cast<std::size_t>(channel) *
+                                               result.points() + point];
+                    }
+                }
+            } else {
+                for (float & value : result.feats) value = normal(generator);
+            }
             return result.valid(error);
         };
 
@@ -433,9 +479,11 @@ bool write_pixal3d_obj(const DualGridMeshF32 & mesh,
     file.precision(std::numeric_limits<float>::max_digits10);
     file << "# Pixal3D.cpp Flexible Dual Grid mesh\n";
     for (std::size_t vertex = 0; vertex < vertex_count; ++vertex) {
-        file << "v " << mesh.vertices[vertex * 3 + 0] << " "
-             << mesh.vertices[vertex * 3 + 1] << " "
-             << mesh.vertices[vertex * 3 + 2] << "\n";
+        const float x = mesh.vertices[vertex * 3 + 0];
+        const float y = mesh.vertices[vertex * 3 + 1];
+        const float z = mesh.vertices[vertex * 3 + 2];
+        // Match the Python reference export transform: (x, y, z) -> (-x, -z, -y).
+        file << "v " << -x << " " << -z << " " << -y << "\n";
     }
     for (std::size_t face = 0; face < mesh.faces.size(); face += 3) {
         file << "f " << (mesh.faces[face + 0] + 1) << " "

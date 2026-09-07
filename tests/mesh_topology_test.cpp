@@ -40,6 +40,14 @@ std::map<std::pair<std::int32_t, std::int32_t>, int> edge_counts(
     return counts;
 }
 
+int nonmanifold_edge_count(const pixal3d::DualGridMeshF32 & mesh) {
+    int count = 0;
+    for (const auto & entry : edge_counts(mesh)) {
+        if (entry.second > 2) ++count;
+    }
+    return count;
+}
+
 } // namespace
 
 int main() {
@@ -94,5 +102,56 @@ int main() {
                "non-manifold vertices changed") ||
         !check(nonmanifold.faces == nonmanifold_faces,
                "non-manifold faces changed")) return 1;
+
+    // An unsafe boundary branch must not suppress an unrelated small closed
+    // boundary loop elsewhere in the same mesh.
+    pixal3d::DualGridMeshF32 mixed = nonmanifold;
+    const std::int32_t base = 5;
+    mixed.vertices.insert(mixed.vertices.end(), {
+        2.0f, 0.0f, 0.0f,
+        2.007f, 0.0f, 0.0f,
+        2.007f, 0.007f, 0.0f,
+        2.0f, 0.007f, 0.0f});
+    mixed.faces.insert(mixed.faces.end(), {
+        base + 0, base + 1, base + 2,
+        base + 0, base + 2, base + 3});
+    if (!check(pixal3d::fill_mesh_holes_f32(mixed, 0.03f, &error),
+               "mixed topology returned failure") ||
+        !check(mixed.vertices.size() == nonmanifold_vertices.size() + 15,
+               "mixed topology did not fill the independent loop") ||
+        !check(mixed.faces.size() == nonmanifold_faces.size() + 18,
+               "mixed topology added unexpected faces")) return 1;
+
+    pixal3d::MeshTopologyRepairReport repair_report;
+    const auto repair_input_vertices = nonmanifold.vertices;
+    const auto repair_input_faces = nonmanifold.faces;
+    if (!check(pixal3d::repair_non_manifold_edges_f32(
+                   nonmanifold, &repair_report, &error),
+               "non-manifold repair failed") ||
+        !check(nonmanifold.faces.size() == repair_input_faces.size(),
+               "non-manifold repair removed faces") ||
+        !check(nonmanifold_edge_count(nonmanifold) == 0,
+               "non-manifold repair left an over-shared edge") ||
+        !check(repair_report.nonmanifold_edges_before == 1 &&
+                   repair_report.nonmanifold_edges_after == 0 &&
+                   repair_report.face_count == 3 &&
+                   repair_report.split_vertices > 0,
+               "non-manifold repair report mismatch") ||
+        !check(nonmanifold.vertices.size() > repair_input_vertices.size(),
+               "non-manifold repair did not split a vertex")) return 1;
+    for (std::size_t index = repair_input_faces.size(); index < nonmanifold.faces.size(); ++index) {
+        if (!check(false, "non-manifold repair changed face buffer size")) return 1;
+    }
+
+    auto deterministic_repair = pixal3d::DualGridMeshF32{};
+    deterministic_repair.vertices = repair_input_vertices;
+    deterministic_repair.faces = repair_input_faces;
+    pixal3d::MeshTopologyRepairReport second_report;
+    if (!check(pixal3d::repair_non_manifold_edges_f32(
+                   deterministic_repair, &second_report, &error),
+               "second non-manifold repair failed") ||
+        !check(deterministic_repair.vertices == nonmanifold.vertices &&
+                   deterministic_repair.faces == nonmanifold.faces,
+               "non-manifold repair is not deterministic")) return 1;
     return 0;
 }

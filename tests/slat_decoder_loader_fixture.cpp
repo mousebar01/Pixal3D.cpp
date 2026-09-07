@@ -8,7 +8,7 @@
 
 namespace {
 
-void emit(const char * name, const std::vector<float> & values) {
+void emit(const std::string & name, const std::vector<float> & values) {
     std::cout << name << " " << values.size();
     for (float value : values) std::cout << " " << value;
     std::cout << "\n";
@@ -47,23 +47,32 @@ int main(int argc, char ** argv) {
         std::cerr << "unexpected subdivision count: " << subdivisions.size() << "\n";
         return 1;
     }
+    emit("slat_decoder_input_coords",
+         std::vector<float>(input.coords.begin(), input.coords.end()));
     emit("slat_decoder_coords",
          std::vector<float>(output.coords.begin(), output.coords.end()));
     emit("slat_decoder_output", output.feats);
     for (std::size_t level = 0; level < subdivisions.size(); ++level) {
-        emit((std::string("slat_decoder_subdiv_coords_") + std::to_string(level)).c_str(),
+        const std::string prefix = "slat_decoder_subdiv_" + std::to_string(level);
+        emit(prefix + "_coords",
              std::vector<float>(subdivisions[level].coords.begin(), subdivisions[level].coords.end()));
-        emit((std::string("slat_decoder_subdiv_output_") + std::to_string(level)).c_str(),
-             subdivisions[level].feats);
+        emit(prefix + "_output", subdivisions[level].feats);
+        std::vector<float> active(subdivisions[level].feats.size(), 0.0f);
+        for (std::size_t index = 0; index < active.size(); ++index) {
+            active[index] = subdivisions[level].feats[index] > 0.0f ? 1.0f : 0.0f;
+        }
+        emit(prefix + "_active", active);
     }
     if (argc == 3) {
-        pixal3d::SparseTensorF32 upsampled;
-        if (!model.upsample_coords(input, 1, upsampled, &error)) {
-            std::cerr << error << "\n";
-            return 1;
+        for (int level = 0; level < static_cast<int>(model.hparams().model_channels.size()); ++level) {
+            pixal3d::SparseTensorF32 upsampled;
+            if (!model.upsample_coords(input, level, upsampled, &error)) {
+                std::cerr << error << "\n";
+                return 1;
+            }
+            emit("slat_decoder_upsample_coords_" + std::to_string(level),
+                 std::vector<float>(upsampled.coords.begin(), upsampled.coords.end()));
         }
-        emit("slat_decoder_upsample_coords",
-             std::vector<float>(upsampled.coords.begin(), upsampled.coords.end()));
     }
     return 0;
 }

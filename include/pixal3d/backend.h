@@ -144,4 +144,14 @@ private:
 
 const char * backend_device_type_name(enum ggml_backend_dev_type type) noexcept;
 
+// Return a monotonic wall-clock timestamp in milliseconds.  The helper is
+// intended for optional backend performance diagnostics and has no effect on
+// graph placement or numerical behavior.
+double backend_time_now_ms() noexcept;
+
+// Emit one timing record when PIXAL3D_BACKEND_TRACE is enabled.
+void backend_log_timing(const char * stage,
+                        const char * phase,
+                        double elapsed_ms) noexcept;
+
 } // namespace pixal3d

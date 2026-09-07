@@ -141,6 +141,8 @@ bool encode_pixal3d_condition_bundle_from_image_f32(
     std::string * error) {
     output = Pixal3DConditionBundleF32{};
     if (!image.valid(error)) return false;
+    Pixal3DImageF32 preprocessed_image;
+    if (!preprocess_pixal3d_image_f32(image, preprocessed_image, error)) return false;
     const struct StageSpec {
         const char * name;
         int image_resolution;
@@ -171,7 +173,7 @@ bool encode_pixal3d_condition_bundle_from_image_f32(
         }
         stage_images.emplace_back();
         if (!resize_pixal3d_image_f32(
-                image, spec.image_resolution, spec.image_resolution,
+                preprocessed_image, spec.image_resolution, spec.image_resolution,
                 stage_images.back(), error)) {
             return false;
         }

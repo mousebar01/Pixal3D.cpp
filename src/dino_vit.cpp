@@ -514,7 +514,6 @@ bool DinoV3Model::encode(const float * pixels,
     } else {
         set_error(error, "DINOv3 graph compute failed: " + scheduler_error);
     }
-    scheduler.synchronize();
     ggml_free(ctx);
     if (!ok) return false;
 

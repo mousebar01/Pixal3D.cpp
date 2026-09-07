@@ -3,6 +3,9 @@
 #include <cmath>
 #include <cstddef>
 #include <iomanip>
+
+static_assert(pixal3d::k_slat_decoder_final_layer_norm_eps == 1.0e-5f,
+              "final SLat decoder LayerNorm must match Python F.layer_norm default");
 #include <iostream>
 #include <limits>
 #include <map>
@@ -14,8 +17,11 @@ namespace {
 constexpr int kLatentChannels = 3;
 constexpr int kOutChannels = 3;
 constexpr int kLevel0Channels = 8;
-constexpr int kLevel1Channels = 4;
+constexpr int kLevel1Channels = 8;
+constexpr int kLevel2Channels = 4;
 constexpr int kMlp0Hidden = 32;
+constexpr int kMlp1Hidden = 32;
+constexpr int kMlp2Hidden = 16;
 
 float stable_value(const std::string & name, std::size_t index) {
     std::size_t stable = 0;
@@ -58,10 +64,26 @@ std::vector<float> conv_parameter(const std::string & name, int out_channels,
     return result;
 }
 
-void emit(const char * name, const std::vector<float> & values) {
+void emit(const std::string & name, const std::vector<float> & values) {
     std::cout << name << " " << values.size();
     for (float value : values) std::cout << " " << value;
     std::cout << "\n";
+}
+
+void emit_coords(const std::string & name, const std::vector<std::int32_t> & values) {
+    std::vector<float> converted(values.begin(), values.end());
+    emit(name, converted);
+}
+
+void emit_subdivision(std::size_t level, const pixal3d::SparseTensorF32 & subdivision) {
+    const std::string prefix = "slat_decoder_subdiv_" + std::to_string(level);
+    emit_coords(prefix + "_coords", subdivision.coords);
+    emit(prefix + "_output", subdivision.feats);
+    std::vector<float> active(subdivision.feats.size(), 0.0f);
+    for (std::size_t index = 0; index < subdivision.feats.size(); ++index) {
+        active[index] = subdivision.feats[index] > 0.0f ? 1.0f : 0.0f;
+    }
+    emit(prefix + "_active", active);
 }
 
 void bind_convnext(pixal3d::SLatDecoderBlockWeightsF32 & weights,
@@ -73,13 +95,16 @@ void bind_convnext(pixal3d::SLatDecoderBlockWeightsF32 & weights,
     weights.mlp_hidden = mlp_hidden;
     params.emplace(prefix + ".norm.weight", parameter(prefix + ".norm.weight", channels));
     params.emplace(prefix + ".norm.bias", parameter(prefix + ".norm.bias", channels));
-    params.emplace(prefix + ".conv.weight", conv_parameter(prefix + ".conv.weight", channels, channels));
+    params.emplace(prefix + ".conv.weight",
+                   conv_parameter(prefix + ".conv.weight", channels, channels));
     params.emplace(prefix + ".conv.bias", parameter(prefix + ".conv.bias", channels));
-    params.emplace(prefix + ".mlp.0.weight", parameter(prefix + ".mlp.0.weight",
-                                                         static_cast<std::size_t>(mlp_hidden) * channels));
+    params.emplace(prefix + ".mlp.0.weight",
+                   parameter(prefix + ".mlp.0.weight",
+                             static_cast<std::size_t>(mlp_hidden) * channels));
     params.emplace(prefix + ".mlp.0.bias", parameter(prefix + ".mlp.0.bias", mlp_hidden));
-    params.emplace(prefix + ".mlp.2.weight", parameter(prefix + ".mlp.2.weight",
-                                                         static_cast<std::size_t>(channels) * mlp_hidden));
+    params.emplace(prefix + ".mlp.2.weight",
+                   parameter(prefix + ".mlp.2.weight",
+                             static_cast<std::size_t>(channels) * mlp_hidden));
     params.emplace(prefix + ".mlp.2.bias", parameter(prefix + ".mlp.2.bias", channels));
     weights.norm_weight = params.at(prefix + ".norm.weight").data();
     weights.norm_bias = params.at(prefix + ".norm.bias").data();
@@ -99,12 +124,15 @@ void bind_c2s(pixal3d::SLatDecoderBlockWeightsF32 & weights,
     weights.out_channels = out_channels;
     params.emplace(prefix + ".norm1.weight", parameter(prefix + ".norm1.weight", channels));
     params.emplace(prefix + ".norm1.bias", parameter(prefix + ".norm1.bias", channels));
-    params.emplace(prefix + ".conv1.weight", conv_parameter(prefix + ".conv1.weight", out_channels * 8, channels));
-    params.emplace(prefix + ".conv1.bias", parameter(prefix + ".conv1.bias", out_channels * 8));
-    params.emplace(prefix + ".conv2.weight", conv_parameter(prefix + ".conv2.weight", out_channels, out_channels));
+    params.emplace(prefix + ".conv1.weight",
+                   conv_parameter(prefix + ".conv1.weight", out_channels * 8, channels));
+    params.emplace(prefix + ".conv1.bias",
+                   parameter(prefix + ".conv1.bias", out_channels * 8));
+    params.emplace(prefix + ".conv2.weight",
+                   conv_parameter(prefix + ".conv2.weight", out_channels, out_channels));
     params.emplace(prefix + ".conv2.bias", parameter(prefix + ".conv2.bias", out_channels));
-    params.emplace(prefix + ".to_subdiv.weight", parameter(prefix + ".to_subdiv.weight",
-                                                             static_cast<std::size_t>(8) * channels));
+    params.emplace(prefix + ".to_subdiv.weight",
+                   parameter(prefix + ".to_subdiv.weight", static_cast<std::size_t>(8) * channels));
     params.emplace(prefix + ".to_subdiv.bias", parameter(prefix + ".to_subdiv.bias", 8));
     weights.norm1_weight = params.at(prefix + ".norm1.weight").data();
     weights.norm1_bias = params.at(prefix + ".norm1.bias").data();
@@ -134,20 +162,22 @@ int main(int argc, char ** argv) {
                                      static_cast<std::size_t>(kLevel0Channels) * kLatentChannels);
     weights.from_latent_bias = add("from_latent.bias", kLevel0Channels);
     weights.output_weight = add("output_layer.weight",
-                                static_cast<std::size_t>(kOutChannels) * kLevel1Channels);
+                                static_cast<std::size_t>(kOutChannels) * kLevel2Channels);
     weights.output_bias = add("output_layer.bias", kOutChannels);
-    weights.blocks.resize(3);
+    weights.blocks.resize(5);
     bind_convnext(weights.blocks[0], "blocks.0.0", kLevel0Channels, kMlp0Hidden, params);
     bind_c2s(weights.blocks[1], "blocks.0.1", kLevel0Channels, kLevel1Channels, params);
-    bind_convnext(weights.blocks[2], "blocks.1.0", kLevel1Channels, 16, params);
+    bind_convnext(weights.blocks[2], "blocks.1.0", kLevel1Channels, kMlp1Hidden, params);
+    bind_c2s(weights.blocks[3], "blocks.1.1", kLevel1Channels, kLevel2Channels, params);
+    bind_convnext(weights.blocks[4], "blocks.2.0", kLevel2Channels, kMlp2Hidden, params);
 
     pixal3d::SLatDecoderConfig config;
     config.latent_channels = kLatentChannels;
     config.out_channels = kOutChannels;
     config.norm_eps = 1e-6f;
     config.pred_subdiv = true;
-    config.model_channels = {kLevel0Channels, kLevel1Channels};
-    config.num_blocks = {1, 1};
+    config.model_channels = {kLevel0Channels, kLevel1Channels, kLevel2Channels};
+    config.num_blocks = {1, 1, 1};
 
     pixal3d::SparseTensorF32 input;
     input.batch_size = 1;
@@ -162,30 +192,33 @@ int main(int argc, char ** argv) {
     pixal3d::SparseTensorF32 output;
     std::vector<pixal3d::SparseTensorF32> subdivisions;
     std::string error;
+
     if (!pixal3d::slat_decoder_forward_f32(input, config, weights, nullptr,
                                            output, &subdivisions, &error)) {
         std::cerr << error << "\n";
         return 1;
     }
-    emit("slat_decoder_coords",
-         std::vector<float>(output.coords.begin(), output.coords.end()));
+    emit_coords("slat_decoder_input_coords", input.coords);
+    emit_coords("slat_decoder_coords", output.coords);
     emit("slat_decoder_output", output.feats);
-    if (subdivisions.size() != 1) {
+    if (subdivisions.size() != config.model_channels.size() - 1) {
         std::cerr << "unexpected subdivision count\n";
         return 1;
     }
-    emit("slat_decoder_subdiv_coords",
-         std::vector<float>(subdivisions[0].coords.begin(), subdivisions[0].coords.end()));
-    emit("slat_decoder_subdiv_output", subdivisions[0].feats);
+    for (std::size_t level = 0; level < subdivisions.size(); ++level) {
+        emit_subdivision(level, subdivisions[level]);
+    }
     if (argc == 2) {
-        pixal3d::SparseTensorF32 upsampled;
-        if (!pixal3d::slat_decoder_upsample_coords_f32(
-                input, config, weights, 1, upsampled, &error)) {
-            std::cerr << error << "\n";
-            return 1;
+        for (int level = 0; level < static_cast<int>(config.model_channels.size()); ++level) {
+            pixal3d::SparseTensorF32 upsampled;
+            if (!pixal3d::slat_decoder_upsample_coords_f32(
+                    input, config, weights, level, upsampled, &error)) {
+                std::cerr << error << "\n";
+                return 1;
+            }
+            emit_coords("slat_decoder_upsample_coords_" + std::to_string(level),
+                        upsampled.coords);
         }
-        emit("slat_decoder_upsample_coords",
-             std::vector<float>(upsampled.coords.begin(), upsampled.coords.end()));
     }
     return 0;
 }

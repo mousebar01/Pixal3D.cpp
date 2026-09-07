@@ -80,8 +80,10 @@ from pixal3d.models.sc_vaes.sparse_unet_vae import SparseUnetVaeDecoder
 
 LATENT_CHANNELS = 3
 OUT_CHANNELS = 3
-LEVEL_CHANNELS = [8, 4]
-NUM_BLOCKS = [1, 1]
+LEVEL_CHANNELS = [8, 8, 4]
+NUM_BLOCKS = [1, 1, 1]
+N_LEVELS = len(LEVEL_CHANNELS)
+N_SUBDIVISIONS = N_LEVELS - 1
 GGUF_MAGIC = b"GGUF"
 GGUF_VERSION = 3
 GGUF_ALIGNMENT = 32
@@ -108,9 +110,9 @@ def make_model() -> Tuple[SparseUnetVaeDecoder, Dict[str, np.ndarray]]:
         LEVEL_CHANNELS,
         LATENT_CHANNELS,
         NUM_BLOCKS,
-        ["SparseConvNeXtBlock3d", "SparseConvNeXtBlock3d"],
-        ["SparseResBlockC2S3d"],
-        [{}, {}],
+        ["SparseConvNeXtBlock3d", "SparseConvNeXtBlock3d", "SparseConvNeXtBlock3d"],
+        ["SparseResBlockC2S3d", "SparseResBlockC2S3d"],
+        [{}, {}, {}],
         use_fp16=False,
         pred_subdiv=True,
     )
@@ -232,11 +234,17 @@ def write_gguf(path: Path, state: Dict[str, np.ndarray], ggml_type: int = GGML_T
 def parse_fixture(text: str, include_upsample: bool = False) -> Dict[str, np.ndarray]:
     outputs: Dict[str, np.ndarray] = {}
     wanted = {
-        "slat_decoder_coords", "slat_decoder_output",
-        "slat_decoder_subdiv_coords", "slat_decoder_subdiv_output",
+        "slat_decoder_input_coords", "slat_decoder_coords", "slat_decoder_output",
     }
+    for level in range(N_SUBDIVISIONS):
+        wanted.update({
+            f"slat_decoder_subdiv_{level}_coords",
+            f"slat_decoder_subdiv_{level}_output",
+            f"slat_decoder_subdiv_{level}_active",
+        })
     if include_upsample:
-        wanted.add("slat_decoder_upsample_coords")
+        for level in range(N_LEVELS):
+            wanted.add(f"slat_decoder_upsample_coords_{level}")
     for line in text.splitlines():
         fields = line.split()
         if not fields or fields[0] not in wanted:
@@ -271,17 +279,24 @@ def reference_outputs(model: SparseUnetVaeDecoder,
     sparse_input = sp.SparseTensor(latent, coords)
     with torch.no_grad():
         reference, subdivisions = model(sparse_input, return_subs=True)
-    values = {
+    values: Dict[str, np.ndarray] = {
+        "slat_decoder_input_coords": coords.detach().cpu().numpy().astype(np.float32).reshape(-1),
         "slat_decoder_coords": reference.coords.detach().cpu().numpy().astype(np.float32).reshape(-1),
         "slat_decoder_output": reference.feats.detach().cpu().numpy().astype(np.float32).reshape(-1),
-        "slat_decoder_subdiv_coords": subdivisions[0].coords.detach().cpu().numpy().astype(np.float32).reshape(-1),
-        "slat_decoder_subdiv_output": subdivisions[0].feats.detach().cpu().numpy().astype(np.float32).reshape(-1),
     }
-    if include_upsample:
-        upsampled = model.upsample(sparse_input, upsample_times=1)
-        values["slat_decoder_upsample_coords"] = (
-            upsampled.detach().cpu().numpy().astype(np.float32).reshape(-1)
+    for level, subdivision in enumerate(subdivisions):
+        logits = subdivision.feats.detach().cpu().numpy().astype(np.float32)
+        values[f"slat_decoder_subdiv_{level}_coords"] = (
+            subdivision.coords.detach().cpu().numpy().astype(np.float32).reshape(-1)
         )
+        values[f"slat_decoder_subdiv_{level}_output"] = logits.reshape(-1)
+        values[f"slat_decoder_subdiv_{level}_active"] = (logits > 0.0).astype(np.float32).reshape(-1)
+    if include_upsample:
+        for level in range(N_LEVELS):
+            upsampled = model.upsample(sparse_input, upsample_times=level)
+            values[f"slat_decoder_upsample_coords_{level}"] = (
+                upsampled.detach().cpu().numpy().astype(np.float32).reshape(-1)
+            )
     return values
 
 
