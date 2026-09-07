@@ -97,7 +97,8 @@ bool parse_float(const char * text, float & value) {
 bool parse_cascade_options(int argc, char ** argv, int first,
                            pixal3d::Pixal3DInferenceConfig & config,
                            std::string * error,
-                           pixal3d::Pixal3DImageConditionBundleConfig * image_config = nullptr) {
+                           pixal3d::Pixal3DImageConditionBundleConfig * image_config = nullptr,
+                           const char * command_name = "run") {
     for (int index = first; index < argc;) {
         const std::string option = argv[index++];
         if (option == "--vision-resolution" && index < argc && image_config) {
@@ -194,7 +195,8 @@ bool parse_cascade_options(int argc, char ** argv, int first,
             config.max_model_bytes = static_cast<std::size_t>(
                 static_cast<double>(gib) * 1024.0 * 1024.0 * 1024.0);
         } else {
-            if (error) *error = "unknown or incomplete run option: " + option;
+            if (error) *error = std::string("unknown or incomplete ") + command_name +
+                                  " option: " + option;
             return false;
         }
     }
@@ -499,93 +501,13 @@ int main(int argc, char ** argv) {
         }
         pixal3d::Pixal3DInferenceConfig config =
             pixal3d::default_pixal3d_inference_config();
-        for (int index = 6; index < argc;) {
-            const std::string option = argv[index++];
-            if (option == "--seed" && index < argc) {
-                if (!parse_u64(argv[index++], config.seed)) {
-                    std::cerr << "error: invalid --seed\n";
-                    return 2;
-                }
-            } else if (option == "--resolution" && index < argc) {
-                if (!parse_int(argv[index++], config.cascade.requested_resolution) ||
-                    config.cascade.requested_resolution < 1024 ||
-                    config.cascade.requested_resolution % 16 != 0) {
-                    std::cerr << "error: --resolution must be a multiple of 16 >= 1024\n";
-                    return 2;
-                }
-            } else if (option == "--max-tokens" && index < argc) {
-                std::uint64_t tokens = 0;
-                if (!parse_u64(argv[index++], tokens) ||
-                    tokens > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-                    std::cerr << "error: invalid --max-tokens\n";
-                    return 2;
-                }
-                config.cascade.max_num_tokens = static_cast<std::size_t>(tokens);
-            } else if (option == "--steps" && index < argc) {
-                int steps = 0;
-                if (!parse_int(argv[index++], steps) || steps <= 0) {
-                    std::cerr << "error: --steps must be positive\n";
-                    return 2;
-                }
-                config.cascade.sparse_structure.sampler.steps = steps;
-                config.cascade.shape_sampler.steps = steps;
-                config.cascade.texture_sampler.steps = steps;
-            } else if (option == "--occupancy-threshold" && index < argc) {
-                if (!parse_float(argv[index++],
-                                 config.cascade.sparse_structure.occupancy_threshold)) {
-                    std::cerr << "error: invalid --occupancy-threshold\n";
-                    return 2;
-                }
-            } else if (option == "--max-structure-points" && index < argc) {
-                std::uint64_t points = 0;
-                if (!parse_u64(argv[index++], points) || points == 0 ||
-                    points > static_cast<std::uint64_t>(
-                        std::numeric_limits<std::size_t>::max())) {
-                    std::cerr << "error: --max-structure-points must be positive\n";
-                    return 2;
-                }
-                config.cascade.max_structure_points = static_cast<std::size_t>(points);
-            } else if (option == "--fov" && index < argc) {
-                if (!parse_float(argv[index++], config.camera.camera_angle_x) ||
-                    !(config.camera.camera_angle_x > 0.0f &&
-                      config.camera.camera_angle_x < 3.1415927f)) {
-                    std::cerr << "error: --fov must be in (0, pi) radians\n";
-                    return 2;
-                }
-            } else if (option == "--distance" && index < argc) {
-                if (!parse_float(argv[index++], config.camera.distance) ||
-                    !(config.camera.distance > 0.0f)) {
-                    std::cerr << "error: --distance must be positive\n";
-                    return 2;
-                }
-            } else if (option == "--mesh-scale" && index < argc) {
-                if (!parse_float(argv[index++], config.camera.mesh_scale) ||
-                    !(config.camera.mesh_scale > 0.0f)) {
-                    std::cerr << "error: --mesh-scale must be positive\n";
-                    return 2;
-                }
-            } else if (option == "--max-model-gib" && index < argc) {
-                float gib = 0.0f;
-                if (!parse_float(argv[index++], gib) || !(gib > 0.0f) ||
-                    static_cast<double>(gib) * 1024.0 * 1024.0 * 1024.0 >
-                        static_cast<double>(std::numeric_limits<std::size_t>::max())) {
-                    std::cerr << "error: --max-model-gib must be positive\n";
-                    return 2;
-                }
-                config.max_model_bytes = static_cast<std::size_t>(
-                    static_cast<double>(gib) * 1024.0 * 1024.0 * 1024.0);
-            } else {
-                std::cerr << "error: unknown or incomplete run-cascade option: "
-                          << option << "\n";
-                return 2;
-            }
-        }
-        // Rebuild the front-view camera after parsing individual scalar fields.
-        config.camera = pixal3d::ProjectionCamera::front(
-            config.camera.camera_angle_x, config.camera.distance,
-            config.camera.mesh_scale);
-        std::size_t estimated_bytes = 0;
         std::string error;
+        if (!parse_cascade_options(argc, argv, 6, config, &error, nullptr,
+                                   "run-cascade")) {
+            std::cerr << "error: " << error << "\n";
+            return 2;
+        }
+        std::size_t estimated_bytes = 0;
         if (!pixal3d::estimate_pixal3d_model_bytes(argv[2], argv[3],
                                                   estimated_bytes, &error)) {
             std::cerr << "error: " << error << "\n";

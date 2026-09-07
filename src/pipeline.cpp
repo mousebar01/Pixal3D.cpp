@@ -8,7 +8,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <limits>
 #include <iostream>
 #include <set>
@@ -61,10 +60,6 @@ SubdivisionStats subdivision_stats(const SparseTensorF32 & subdivision) {
         stats.maximum = std::max(stats.maximum, value);
     }
     return stats;
-}
-
-std::size_t active_subdivision_count(const SparseTensorF32 & subdivision) {
-    return subdivision_stats(subdivision).positive;
 }
 
 bool cascade_spatial_trace_enabled() {
@@ -249,8 +244,7 @@ bool dump_cascade_shape_tensors(const Pixal3DCascadeOutputF32 & output,
     const char * directory = std::getenv("PIXAL3D_CASCADE_DUMP_DIR");
     if (!directory || directory[0] == '\0') return true;
     const std::filesystem::path root(directory);
-    return write_i32_dump(root, "ss_coords", output.sparse_structure.coords, error) &&
-           write_sparse_dump(root, "shape_slat_low", output.shape_slat_low.latent, error) &&
+    return write_sparse_dump(root, "shape_slat_low", output.shape_slat_low.latent, error) &&
            write_sparse_dump(root, "shape_upsampled", output.shape_upsampled, error) &&
            write_i32_dump(root, "high_coords", output.high_coords, error) &&
            write_sparse_dump(root, "shape_slat_high", output.shape_slat_high.latent, error);
