@@ -1,0 +1,38 @@
+Pixal3D.cpp
+Copyright (c) 2026 Pixal3D.cpp contributors.
+
+This project is a C++/ggml migration of the upstream Pixal3D project by
+TencentARC. Upstream Pixal3D code, parameters, weights, and documentation are
+released under the MIT License. See:
+https://github.com/TencentARC/Pixal3D
+https://huggingface.co/TencentARC/Pixal3D
+
+This repository contains or builds on third-party components. Those components
+remain subject to their own original licenses and attribution requirements:
+
+- Pixal3D, TencentARC: MIT License.
+- TRELLIS.2, Microsoft Corporation: MIT License.
+- Direct3D-S2, DreamTech: MIT License.
+- MoGe, Microsoft Corporation: MIT License.
+- DINOv2: Apache License 2.0.
+- ggml: see ggml/LICENSE.
+
+This notice is an attribution summary, not a replacement for any third-party
+license. When redistributing a build that includes a third-party component,
+include the applicable original license and notices.
+
+Responsible use
+
+The upstream Pixal3D project is intended for research, creative production,
+and practical 3D generation. Users are responsible for applicable law, rights,
+consent requirements, and platform policies. Do not use the model or software
+for non-consensual sexual content, sexualized depictions of real people,
+content involving minors, harassment, impersonation, or privacy-violating
+applications. This guidance does not modify the applicable license terms.
+
+Model distribution
+
+The Pixal3D.cpp binary archives do not include model weights. Model files are
+downloaded separately and remain subject to the upstream model repository's
+license, notice, and access metadata. This project does not grant rights to
+third-party input images or generated content.

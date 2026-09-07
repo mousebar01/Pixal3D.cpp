@@ -1,5 +1,6 @@
 #include "pixal3d/backend.h"
 
+#include "ggml-cpu.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -198,6 +199,16 @@ BackendManager::~BackendManager() {
 }
 
 void BackendManager::close() noexcept {
+    for (ggml_backend_t backend : backends_) {
+        if (backend && ggml_backend_is_cpu(backend)) {
+            ggml_backend_cpu_set_threadpool(backend, nullptr);
+        }
+    }
+    if (cpu_threadpool_) {
+        ggml_threadpool_free(cpu_threadpool_);
+        cpu_threadpool_ = nullptr;
+    }
+    cpu_threadpool_n_threads_ = 0;
     for (auto it = backends_.rbegin(); it != backends_.rend(); ++it) {
         if (*it) ggml_backend_free(*it);
     }
@@ -325,9 +336,11 @@ bool BackendManager::initialize(const BackendPolicy & policy,
         return false;
     }
     register_backend(cpu, cpu_backend, false);
+    configure_cpu_threadpool(GGML_DEFAULT_N_THREADS);
     initialized_ = true;
     std::cerr << "pixal3d: backend manager ready (policy=" << policy.name()
-              << ", backends=" << backends_.size() << ")" << std::endl;
+              << ", backends=" << backends_.size()
+              << ", cpu_threads=" << cpu_threadpool_n_threads_ << ")" << std::endl;
     return true;
 }
 
@@ -399,6 +412,40 @@ void BackendManager::log_buffer(const char * phase,
               << std::endl;
 }
 
+bool BackendManager::configure_cpu_threadpool(int n_threads) const noexcept {
+    if (n_threads <= 0) return false;
+
+    if (cpu_threadpool_ && cpu_threadpool_n_threads_ == n_threads) {
+        ggml_threadpool_resume(cpu_threadpool_);
+        return true;
+    }
+
+    struct ggml_threadpool_params params = ggml_threadpool_params_default(n_threads);
+    ggml_threadpool * replacement = ggml_threadpool_new(&params);
+    if (!replacement) {
+        std::cerr << "pixal3d: failed to create CPU ggml threadpool"
+                  << " (threads=" << n_threads
+                  << "); using the backend's disposable pool" << std::endl;
+        return false;
+    }
+
+    ggml_threadpool * previous = cpu_threadpool_;
+    cpu_threadpool_ = replacement;
+    cpu_threadpool_n_threads_ = n_threads;
+    for (ggml_backend_t backend : backends_) {
+        if (backend && ggml_backend_is_cpu(backend)) {
+            ggml_backend_cpu_set_threadpool(backend, cpu_threadpool_);
+        }
+    }
+    if (previous) ggml_threadpool_free(previous);
+
+    if (trace_enabled()) {
+        std::cerr << "pixal3d: CPU ggml threadpool configured"
+                  << " threads=" << n_threads << std::endl;
+    }
+    return true;
+}
+
 void BackendManager::set_n_threads(int n_threads) const noexcept {
     if (n_threads <= 0) return;
     for (ggml_backend_t backend : backends_) {
@@ -410,6 +457,7 @@ void BackendManager::set_n_threads(int n_threads) const noexcept {
             ggml_backend_reg_get_proc_address(registry, "ggml_backend_set_n_threads"));
         if (set_threads) set_threads(backend, n_threads);
     }
+    configure_cpu_threadpool(n_threads);
 }
 
 BackendScheduler::BackendScheduler(const BackendManager & manager,

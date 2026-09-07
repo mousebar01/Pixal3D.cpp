@@ -1,0 +1,144 @@
+name: Release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit SHA to build; empty uses the selected branch HEAD'
+        required: false
+        default: ''
+        type: string
+      build_cuda_compile:
+        description: 'Build the CUDA compile-only candidate (no GPU runtime tests)'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: pixal3d-release-candidate-${{ inputs.commit || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-candidate:
+    name: CPU release candidate
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit != '' && inputs.commit || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Record source and submodule commits
+        run: |
+          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "GGML_SUBMODULE_COMMIT=$(git -C ggml rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            cmake ninja-build libpng-dev libjpeg-dev
+
+      - name: Configure portable Release build
+        run: |
+          cmake -S . -B build-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_TESTING=ON \
+            -DPIXAL3D_ENABLE_CUDA=OFF \
+            -DPIXAL3D_CUDA_TF32=OFF \
+            -DPIXAL3D_GGML_NATIVE=OFF \
+            -DPIXAL3D_BUILD_CLI=ON
+
+      - name: Build
+        run: cmake --build build-release --parallel
+
+      - name: Run CTest
+        run: (cd build-release && ctest --output-on-failure)
+
+      - name: Run CLI smoke checks
+        run: |
+          ./build-release/bin/pixal3d --help
+          ./build-release/bin/pixal3d --version
+
+      - name: Package CPU candidate archive
+        run: |
+          rm -rf dist
+          ./scripts/package_release.sh \
+            --build-dir build-release \
+            --output-dir dist \
+            --variant cpu \
+            --backend cpu \
+            --source-commit "$SOURCE_COMMIT" \
+            --release-tag "v$(./build-release/bin/pixal3d --version | awk '{print $2}')" \
+            --validation-status cpu-ctest-19-passed \
+            --workflow-run-id "${{ github.run_id }}" \
+            --submodule-commit "$GGML_SUBMODULE_COMMIT" \
+            --build-environment github-hosted-ubuntu-22.04
+
+      - name: Upload CPU candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixal3d-cpu-candidate-${{ github.run_id }}
+          path: dist/*
+          if-no-files-found: error
+
+  cuda-compile-only:
+    name: CUDA compile-only candidate
+    if: ${{ inputs.build_cuda_compile }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit != '' && inputs.commit || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Build CUDA CLI in the pinned developer image
+        run: |
+          docker build \
+            --file docker/Dockerfile \
+            --target cpp-build \
+            --tag pixal3d:cuda-compile-only \
+            --build-arg DEV_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu24.04 \
+            --build-arg RUNTIME_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04 \
+            --build-arg PIXAL3D_ENABLE_CUDA=ON \
+            --build-arg PIXAL3D_CUDA_TF32=OFF \
+            --build-arg PIXAL3D_BUILD_TESTS=OFF \
+            --build-arg PIXAL3D_RUN_TESTS=OFF \
+            .
+
+      - name: Record source and submodule commits
+        run: |
+          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "GGML_SUBMODULE_COMMIT=$(git -C ggml rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Package CUDA compile-only candidate
+        run: |
+          rm -rf dist
+          docker create \
+            --env PIXAL3D_SOURCE_COMMIT="$SOURCE_COMMIT" \
+            --env PIXAL3D_SUBMODULE_COMMIT="$GGML_SUBMODULE_COMMIT" \
+            --env PIXAL3D_WORKFLOW_RUN_ID="${{ github.run_id }}" \
+            --env PIXAL3D_VALIDATION_STATUS="cuda-compile-only" \
+            --env PIXAL3D_BUILD_ENVIRONMENT="nvidia/cuda:12.6.3-devel-ubuntu24.04" \
+            --name pixal3d-cuda-package \
+            pixal3d:cuda-compile-only \
+            bash -lc 'rm -rf dist && ./scripts/package_release.sh --build-dir build --output-dir dist --variant cuda-compile-only --backend cuda --source-commit "$PIXAL3D_SOURCE_COMMIT" --release-tag "$PIXAL3D_RELEASE_TAG" --validation-status "$PIXAL3D_VALIDATION_STATUS" --workflow-run-id "$PIXAL3D_WORKFLOW_RUN_ID" --submodule-commit "$PIXAL3D_SUBMODULE_COMMIT" --build-environment "$PIXAL3D_BUILD_ENVIRONMENT"'
+          docker start --attach pixal3d-cuda-package
+          mkdir -p dist
+          docker cp pixal3d-cuda-package:/workspace/dist/. dist/
+          docker rm pixal3d-cuda-package
+
+      - name: Upload CUDA compile-only candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixal3d-cuda-candidate-${{ github.run_id }}
+          path: dist/*
+          if-no-files-found: error

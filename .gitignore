@@ -1,5 +1,8 @@
 /build/
+/build-release/
+/build-cpu-release/
 /build-cuda/
+/build-cuda-compile/
 /build-cuda-*/
 /build-backend-test/
 /build-backend-cuda/

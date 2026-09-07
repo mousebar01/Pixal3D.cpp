@@ -234,6 +234,123 @@ neighborhood attention remain CPU-resident. SLat decoder sparse coordinate,
 subdivision, packing, and host reference operations likewise remain CPU-side;
 its GPU path is partial, not a claim of whole-stage GPU execution.
 
+## Release packages
+
+Release archives contain the CLI and documentation only. Model weights, GGUF
+packs, condition files, latent dumps, meshes, and build directories are never
+included. The local packaging helper writes ignored artifacts under `dist/`:
+
+```sh
+cmake -S . -B build-release \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DBUILD_TESTING=ON \
+  -DPIXAL3D_ENABLE_CUDA=OFF \
+  -DPIXAL3D_GGML_NATIVE=OFF
+cmake --build build-release --parallel
+(cd build-release && ctest --output-on-failure)
+./scripts/package_release.sh --build-dir build-release --variant cpu
+(cd dist && sha256sum -c SHA256SUMS)
+```
+
+The resulting `pixal3d-<version>-linux-<arch>-cpu.tar.gz` is a CLI-only
+runtime archive. It contains `bin/pixal3d`, `README.md`, runtime dependency
+notes, build metadata, and third-party license text. It does not contain the
+CMake SDK library/headers or model files. The generated `RELEASE-MANIFEST.json`
+records the asset name, size, SHA-256, platform, backend, source commit, ggml
+submodule commit, workflow run, and validation status.
+
+CPU ggml graph execution reuses a manager-owned threadpool for the lifetime of
+one backend manager. Stage code still selects its requested thread count through
+the shared backend manager; this does not change scheduler placement or numerical
+behavior. Builds with ggml OpenMP use OpenMP's worker team for each parallel
+region, so a persistent pool should not be interpreted as a permanent set of
+OS threads in that configuration.
+
+The outer project is released under the MIT License in `LICENSE`. `NOTICE`
+contains the upstream Pixal3D attribution, third-party component summary, and
+responsible-use guidance. README is explanatory documentation; it does not
+replace those files. Both files are included in the CMake install tree and in
+formal binary archives, alongside `ggml-LICENSE`. The ggml license is not a
+license for the outer Pixal3D.cpp project.
+
+Model weights are not included in the binary archive. They are downloaded
+separately and remain subject to the upstream Pixal3D model repository's
+license, notice, and access metadata.
+
+Following the convention used by whisper.cpp and llama.cpp, keep these items in
+Git:
+
+```text
+source, headers, CMake files
+.github/workflows/*
+scripts/package_release.sh
+scripts/validate_release_candidate.sh
+README.md and release documentation
+```
+
+Keep these items out of Git. `dist/` is ignored and the generated files belong
+in Actions artifacts or the GitHub Release instead:
+
+```text
+build*/
+dist/
+*.tar.gz, *.zip, *.gguf, *.safetensors
+weights/, meshes, latent dumps, Blender files
+```
+
+Download a formal release from the repository's [GitHub Releases](/../../releases)
+page and verify it in the directory containing the downloaded assets:
+
+```sh
+sha256sum -c SHA256SUMS
+```
+
+The release manifest is generated from the same candidate as the archive; it is
+not hand-maintained in the source repository. Formal publication requires both
+`LICENSE` and `NOTICE` to be present in the candidate archive.
+
+Releases use a two-stage, manually gated workflow modeled after whisper.cpp.
+`.github/workflows/release.yml` is a candidate build only: it runs the portable
+CPU tests and uploads an Actions artifact, but never creates a tag or modifies a
+GitHub Release. The candidate can optionally include a separate CUDA
+`compile-only` artifact. That artifact is not a claim of GPU runtime support:
+forced `gpu:<index>` execution, scheduler placement, memory usage, and CPU/GPU
+numerical parity still require a matching NVIDIA runner or local CUDA host.
+
+After reviewing a successful candidate, use `.github/workflows/make-release.yml`
+with the exact candidate run ID. It downloads and rechecks the candidate
+archive, verifies the CLI version, checksum, source commit, and release tag,
+and rejects an existing tag or Release. A dry run performs all checks without
+publishing; only `dry_run=false` creates the tag at the tested commit and
+uploads the immutable CPU assets:
+
+```sh
+# 1. Build and test a candidate; this creates no GitHub Release.
+gh workflow run release.yml --ref master \
+  -f build_cuda_compile=false
+
+# 2. Inspect the successful candidate run and record its run ID.
+gh run list --workflow release.yml --limit 5
+
+# 3. Validate that exact candidate without publishing.
+gh workflow run make-release.yml --ref master \
+  -f candidate_run_id=123456789 \
+  -f release_tag=v0.3.0 \
+  -f dry_run=true
+
+# 4. After review, publish the same candidate run.
+gh workflow run make-release.yml --ref master \
+  -f candidate_run_id=123456789 \
+  -f release_tag=v0.3.0 \
+  -f dry_run=false
+```
+
+The final workflow does not rebuild from a moving branch and does not overwrite
+existing tags or Release assets. CUDA packages require a compatible NVIDIA
+driver/CUDA runtime and are not bundled with model weights; the compile-only
+CUDA candidate is not included in the formal CPU Release.
+
 ## Docker and CUDA
 
 The small C++ Dockerfile provides CPU-capable `dev`, `cpp-build`, and `runtime`

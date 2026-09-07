@@ -8,6 +8,7 @@
 
 struct ggml_cgraph;
 struct ggml_tensor;
+struct ggml_threadpool;
 
 namespace pixal3d {
 
@@ -82,13 +83,23 @@ public:
     void log_buffer(const char * phase,
                     ggml_backend_t backend,
                     std::size_t buffer_bytes = 0) const noexcept;
+    // Configure all backends and reuse the CPU backend's worker pool across
+    // graph invocations.  The method is const because thread configuration is
+    // runtime state owned by the manager, not part of backend policy identity.
     void set_n_threads(int n_threads) const noexcept;
+    int cpu_threadpool_n_threads() const noexcept {
+        return cpu_threadpool_n_threads_;
+    }
 
 private:
+    bool configure_cpu_threadpool(int n_threads) const noexcept;
+
     BackendPolicy policy_;
     std::vector<ggml_backend_t> backends_;
     std::vector<BackendDeviceInfo> devices_;
     std::string primary_name_;
+    mutable struct ggml_threadpool * cpu_threadpool_ = nullptr;
+    mutable int cpu_threadpool_n_threads_ = 0;
     bool initialized_ = false;
 };
 

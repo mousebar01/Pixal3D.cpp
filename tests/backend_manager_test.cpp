@@ -116,6 +116,14 @@ int main() {
                "forced CPU manager did not select CPU")) return 1;
     if (!check(!manager.primary_name().empty(),
                "CPU backend manager has no primary name")) return 1;
+    if (!check(manager.cpu_threadpool_n_threads() == GGML_DEFAULT_N_THREADS,
+               "CPU backend manager did not configure the default threadpool")) return 1;
+    manager.set_n_threads(2);
+    if (!check(manager.cpu_threadpool_n_threads() == 2,
+               "CPU backend manager did not resize the threadpool")) return 1;
+    manager.set_n_threads(GGML_DEFAULT_N_THREADS);
+    if (!check(manager.cpu_threadpool_n_threads() == GGML_DEFAULT_N_THREADS,
+               "CPU backend manager did not restore the default threadpool")) return 1;
 
     pixal3d::BackendManager auto_manager;
     error.clear();

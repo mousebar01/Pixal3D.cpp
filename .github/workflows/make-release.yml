@@ -1,0 +1,208 @@
+name: Make release
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: 'Successful release.yml candidate run ID'
+        required: true
+        type: string
+      release_tag:
+        description: 'Release tag (empty uses v<candidate CLI version>)'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: 'Validate only; do not create a tag or GitHub Release'
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: pixal3d-make-release-${{ inputs.release_tag || inputs.candidate_run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate_candidate:
+    name: Validate release candidate
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      REQUESTED_TAG: ${{ inputs.release_tag }}
+    outputs:
+      candidate_sha: ${{ steps.package.outputs.source_commit }}
+      tag_name: ${{ steps.package.outputs.tag_name }}
+      version: ${{ steps.package.outputs.version }}
+      archive_name: ${{ steps.package.outputs.archive_name }}
+    steps:
+      - name: Check out release scripts
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Inspect candidate workflow run
+        id: run_info
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_json=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}")
+          workflow_path=$(jq -r '.path' <<<"$run_json")
+          event_name=$(jq -r '.event' <<<"$run_json")
+          status=$(jq -r '.status' <<<"$run_json")
+          conclusion=$(jq -r '.conclusion' <<<"$run_json")
+          head_branch=$(jq -r '.head_branch' <<<"$run_json")
+          workflow_sha=$(jq -r '.head_sha' <<<"$run_json")
+
+          [[ "$workflow_path" == ".github/workflows/release.yml" ]] || {
+            echo "error: run ${CANDIDATE_RUN_ID} is not release.yml (${workflow_path})" >&2
+            exit 1
+          }
+          [[ "$event_name" == "workflow_dispatch" ]] || {
+            echo "error: candidate run was not manually dispatched (${event_name})" >&2
+            exit 1
+          }
+          [[ "$status" == "completed" && "$conclusion" == "success" ]] || {
+            echo "error: candidate run is ${status}/${conclusion}, not completed/success" >&2
+            exit 1
+          }
+          [[ "$head_branch" == "master" ]] || {
+            echo "error: candidate must come from master, got ${head_branch}" >&2
+            exit 1
+          }
+          [[ "$workflow_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "error: workflow ref SHA is not a full Git SHA: ${workflow_sha}" >&2
+            exit 1
+          }
+
+          printf 'candidate run: %s\n' "$CANDIDATE_RUN_ID"
+          printf 'candidate branch: %s\n' "$head_branch"
+          printf 'workflow ref SHA: %s\n' "$workflow_sha"
+
+      - name: Download CPU candidate artifact
+        run: |
+          rm -rf candidate
+          gh run download "$CANDIDATE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "pixal3d-cpu-candidate-${CANDIDATE_RUN_ID}" \
+            --dir candidate
+          find candidate -maxdepth 2 -type f -print
+
+      - name: Validate package, version, and commit
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --candidate-dir candidate
+          )
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            args+=(--expected-tag "$REQUESTED_TAG")
+          fi
+          ./scripts/validate_release_candidate.sh \
+            "${args[@]}" \
+            --require-project-license \
+            --require-notice
+
+      - name: Verify candidate commit belongs to master
+        env:
+          SOURCE_COMMIT: ${{ steps.package.outputs.source_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/compare/master...${SOURCE_COMMIT}" \
+            --jq '.status')
+          case "$status" in
+            identical|behind) ;;
+            *)
+              echo "error: candidate commit ${SOURCE_COMMIT} is not on master (compare status: ${status})" >&2
+              exit 1
+              ;;
+          esac
+          printf 'candidate commit %s is on master (compare status: %s)\n' "$SOURCE_COMMIT" "$status"
+
+      - name: Reject an existing tag or release
+        env:
+          TAG_NAME: ${{ steps.package.outputs.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG_NAME}" >/dev/null 2>&1; then
+            echo "error: tag ${TAG_NAME} already exists" >&2
+            exit 1
+          fi
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "error: GitHub Release ${TAG_NAME} already exists" >&2
+            exit 1
+          fi
+          printf 'tag %s is available\n' "$TAG_NAME"
+
+      - name: Print dry-run result
+        run: |
+          cat <<EOF
+          Candidate validation passed.
+          candidate_run_id=${CANDIDATE_RUN_ID}
+          candidate_sha=${{ steps.package.outputs.source_commit }}
+          release_tag=${{ steps.package.outputs.tag_name }}
+          dry_run=${{ inputs.dry_run }}
+          EOF
+
+  publish:
+    name: Publish verified release
+    if: ${{ inputs.dry_run == false }}
+    needs: validate_candidate
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      CANDIDATE_SHA: ${{ needs.validate_candidate.outputs.candidate_sha }}
+      TAG_NAME: ${{ needs.validate_candidate.outputs.tag_name }}
+    steps:
+      - name: Check out the exact candidate commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate_candidate.outputs.candidate_sha }}
+          fetch-depth: 1
+
+      - name: Download the validated CPU artifact
+        run: |
+          rm -rf candidate
+          gh run download "$CANDIDATE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "pixal3d-cpu-candidate-${CANDIDATE_RUN_ID}" \
+            --dir candidate
+          ./scripts/validate_release_candidate.sh \
+            --candidate-dir candidate \
+            --expected-tag "$TAG_NAME" \
+            --expected-commit "$CANDIDATE_SHA" \
+            --require-project-license \
+            --require-notice
+
+      - name: Create and push the exact release tag
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG_NAME}" >/dev/null 2>&1; then
+            echo "error: tag ${TAG_NAME} appeared after validation" >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG_NAME" "$CANDIDATE_SHA" -m "Pixal3D $TAG_NAME"
+          git push origin "$TAG_NAME"
+
+      - name: Create GitHub Release and upload immutable assets
+        run: |
+          gh release create "$TAG_NAME" \
+            candidate/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Pixal3D $TAG_NAME" \
+            --generate-notes \
+            --target "$CANDIDATE_SHA"
