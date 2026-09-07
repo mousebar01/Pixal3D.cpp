@@ -87,6 +87,29 @@ bool same_shape(const SparseTensorF32 & left, const SparseTensorF32 & right) {
            left.feats.size() == right.feats.size();
 }
 
+void clear_tensor_for_callback(SparseTensorF32 & tensor) {
+    tensor.batch_size = 0;
+    tensor.channels = 0;
+    tensor.spatial_x = 0;
+    tensor.spatial_y = 0;
+    tensor.spatial_z = 0;
+    tensor.coords.clear();
+    tensor.feats.clear();
+}
+
+struct FlowSamplerWorkspace {
+    SparseTensorF32 prediction;
+    SparseTensorF32 positive;
+    SparseTensorF32 negative;
+    SparseTensorF32 x0_positive;
+    SparseTensorF32 x0_cfg;
+    std::vector<float> std_positive;
+    std::vector<float> std_cfg;
+    std::vector<std::size_t> counts;
+    std::vector<float> sum;
+    std::vector<float> sum_squared;
+};
+
 bool valid_config(const FlowEulerSamplerConfig & config, std::string * error) {
     if (config.steps <= 0 || !(config.sigma_min >= 0.0f) ||
         !(config.sigma_min < 1.0f) || !std::isfinite(config.sigma_min) ||
@@ -139,12 +162,16 @@ void xstart_to_pred(const SparseTensorF32 & state, float timestep, float sigma_m
 // reducing, so this is the population standard deviation over all feature
 // values in each batch.
 bool sparse_batch_std(const SparseTensorF32 & input, std::vector<float> & output,
+                      std::vector<std::size_t> & counts,
+                      std::vector<float> & sum,
+                      std::vector<float> & sum_squared,
                       std::string * error) {
     if (!input.valid(error)) return false;
-    output.assign(static_cast<std::size_t>(input.batch_size), 0.0f);
-    std::vector<std::size_t> counts(static_cast<std::size_t>(input.batch_size), 0);
-    std::vector<float> sum(static_cast<std::size_t>(input.batch_size), 0.0f);
-    std::vector<float> sum_squared(static_cast<std::size_t>(input.batch_size), 0.0f);
+    const std::size_t batch_count = static_cast<std::size_t>(input.batch_size);
+    output.assign(batch_count, 0.0f);
+    counts.assign(batch_count, 0);
+    sum.assign(batch_count, 0.0f);
+    sum_squared.assign(batch_count, 0.0f);
     for (std::size_t point = 0; point < input.points(); ++point) {
         const int batch = input.coords[point * 4];
         const float * values = input.feats.data() + point * static_cast<std::size_t>(input.channels);
@@ -184,15 +211,19 @@ bool apply_guidance_rescale(const SparseTensorF32 & state, float timestep,
                             const FlowEulerSamplerConfig & config,
                             const SparseTensorF32 & positive,
                             SparseTensorF32 & prediction,
+                            FlowSamplerWorkspace & workspace,
                             std::string * error) {
-    SparseTensorF32 x0_positive;
-    SparseTensorF32 x0_cfg;
-    pred_to_xstart(state, timestep, config.sigma_min, positive, x0_positive);
-    pred_to_xstart(state, timestep, config.sigma_min, prediction, x0_cfg);
-    std::vector<float> std_positive;
-    std::vector<float> std_cfg;
-    if (!sparse_batch_std(x0_positive, std_positive, error) ||
-        !sparse_batch_std(x0_cfg, std_cfg, error)) return false;
+    pred_to_xstart(state, timestep, config.sigma_min, positive, workspace.x0_positive);
+    pred_to_xstart(state, timestep, config.sigma_min, prediction, workspace.x0_cfg);
+    if (!sparse_batch_std(workspace.x0_positive, workspace.std_positive,
+                          workspace.counts, workspace.sum, workspace.sum_squared, error) ||
+        !sparse_batch_std(workspace.x0_cfg, workspace.std_cfg,
+                          workspace.counts, workspace.sum, workspace.sum_squared, error)) {
+        return false;
+    }
+    SparseTensorF32 & x0_cfg = workspace.x0_cfg;
+    const std::vector<float> & std_positive = workspace.std_positive;
+    const std::vector<float> & std_cfg = workspace.std_cfg;
     for (std::size_t point = 0; point < x0_cfg.points(); ++point) {
         const int batch = x0_cfg.coords[point * 4];
         const float denominator = std_cfg[static_cast<std::size_t>(batch)];
@@ -225,6 +256,7 @@ bool flow_euler_sample_f32(
     }
 
     SparseTensorF32 state = noise;
+    FlowSamplerWorkspace workspace;
     const bool diagnostics = flow_diagnostics_enabled();
     if (diagnostics && !trace_features(state, "state_before", "initial", -1, 1.0f, error)) {
         return false;
@@ -253,50 +285,51 @@ bool flow_euler_sample_f32(
                                  timestep <= config.guidance_interval_max;
         const float guidance = in_interval ? config.guidance_strength : 1.0f;
 
-        SparseTensorF32 prediction;
+        clear_tensor_for_callback(workspace.prediction);
         if (guidance == 1.0f) {
-            if (!model(state, 1000.0f * timestep, true, prediction, error) ||
-                !check_model_output(state, prediction, error)) return false;
-            if (diagnostics && !trace_features(prediction, "prediction", "conditional", step,
+            if (!model(state, 1000.0f * timestep, true, workspace.prediction, error) ||
+                !check_model_output(state, workspace.prediction, error)) return false;
+            if (diagnostics && !trace_features(workspace.prediction, "prediction", "conditional", step,
                                                timestep, error)) return false;
         } else if (guidance == 0.0f) {
-            if (!model(state, 1000.0f * timestep, false, prediction, error) ||
-                !check_model_output(state, prediction, error)) return false;
-            if (diagnostics && !trace_features(prediction, "prediction", "unconditional", step,
+            if (!model(state, 1000.0f * timestep, false, workspace.prediction, error) ||
+                !check_model_output(state, workspace.prediction, error)) return false;
+            if (diagnostics && !trace_features(workspace.prediction, "prediction", "unconditional", step,
                                                timestep, error)) return false;
         } else {
-            SparseTensorF32 positive;
-            SparseTensorF32 negative;
-            if (!model(state, 1000.0f * timestep, true, positive, error) ||
-                !check_model_output(state, positive, error)) return false;
-            if (diagnostics && !trace_features(positive, "prediction", "conditional", step,
+            clear_tensor_for_callback(workspace.positive);
+            clear_tensor_for_callback(workspace.negative);
+            if (!model(state, 1000.0f * timestep, true, workspace.positive, error) ||
+                !check_model_output(state, workspace.positive, error)) return false;
+            if (diagnostics && !trace_features(workspace.positive, "prediction", "conditional", step,
                                                timestep, error)) return false;
-            if (!model(state, 1000.0f * timestep, false, negative, error) ||
-                !check_model_output(state, negative, error)) return false;
-            if (diagnostics && !trace_features(negative, "prediction", "unconditional", step,
+            if (!model(state, 1000.0f * timestep, false, workspace.negative, error) ||
+                !check_model_output(state, workspace.negative, error)) return false;
+            if (diagnostics && !trace_features(workspace.negative, "prediction", "unconditional", step,
                                                timestep, error)) return false;
-            blend_guidance(positive, negative, guidance, prediction);
-            if (diagnostics && !trace_features(prediction, "cfg_blend", "guided", step,
+            blend_guidance(workspace.positive, workspace.negative, guidance, workspace.prediction);
+            if (diagnostics && !trace_features(workspace.prediction, "cfg_blend", "guided", step,
                                                timestep, error)) return false;
             if (config.guidance_rescale > 0.0f &&
-                !apply_guidance_rescale(state, timestep, config, positive, prediction, error)) {
+                !apply_guidance_rescale(state, timestep, config, workspace.positive,
+                                        workspace.prediction, workspace, error)) {
                 return false;
             }
             if (diagnostics && config.guidance_rescale > 0.0f &&
-                !trace_features(prediction, "guidance_rescale", "guided", step,
+                !trace_features(workspace.prediction, "guidance_rescale", "guided", step,
                                 timestep, error)) return false;
         }
 
         SparseTensorF32 x0;
         if (config.record_trajectory) {
-            pred_to_xstart(state, timestep, config.sigma_min, prediction, x0);
+            pred_to_xstart(state, timestep, config.sigma_min, workspace.prediction, x0);
             if (diagnostics && !trace_features(x0, "x0", "guided", step, timestep, error)) {
                 return false;
             }
         }
         const float delta = timestep - next_timestep;
         for (std::size_t index = 0; index < state.feats.size(); ++index) {
-            state.feats[index] -= delta * prediction.feats[index];
+            state.feats[index] -= delta * workspace.prediction.feats[index];
         }
         if (diagnostics && !trace_features(state, "state_after", "euler", step,
                                            next_timestep, error)) return false;

@@ -1,12 +1,7 @@
 .git
 .gitignore
 build
-build-cuda
-build-cuda-work
-build-cuda-new
-build-cuda-docker
-build-cuda-local
-build-cuda-patch
+build-*
 Testing
 weights
 ref

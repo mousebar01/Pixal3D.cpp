@@ -96,6 +96,11 @@ bool valid_eps(float epsilon, std::string * error) {
     return false;
 }
 
+bool slat_decoder_trace_enabled() noexcept {
+    const char * value = std::getenv("PIXAL3D_SLAT_DECODER_TRACE");
+    return value && *value && std::strcmp(value, "0") != 0;
+}
+
 } // namespace
 
 bool sparse_convnext_block_f32(const SparseTensorF32 & input,
@@ -555,26 +560,6 @@ struct SLatDecoderGpuState {
         return true;
     }
 
-    static bool channel_major(const SparseTensorF32 & input,
-                              std::vector<float> & values,
-                              std::string * error) {
-        if (!input.valid(error)) return false;
-        values.resize(input.points() * static_cast<std::size_t>(input.channels));
-        for (std::size_t point = 0; point < input.points(); ++point) {
-            for (int channel = 0; channel < input.channels; ++channel) {
-                // ggml tensors shaped [channels, points] are contiguous in
-                // point-major rows: ne[0] (channels) is the innermost
-                // dimension.  This is the same byte order as SparseTensor's
-                // public [point, channel] feature rows.
-                values[point * static_cast<std::size_t>(input.channels) +
-                       static_cast<std::size_t>(channel)] =
-                    input.feats[point * static_cast<std::size_t>(input.channels) +
-                                static_cast<std::size_t>(channel)];
-            }
-        }
-        return true;
-    }
-
     static bool finish_sparse(const SparseTensorF32 & input,
                               int channels,
                               const std::vector<float> & channel_values,
@@ -619,18 +604,14 @@ struct SLatDecoderGpuState {
             set_error(error, "SLat decoder GPU convolution point count is invalid");
             return false;
         }
-        std::vector<float> values;
-        if (!channel_major(input, values, error)) return false;
         // Append one explicit zero column so missing sparse neighbours can be
-        // gathered without a backend-dependent broadcast mask operation.
+        // gathered without a backend-dependent broadcast mask operation.  The
+        // public feature rows already have ggml's contiguous [channel, point]
+        // byte order, so write them directly and avoid an intermediate copy.
         const std::size_t input_columns = points + 1;
         std::vector<float> padded_values(
             static_cast<std::size_t>(input.channels) * input_columns, 0.0f);
-        for (std::size_t point = 0; point < points; ++point) {
-            std::copy_n(values.data() + point * static_cast<std::size_t>(input.channels),
-                        input.channels,
-                        padded_values.data() + point * static_cast<std::size_t>(input.channels));
-        }
+        std::copy(input.feats.begin(), input.feats.end(), padded_values.begin());
         std::unordered_map<DecoderCoord, std::size_t, DecoderCoordHash> indices;
         indices.reserve(points);
         for (std::size_t point = 0; point < points; ++point) {
@@ -701,6 +682,8 @@ struct SLatDecoderGpuState {
         accumulator = ggml_cont(ctx, accumulator);
         ggml_set_output(accumulator);
         ggml_build_forward_expand(graph, accumulator);
+        const bool trace = slat_decoder_trace_enabled();
+        const double allocation_begin = trace ? backend_time_now_ms() : 0.0;
         std::string scheduler_error;
         BackendScheduler scheduler(*backend_manager, 4096, false, true,
                                    &scheduler_error, "SLat decoder");
@@ -708,13 +691,25 @@ struct SLatDecoderGpuState {
             (backend_manager->requires_primary_backend() &&
              !scheduler.require_primary_graph(graph, &scheduler_error)) ||
             !scheduler.allocate_graph(graph, &scheduler_error)) {
+            scheduler.synchronize();
+            scheduler = BackendScheduler{};
             ggml_free(ctx);
             set_error(error, scheduler_error.empty()
                 ? "failed to allocate SLat decoder GPU convolution graph" : scheduler_error);
             return false;
         }
+        if (trace) {
+            backend_log_timing("SLat-decoder-conv", "scheduler_allocate",
+                               backend_time_now_ms() - allocation_begin);
+        }
+        const double input_upload_begin = trace ? backend_time_now_ms() : 0.0;
         ggml_backend_tensor_set(input_tensor, padded_values.data(), 0,
                                 padded_values.size() * sizeof(float));
+        if (trace) {
+            backend_log_timing("SLat-decoder-conv", "input_upload",
+                               backend_time_now_ms() - input_upload_begin);
+        }
+        const double index_upload_begin = trace ? backend_time_now_ms() : 0.0;
         for (std::size_t index = 0; index < index_tensors.size(); ++index) {
             // Reconstructing the small gather arrays here keeps their lifetime
             // independent from the graph descriptors and avoids host-side
@@ -738,17 +733,40 @@ struct SLatDecoderGpuState {
             ggml_backend_tensor_set(index_tensors[index], index_values.data(), 0,
                                     index_values.size() * sizeof(std::int32_t));
         }
+        if (trace) {
+            backend_log_timing("SLat-decoder-conv", "index_upload",
+                               backend_time_now_ms() - index_upload_begin);
+        }
+        const double compute_begin = trace ? backend_time_now_ms() : 0.0;
         const ggml_status status = scheduler.compute(graph, &scheduler_error);
+        if (trace) {
+            backend_log_timing("SLat-decoder-conv", "scheduler_compute",
+                               backend_time_now_ms() - compute_begin);
+        }
         bool ok = status == GGML_STATUS_SUCCESS;
         std::vector<float> result_values(points * static_cast<std::size_t>(out_channels));
         if (ok) {
+            const double output_download_begin = trace ? backend_time_now_ms() : 0.0;
             ggml_backend_tensor_get(accumulator, result_values.data(), 0,
                                     result_values.size() * sizeof(float));
+            if (trace) {
+                backend_log_timing("SLat-decoder-conv", "output_download",
+                                   backend_time_now_ms() - output_download_begin);
+                std::cerr << "pixal3d: SLat-decoder-conv points=" << points
+                          << " in_channels=" << input.channels
+                          << " out_channels=" << out_channels
+                          << " input_bytes=" << padded_values.size() * sizeof(float)
+                          << " index_bytes=" << index_tensors.size() * points * sizeof(std::int32_t)
+                          << " output_bytes=" << result_values.size() * sizeof(float)
+                          << std::endl;
+            }
             ok = finish_sparse(input, out_channels, result_values, output, error);
         } else {
             set_error(error, "SLat decoder GPU convolution graph compute failed" +
                       (scheduler_error.empty() ? std::string{} : ": " + scheduler_error));
         }
+        scheduler.synchronize();
+        scheduler = BackendScheduler{};
         ggml_free(ctx);
         return ok;
     }

@@ -200,10 +200,36 @@ bool ss_occupancy_to_coords_f32(const float * occupancy_logits,
 }
 
 struct SSDecoderModel::Impl {
+    struct Runtime {
+        ggml_context * ctx = nullptr;
+        ggml_cgraph * graph = nullptr;
+        ggml_tensor * input = nullptr;
+        ggml_tensor * output = nullptr;
+        BackendScheduler scheduler;
+
+        ~Runtime() { close(); }
+
+        void close() noexcept {
+            // The scheduler owns graph allocations and backend references to
+            // the graph tensors.  Synchronize and release it before the
+            // context so no in-flight work or scheduler references remain.
+            scheduler.synchronize();
+            scheduler = BackendScheduler{};
+            if (ctx) {
+                ggml_free(ctx);
+                ctx = nullptr;
+            }
+            graph = nullptr;
+            input = nullptr;
+            output = nullptr;
+        }
+    };
+
     Pixal3DPackReader reader;
     SSDecoderHParams hp;
     ggml_context * weights_ctx = nullptr;
     BackendManager backend_manager;
+    Runtime runtime;
     ggml_backend_buffer_t weights_buffer = nullptr;
     std::string backend_name;
     bool has_data = false;
@@ -212,6 +238,7 @@ struct SSDecoderModel::Impl {
     ~Impl() { close(); }
 
     void close() noexcept {
+        runtime.close();
         if (weights_buffer) {
             ggml_backend_buffer_free(weights_buffer);
             weights_buffer = nullptr;
@@ -414,173 +441,188 @@ bool SSDecoderModel::decode(const float * latent,
         }
     }
 
-    const std::size_t graph_memory = ggml_tensor_overhead() * 8192 +
-                                     ggml_graph_overhead_custom(8192, false);
-    ggml_init_params graph_params{};
-    graph_params.mem_size = graph_memory;
-    graph_params.mem_buffer = nullptr;
-    graph_params.no_alloc = true;
-    ggml_context * ctx = ggml_init(graph_params);
-    if (!ctx) {
-        set_error(error, "failed to allocate ss-decoder graph context");
-        return false;
-    }
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
-    if (!graph) {
-        ggml_free(ctx);
-        set_error(error, "failed to allocate ss-decoder graph");
-        return false;
-    }
-    const int input_channels = hp.latent_channels;
-    ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
-                                             hp.resolution, hp.resolution,
-                                             hp.resolution, input_channels);
-    if (!input) {
-        ggml_free(ctx);
-        set_error(error, "failed to allocate ss-decoder input");
-        return false;
-    }
-    ggml_set_input(input);
-    ggml_set_name(input, "z_s");
+    Impl::Runtime & runtime = impl_->runtime;
+    if (!runtime.ctx) {
+        const double graph_build_start = backend_time_now_ms();
+        const std::size_t graph_memory = ggml_tensor_overhead() * 8192 +
+                                         ggml_graph_overhead_custom(8192, false);
+        ggml_init_params graph_params{};
+        graph_params.mem_size = graph_memory;
+        graph_params.mem_buffer = nullptr;
+        graph_params.no_alloc = true;
+        runtime.ctx = ggml_init(graph_params);
+        if (!runtime.ctx) {
+            set_error(error, "failed to allocate ss-decoder graph context");
+            return false;
+        }
+        ggml_context * ctx = runtime.ctx;
+        runtime.graph = ggml_new_graph_custom(ctx, 8192, false);
+        if (!runtime.graph) {
+            runtime.close();
+            set_error(error, "failed to allocate ss-decoder graph");
+            return false;
+        }
+        const int input_channels = hp.latent_channels;
+        runtime.input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                                           hp.resolution, hp.resolution,
+                                           hp.resolution, input_channels);
+        if (!runtime.input) {
+            runtime.close();
+            set_error(error, "failed to allocate ss-decoder input");
+            return false;
+        }
+        ggml_set_input(runtime.input);
+        ggml_set_name(runtime.input, "z_s");
 
-    auto conv = [&](ggml_tensor * in, const std::string & local_name,
-                    int channels_in, int channels_out) {
-        ggml_tensor * weight = W(local_name + ".weight");
-        ggml_tensor * bias = W(local_name + ".bias");
-        if (ggml_backend_is_cpu(impl_->backend_manager.primary())) {
-            // The CPU backend has a dedicated Conv3d implementation which
-            // accepts the native F16-kernel path.  Keep it for the validated
-            // reference/fallback route; only CUDA needs the explicit recipe
-            // below because its direct Conv3d op is not available.
-            ggml_tensor * result = ggml_conv_3d(
-                ctx, weight, in, channels_in, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+        auto conv = [&](ggml_tensor * in, const std::string & local_name,
+                        int channels_in, int channels_out) {
+            ggml_tensor * weight = W(local_name + ".weight");
+            ggml_tensor * bias = W(local_name + ".bias");
+            if (ggml_backend_is_cpu(impl_->backend_manager.primary())) {
+                // The CPU backend has a dedicated Conv3d implementation which
+                // accepts the native F16-kernel path.  Keep it for the validated
+                // reference/fallback route; only CUDA needs the explicit recipe
+                // below because its direct Conv3d op is not available.
+                ggml_tensor * result = ggml_conv_3d(
+                    ctx, weight, in, channels_in, 1, 1, 1, 1, 1, 1, 1, 1, 1);
+                return ggml_add(ctx, result,
+                                ggml_reshape_4d(ctx, bias, 1, 1, 1, channels_out));
+            }
+            // The CUDA matmul path requires both operands to have the same
+            // storage dtype.  Keep the source activation tensor in F32, but use
+            // the kernel dtype for the im2col staging tensor, matching ggml's
+            // reference Conv3d recipe.  ggml_mul_mat still returns F32 and is
+            // explicitly configured for F32 accumulation below.
+            ggml_tensor * im2col = ggml_im2col_3d(
+                ctx, weight, in, channels_in, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                weight->type);
+            ggml_tensor * im2col_matrix = ggml_reshape_2d(
+                ctx, im2col, im2col->ne[0],
+                im2col->ne[3] * im2col->ne[2] * im2col->ne[1]);
+            ggml_tensor * weight_matrix = ggml_reshape_2d(
+                ctx, weight, weight->ne[0] * weight->ne[1] * weight->ne[2] *
+                channels_in, weight->ne[3] / channels_in);
+            ggml_tensor * result = ggml_mul_mat(ctx, im2col_matrix, weight_matrix);
+            ggml_mul_mat_set_prec(result, GGML_PREC_F32);
+            const int64_t output_depth = im2col->ne[3] / (in->ne[3] / channels_in);
+            result = ggml_reshape_4d(ctx, result,
+                                     im2col->ne[1] * im2col->ne[2],
+                                     output_depth, in->ne[3] / channels_in,
+                                     weight->ne[3] / channels_in);
+            result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2));
+            result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2],
+                                     output_depth,
+                                     (weight->ne[3] / channels_in) *
+                                     (in->ne[3] / channels_in));
             return ggml_add(ctx, result,
                             ggml_reshape_4d(ctx, bias, 1, 1, 1, channels_out));
-        }
-        // The CUDA matmul path requires both operands to have the same
-        // storage dtype.  Keep the source activation tensor in F32, but use
-        // the kernel dtype for the im2col staging tensor, matching ggml's
-        // reference Conv3d recipe.  ggml_mul_mat still returns F32 and is
-        // explicitly configured for F32 accumulation below.
-        ggml_tensor * im2col = ggml_im2col_3d(
-            ctx, weight, in, channels_in, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-            weight->type);
-        ggml_tensor * im2col_matrix = ggml_reshape_2d(
-            ctx, im2col, im2col->ne[0],
-            im2col->ne[3] * im2col->ne[2] * im2col->ne[1]);
-        ggml_tensor * weight_matrix = ggml_reshape_2d(
-            ctx, weight, weight->ne[0] * weight->ne[1] * weight->ne[2] *
-            channels_in, weight->ne[3] / channels_in);
-        ggml_tensor * result = ggml_mul_mat(ctx, im2col_matrix, weight_matrix);
-        ggml_mul_mat_set_prec(result, GGML_PREC_F32);
-        const int64_t output_depth = im2col->ne[3] / (in->ne[3] / channels_in);
-        result = ggml_reshape_4d(ctx, result,
-                                 im2col->ne[1] * im2col->ne[2],
-                                 output_depth, in->ne[3] / channels_in,
-                                 weight->ne[3] / channels_in);
-        result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2));
-        result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2],
-                                 output_depth,
-                                 (weight->ne[3] / channels_in) *
-                                 (in->ne[3] / channels_in));
-        return ggml_add(ctx, result,
-                        ggml_reshape_4d(ctx, bias, 1, 1, 1, channels_out));
-    };
-    auto channel_norm = [&](ggml_tensor * in, const std::string & local_name) {
-        ggml_tensor * permuted = ggml_cont(ctx, ggml_permute(ctx, in, 1, 2, 3, 0));
-        permuted = ggml_norm(ctx, permuted, hp.norm_eps);
-        permuted = ggml_add(ctx, ggml_mul(ctx, permuted,
-                                           W(local_name + ".weight")),
-                            W(local_name + ".bias"));
-        return ggml_cont(ctx, ggml_permute(ctx, permuted, 3, 0, 1, 2));
-    };
-    auto resblock = [&](ggml_tensor * in, const std::string & local_name,
-                        int channels) {
-        ggml_tensor * h = channel_norm(in, local_name + ".norm1");
-        h = ggml_silu(ctx, h);
-        h = conv(h, local_name + ".conv1", channels, channels);
-        h = channel_norm(h, local_name + ".norm2");
-        h = ggml_silu(ctx, h);
-        h = conv(h, local_name + ".conv2", channels, channels);
-        return ggml_add(ctx, h, in);
-    };
-    auto pixel_shuffle = [&](ggml_tensor * tensor, int a0, int a1, int a2,
-                             int channels_out) {
-        tensor = ggml_reshape_4d(ctx, tensor, a0, a1 * a2, 2, channels_out * 4);
-        tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 2, 0, 3));
-        tensor = ggml_reshape_4d(ctx, tensor, 2 * a0, a1, a2, channels_out * 4);
-        tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 0, 2, 3));
-        tensor = ggml_reshape_4d(ctx, tensor, a1, 2 * a0 * a2, 2,
-                                 channels_out * 2);
-        tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 2, 0, 3));
-        tensor = ggml_reshape_4d(ctx, tensor, 2 * a1, 2 * a0, a2,
-                                 channels_out * 2);
-        tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 0, 2, 3));
-        tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 2, 0, 3));
-        tensor = ggml_reshape_4d(ctx, tensor, a2, 2 * a0 * 2 * a1, 2,
-                                 channels_out);
-        tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 2, 0, 3));
-        tensor = ggml_reshape_4d(ctx, tensor, 2 * a2, 2 * a0, 2 * a1,
-                                 channels_out);
-        return ggml_cont(ctx, ggml_permute(ctx, tensor, 2, 0, 1, 3));
-    };
+        };
+        auto channel_norm = [&](ggml_tensor * in, const std::string & local_name) {
+            ggml_tensor * permuted = ggml_cont(ctx, ggml_permute(ctx, in, 1, 2, 3, 0));
+            permuted = ggml_norm(ctx, permuted, hp.norm_eps);
+            permuted = ggml_add(ctx, ggml_mul(ctx, permuted,
+                                               W(local_name + ".weight")),
+                                W(local_name + ".bias"));
+            return ggml_cont(ctx, ggml_permute(ctx, permuted, 3, 0, 1, 2));
+        };
+        auto resblock = [&](ggml_tensor * in, const std::string & local_name,
+                            int channels) {
+            ggml_tensor * h = channel_norm(in, local_name + ".norm1");
+            h = ggml_silu(ctx, h);
+            h = conv(h, local_name + ".conv1", channels, channels);
+            h = channel_norm(h, local_name + ".norm2");
+            h = ggml_silu(ctx, h);
+            h = conv(h, local_name + ".conv2", channels, channels);
+            return ggml_add(ctx, h, in);
+        };
+        auto pixel_shuffle = [&](ggml_tensor * tensor, int a0, int a1, int a2,
+                                 int channels_out) {
+            tensor = ggml_reshape_4d(ctx, tensor, a0, a1 * a2, 2, channels_out * 4);
+            tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 2, 0, 3));
+            tensor = ggml_reshape_4d(ctx, tensor, 2 * a0, a1, a2, channels_out * 4);
+            tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 0, 2, 3));
+            tensor = ggml_reshape_4d(ctx, tensor, a1, 2 * a0 * a2, 2,
+                                     channels_out * 2);
+            tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 2, 0, 3));
+            tensor = ggml_reshape_4d(ctx, tensor, 2 * a1, 2 * a0, a2,
+                                     channels_out * 2);
+            tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 0, 2, 3));
+            tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 2, 0, 3));
+            tensor = ggml_reshape_4d(ctx, tensor, a2, 2 * a0 * 2 * a1, 2,
+                                     channels_out);
+            tensor = ggml_cont(ctx, ggml_permute(ctx, tensor, 1, 2, 0, 3));
+            tensor = ggml_reshape_4d(ctx, tensor, 2 * a2, 2 * a0, 2 * a1,
+                                     channels_out);
+            return ggml_cont(ctx, ggml_permute(ctx, tensor, 2, 0, 1, 3));
+        };
 
-    ggml_tensor * h = conv(input, "input_layer", hp.latent_channels,
-                           hp.channels.front());
-    for (int index = 0; index < hp.num_res_blocks_middle; ++index) {
-        h = resblock(h, "middle_block." + std::to_string(index), hp.channels.front());
-    }
-    int block_index = 0;
-    int current_resolution = hp.resolution;
-    for (std::size_t level = 0; level < hp.channels.size(); ++level) {
-        const int channels = hp.channels[level];
-        for (int index = 0; index < hp.num_res_blocks; ++index) {
-            h = resblock(h, "blocks." + std::to_string(block_index++), channels);
+        ggml_tensor * h = conv(runtime.input, "input_layer", hp.latent_channels,
+                               hp.channels.front());
+        for (int index = 0; index < hp.num_res_blocks_middle; ++index) {
+            h = resblock(h, "middle_block." + std::to_string(index), hp.channels.front());
         }
-        if (level + 1 < hp.channels.size()) {
-            const int next = hp.channels[level + 1];
-            h = conv(h, "blocks." + std::to_string(block_index++) + ".conv",
-                     channels, next * 8);
-            h = pixel_shuffle(h, current_resolution, current_resolution,
-                              current_resolution, next);
-            current_resolution *= 2;
+        int block_index = 0;
+        int current_resolution = hp.resolution;
+        for (std::size_t level = 0; level < hp.channels.size(); ++level) {
+            const int channels = hp.channels[level];
+            for (int index = 0; index < hp.num_res_blocks; ++index) {
+                h = resblock(h, "blocks." + std::to_string(block_index++), channels);
+            }
+            if (level + 1 < hp.channels.size()) {
+                const int next = hp.channels[level + 1];
+                h = conv(h, "blocks." + std::to_string(block_index++) + ".conv",
+                         channels, next * 8);
+                h = pixel_shuffle(h, current_resolution, current_resolution,
+                                  current_resolution, next);
+                current_resolution *= 2;
+            }
+        }
+        h = channel_norm(h, "out_layer.0");
+        h = ggml_silu(ctx, h);
+        h = conv(h, "out_layer.2", hp.channels.back(), hp.out_channels);
+        runtime.output = h;
+        ggml_set_output(runtime.output);
+        if (!missing.empty()) {
+            runtime.close();
+            set_error(error, "missing ss-decoder tensor: " + missing);
+            return false;
+        }
+        ggml_build_forward_expand(runtime.graph, runtime.output);
+        backend_log_timing("SS-decoder", "graph_build",
+                           backend_time_now_ms() - graph_build_start);
+        std::string scheduler_error;
+        runtime.scheduler = BackendScheduler(impl_->backend_manager, 8192, false, true,
+                                             &scheduler_error, "SS-decoder");
+        if (!runtime.scheduler.valid() ||
+            (impl_->backend_manager.requires_primary_backend() &&
+             !runtime.scheduler.require_primary_graph(runtime.graph, &scheduler_error)) ||
+            !runtime.scheduler.allocate_graph(runtime.graph, &scheduler_error)) {
+            runtime.close();
+            set_error(error, "failed to allocate ss-decoder compute graph: " + scheduler_error);
+            return false;
         }
     }
-    h = channel_norm(h, "out_layer.0");
-    h = ggml_silu(ctx, h);
-    h = conv(h, "out_layer.2", hp.channels.back(), hp.out_channels);
-    ggml_set_output(h);
-    if (!missing.empty()) {
-        set_error(error, "missing ss-decoder tensor: " + missing);
-        ggml_free(ctx);
-        return false;
-    }
-    ggml_build_forward_expand(graph, h);
-    std::string scheduler_error;
-    BackendScheduler scheduler(impl_->backend_manager, 8192, false, true,
-                                &scheduler_error, "SS-decoder");
-    if (!scheduler.valid() ||
-        (impl_->backend_manager.requires_primary_backend() &&
-         !scheduler.require_primary_graph(graph, &scheduler_error)) ||
-        !scheduler.allocate_graph(graph, &scheduler_error)) {
-        ggml_free(ctx);
-        set_error(error, "failed to allocate ss-decoder compute graph: " + scheduler_error);
-        return false;
-    }
+
     impl_->backend_manager.set_n_threads(4);
-    ggml_backend_tensor_set(input, latent, 0,
+    const double upload_start = backend_time_now_ms();
+    ggml_backend_tensor_set(runtime.input, latent, 0,
                             static_cast<std::size_t>(hp.latent_channels) *
                             input_points * sizeof(float));
-    const ggml_status status = scheduler.compute(graph, &scheduler_error);
+    backend_log_timing("SS-decoder", "input_upload",
+                       backend_time_now_ms() - upload_start);
+    std::string scheduler_error;
+    const ggml_status status = runtime.scheduler.compute(runtime.graph, &scheduler_error);
     bool ok = status == GGML_STATUS_SUCCESS;
     if (ok) {
-        ggml_backend_tensor_get(h, output, 0,
+        const double download_start = backend_time_now_ms();
+        ggml_backend_tensor_get(runtime.output, output, 0,
                                 static_cast<std::size_t>(hp.out_channels) *
                                 output_points * sizeof(float));
+        backend_log_timing("SS-decoder", "output_download",
+                           backend_time_now_ms() - download_start);
     } else {
         set_error(error, "ss-decoder graph compute failed: " + scheduler_error);
     }
-    ggml_free(ctx);
     return ok;
 }
 

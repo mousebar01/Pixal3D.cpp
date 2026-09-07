@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -199,6 +201,7 @@ struct SSFlowModel::Impl {
         std::string backend_name;
         std::vector<float> cos_values;
         std::vector<float> sin_values;
+        bool rope_uploaded = false;
         BackendScheduler scheduler;
     } runtime;
 
@@ -238,6 +241,7 @@ struct SSFlowModel::Impl {
         runtime.backend_name.clear();
         runtime.cos_values.clear();
         runtime.sin_values.clear();
+        runtime.rope_uploaded = false;
     }
 
     void close() noexcept {
@@ -747,6 +751,7 @@ bool SSFlowModel::forward(const float * x,
         runtime.backend_name = impl_->backend_name;
         runtime.cos_values = std::move(cos_values);
         runtime.sin_values = std::move(sin_values);
+        runtime.rope_uploaded = false;
         runtime.scheduler = std::move(scheduler);
     }
 
@@ -756,10 +761,15 @@ bool SSFlowModel::forward(const float * x,
                             static_cast<std::size_t>(hp.in_channels) * points * sizeof(float));
     ggml_backend_tensor_set(runtime.temb, embedding.data(), 0,
                             embedding.size() * sizeof(float));
-    ggml_backend_tensor_set(runtime.cos_t, runtime.cos_values.data(), 0,
-                            runtime.cos_values.size() * sizeof(float));
-    ggml_backend_tensor_set(runtime.sin_t, runtime.sin_values.data(), 0,
-                            runtime.sin_values.size() * sizeof(float));
+    bool rope_uploaded = false;
+    if (!runtime.rope_uploaded) {
+        ggml_backend_tensor_set(runtime.cos_t, runtime.cos_values.data(), 0,
+                                runtime.cos_values.size() * sizeof(float));
+        ggml_backend_tensor_set(runtime.sin_t, runtime.sin_values.data(), 0,
+                                runtime.sin_values.size() * sizeof(float));
+        runtime.rope_uploaded = true;
+        rope_uploaded = true;
+    }
     ggml_backend_tensor_set(runtime.cnd, cond, 0,
                             static_cast<std::size_t>(cond_channels) *
                             static_cast<std::size_t>(cond_tokens) * sizeof(float));
@@ -769,6 +779,12 @@ bool SSFlowModel::forward(const float * x,
                                 sizeof(float));
     }
     backend_log_timing("SS-flow", "input_upload", backend_time_now_ms() - upload_start);
+    if (const char * trace = std::getenv("PIXAL3D_SS_FLOW_TRACE")) {
+        if (*trace && std::strcmp(trace, "0") != 0) {
+            std::fprintf(stderr, "pixal3d: SS-flow rope_upload=%s\n",
+                         rope_uploaded ? "yes" : "skip");
+        }
+    }
     std::string scheduler_error;
     const ggml_status status = runtime.scheduler.compute(runtime.graph, &scheduler_error);
     const bool ok = status == GGML_STATUS_SUCCESS;

@@ -480,6 +480,19 @@ struct SLatFlowModel::Impl {
     ggml_tensor * runtime_projection = nullptr;
     ggml_tensor * runtime_result = nullptr;
     SLatFiniteProbe runtime_finite_probe;
+    std::vector<float> runtime_channel_major_input;
+    std::vector<float> runtime_embedding;
+    std::vector<float> runtime_cos_values;
+    std::vector<float> runtime_sin_values;
+    std::vector<float> runtime_frequencies;
+    std::vector<std::int32_t> runtime_rope_coords;
+    std::vector<float> runtime_output_scratch;
+    int runtime_rope_head_dim = 0;
+    float runtime_rope_freq_min = 0.0f;
+    float runtime_rope_freq_base = 0.0f;
+    std::size_t runtime_rope_points = 0;
+    bool runtime_rope_cache_valid = false;
+    bool runtime_rope_uploaded = false;
     bool runtime_ready = false;
     int tensor_count = 0;
     bool has_data = false;
@@ -505,6 +518,19 @@ struct SLatFlowModel::Impl {
         runtime_projection = nullptr;
         runtime_result = nullptr;
         runtime_finite_probe = SLatFiniteProbe{};
+        runtime_channel_major_input.clear();
+        runtime_embedding.clear();
+        runtime_cos_values.clear();
+        runtime_sin_values.clear();
+        runtime_frequencies.clear();
+        runtime_rope_coords.clear();
+        runtime_output_scratch.clear();
+        runtime_rope_head_dim = 0;
+        runtime_rope_freq_min = 0.0f;
+        runtime_rope_freq_base = 0.0f;
+        runtime_rope_points = 0;
+        runtime_rope_cache_valid = false;
+        runtime_rope_uploaded = false;
         runtime_key = SLatFlowGpuRuntimeKey{};
         runtime_ready = false;
     }
@@ -756,45 +782,69 @@ bool SLatFlowModel::Impl::forward_gpu(
     const bool runtime_hit = runtime_ready && runtime_key.matches(
         points, context_tokens, projection_mode, projection_channels,
         concat_channels, hp.component, backend_policy, backend_name);
+    if (!runtime_hit) {
+        close_runtime();
+    }
 
     // These host-side inputs are refreshed for every invocation while the
     // graph and its device allocations remain stage-local and shape-fixed.
-    std::vector<float> channel_major_input(points * static_cast<std::size_t>(hp.in_channels));
+    runtime_channel_major_input.resize(
+        points * static_cast<std::size_t>(hp.in_channels));
     for (std::size_t point = 0; point < points; ++point) {
         for (int channel = 0; channel < hp.in_channels; ++channel) {
-            channel_major_input[static_cast<std::size_t>(channel) * points + point] =
+            runtime_channel_major_input[static_cast<std::size_t>(channel) * points + point] =
                 input_for_model->feats[point * static_cast<std::size_t>(hp.in_channels) +
                                         static_cast<std::size_t>(channel)];
         }
     }
-    std::vector<float> embedding;
-    if (!timestep_embedding(timesteps, 1, 256, 10000, embedding, error)) return false;
-    std::vector<float> cos_values(points * static_cast<std::size_t>(hd), 1.0f);
-    std::vector<float> sin_values(points * static_cast<std::size_t>(hd), 0.0f);
-    const int rope_freq_dim = hd / 2 / 3;
-    const int rope_pairs = hd / 2;
-    std::vector<float> frequencies(static_cast<std::size_t>(std::max(rope_freq_dim, 0)));
-    for (int index = 0; index < rope_freq_dim; ++index) {
-        frequencies[static_cast<std::size_t>(index)] = hp.rope_freq_min /
-            std::pow(hp.rope_freq_base, static_cast<float>(index) /
-                     static_cast<float>(rope_freq_dim));
+    if (!timestep_embedding(timesteps, 1, 256, 10000, runtime_embedding, error)) {
+        return false;
     }
-    for (std::size_t point = 0; point < points; ++point) {
-        const int coordinate[3] = {
-            input_for_model->coords[point * 4 + 1],
-            input_for_model->coords[point * 4 + 2],
-            input_for_model->coords[point * 4 + 3]};
-        for (int pair = 0; pair < rope_pairs; ++pair) {
-            float phase = 0.0f;
-            if (rope_freq_dim > 0 && pair < 3 * rope_freq_dim) {
-                phase = static_cast<float>(coordinate[pair / rope_freq_dim]) *
-                        frequencies[static_cast<std::size_t>(pair % rope_freq_dim)];
-            }
-            const std::size_t base = point * static_cast<std::size_t>(hd) +
-                                     static_cast<std::size_t>(pair * 2);
-            cos_values[base] = cos_values[base + 1] = std::cos(phase);
-            sin_values[base] = sin_values[base + 1] = std::sin(phase);
+
+    const bool rope_hit = runtime_rope_cache_valid &&
+        runtime_rope_points == points && runtime_rope_head_dim == hd &&
+        runtime_rope_freq_min == hp.rope_freq_min &&
+        runtime_rope_freq_base == hp.rope_freq_base &&
+        runtime_rope_coords == input_for_model->coords;
+    if (!rope_hit) {
+        runtime_rope_uploaded = false;
+        runtime_cos_values.assign(points * static_cast<std::size_t>(hd), 1.0f);
+        runtime_sin_values.assign(points * static_cast<std::size_t>(hd), 0.0f);
+        const int rope_freq_dim = hd / 2 / 3;
+        const int rope_pairs = hd / 2;
+        runtime_frequencies.resize(static_cast<std::size_t>(std::max(rope_freq_dim, 0)));
+        for (int index = 0; index < rope_freq_dim; ++index) {
+            runtime_frequencies[static_cast<std::size_t>(index)] = hp.rope_freq_min /
+                std::pow(hp.rope_freq_base, static_cast<float>(index) /
+                         static_cast<float>(rope_freq_dim));
         }
+        for (std::size_t point = 0; point < points; ++point) {
+            const int coordinate[3] = {
+                input_for_model->coords[point * 4 + 1],
+                input_for_model->coords[point * 4 + 2],
+                input_for_model->coords[point * 4 + 3]};
+            for (int pair = 0; pair < rope_pairs; ++pair) {
+                float phase = 0.0f;
+                if (rope_freq_dim > 0 && pair < 3 * rope_freq_dim) {
+                    phase = static_cast<float>(coordinate[pair / rope_freq_dim]) *
+                            runtime_frequencies[static_cast<std::size_t>(pair % rope_freq_dim)];
+                }
+                const std::size_t base = point * static_cast<std::size_t>(hd) +
+                                         static_cast<std::size_t>(pair * 2);
+                runtime_cos_values[base] = runtime_cos_values[base + 1] = std::cos(phase);
+                runtime_sin_values[base] = runtime_sin_values[base + 1] = std::sin(phase);
+            }
+        }
+        runtime_rope_coords = input_for_model->coords;
+        runtime_rope_points = points;
+        runtime_rope_head_dim = hd;
+        runtime_rope_freq_min = hp.rope_freq_min;
+        runtime_rope_freq_base = hp.rope_freq_base;
+        runtime_rope_cache_valid = true;
+    }
+    if (std::getenv("PIXAL3D_SLAT_TRACE")) {
+        std::cerr << "pixal3d: SLat GPU graph=" << (runtime_hit ? "hit" : "build")
+                  << " rope=" << (rope_hit ? "hit" : "build") << std::endl;
     }
 
     ggml_context * ctx = runtime_ctx;
@@ -808,7 +858,6 @@ bool SLatFlowModel::Impl::forward_gpu(
     ggml_tensor * result = runtime_result;
     std::string scheduler_error;
     if (!runtime_hit) {
-        close_runtime();
         ctx = nullptr;
         graph = nullptr;
         x_t = nullptr;
@@ -1095,11 +1144,19 @@ bool SLatFlowModel::Impl::forward_gpu(
     }
 
     const double upload_start = backend_time_now_ms();
-    ggml_backend_tensor_set(runtime_x, channel_major_input.data(), 0,
-                            channel_major_input.size() * sizeof(float));
-    ggml_backend_tensor_set(runtime_temb, embedding.data(), 0, embedding.size() * sizeof(float));
-    ggml_backend_tensor_set(runtime_cos, cos_values.data(), 0, cos_values.size() * sizeof(float));
-    ggml_backend_tensor_set(runtime_sin, sin_values.data(), 0, sin_values.size() * sizeof(float));
+    ggml_backend_tensor_set(runtime_x, runtime_channel_major_input.data(), 0,
+                            runtime_channel_major_input.size() * sizeof(float));
+    ggml_backend_tensor_set(runtime_temb, runtime_embedding.data(), 0,
+                            runtime_embedding.size() * sizeof(float));
+    bool rope_uploaded = false;
+    if (!runtime_rope_uploaded) {
+        ggml_backend_tensor_set(runtime_cos, runtime_cos_values.data(), 0,
+                                runtime_cos_values.size() * sizeof(float));
+        ggml_backend_tensor_set(runtime_sin, runtime_sin_values.data(), 0,
+                                runtime_sin_values.size() * sizeof(float));
+        runtime_rope_uploaded = true;
+        rope_uploaded = true;
+    }
     // The public condition buffers are row-major [token, channel] / [point,
     // channel].  With ggml tensors shaped [channel, token/point], that byte
     // order is exactly the required contiguous layout (ne[0] is the channel
@@ -1113,6 +1170,8 @@ bool SLatFlowModel::Impl::forward_gpu(
     backend_log_timing(hp.component.c_str(), "input_upload",
                        backend_time_now_ms() - upload_start);
     if (std::getenv("PIXAL3D_SLAT_TRACE")) {
+        std::cerr << "pixal3d: SLat GPU rope_upload="
+                  << (rope_uploaded ? "yes" : "skip") << std::endl;
         std::cerr << "pixal3d: SLat GPU graph compute start" << std::endl;
     }
     const ggml_status status = runtime_scheduler.compute(runtime_graph, &scheduler_error);
@@ -1120,7 +1179,7 @@ bool SLatFlowModel::Impl::forward_gpu(
         std::cerr << "pixal3d: SLat GPU graph compute complete status="
                   << static_cast<int>(status) << std::endl;
     }
-    std::vector<float> backend_output(points * static_cast<std::size_t>(hp.out_channels));
+    runtime_output_scratch.resize(points * static_cast<std::size_t>(hp.out_channels));
     bool ok = status == GGML_STATUS_SUCCESS;
     if (runtime_finite_probe.bad) {
         set_error(error, runtime_finite_probe.error.empty()
@@ -1129,16 +1188,25 @@ bool SLatFlowModel::Impl::forward_gpu(
     }
     if (ok) {
         const double download_start = backend_time_now_ms();
-        ggml_backend_tensor_get(runtime_result, backend_output.data(), 0,
-                                backend_output.size() * sizeof(float));
+        ggml_backend_tensor_get(runtime_result, runtime_output_scratch.data(), 0,
+                                runtime_output_scratch.size() * sizeof(float));
         backend_log_timing(hp.component.c_str(), "output_download",
                            backend_time_now_ms() - download_start);
-        output = *input_for_model;
+        output.batch_size = input_for_model->batch_size;
         output.channels = hp.out_channels;
+        output.spatial_x = input_for_model->spatial_x;
+        output.spatial_y = input_for_model->spatial_y;
+        output.spatial_z = input_for_model->spatial_z;
+        output.coords = input_for_model->coords;
         // The final graph tensor is already returned in the public
         // [point, channel] byte order.  Do not transpose it a second time:
         // doing so scrambles channels across neighboring sparse points.
-        output.feats = std::move(backend_output);
+        // Avoid copying the input feature buffer; the backend output replaces
+        // it completely.
+        // Swap ownership with the persistent scratch buffer.  The public
+        // output owns its features after return, while the previous output
+        // storage remains available for the next invocation.
+        output.feats.swap(runtime_output_scratch);
         std::string finite_error;
         if (!output.valid(&finite_error)) {
             set_error(error, finite_error.empty()
@@ -1350,18 +1418,19 @@ bool SLatFlowModel::sample(const SparseTensorF32 & noise,
         std::fill(negative_projection.feats.begin(), negative_projection.feats.end(), 0.0f);
         negative_projection_ptr = &negative_projection;
     }
+    std::vector<float> timestep_buffer(static_cast<std::size_t>(noise.batch_size));
     FlowVelocityFn callback = [this, &global_context, &negative_global,
                                projection_context, negative_projection_ptr,
-                               concat_condition]
+                               concat_condition, &timestep_buffer]
                               (const SparseTensorF32 & state, float timestep,
                                bool conditional, SparseTensorF32 & velocity,
                                std::string * callback_error) {
         const VarLenTensorF32 & context = conditional ? global_context : negative_global;
         const SparseTensorF32 * projected = conditional
             ? projection_context : negative_projection_ptr;
-        std::vector<float> timesteps(static_cast<std::size_t>(state.batch_size), timestep);
-        return forward(state, timesteps.data(), timesteps.size(), context, projected,
-                       velocity, callback_error, concat_condition);
+        std::fill(timestep_buffer.begin(), timestep_buffer.end(), timestep);
+        return forward(state, timestep_buffer.data(), timestep_buffer.size(),
+                       context, projected, velocity, callback_error, concat_condition);
     };
     const bool ok = flow_euler_sample_f32(noise, sampler_config, callback, output, error);
     // A stage owns its GPU weights only while its sampler is active.  This
