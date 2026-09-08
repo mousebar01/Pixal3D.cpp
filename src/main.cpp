@@ -4,6 +4,7 @@
 #include "pixal3d/dino_vit.h"
 #include "pixal3d/inference.h"
 #include "pixal3d/image.h"
+#include "pixal3d/moge_camera.h"
 #include "pixal3d/naf.h"
 #include "pixal3d/slat_decoder.h"
 #include "pixal3d/slat_flow.h"
@@ -12,6 +13,7 @@
 #include "pixal3d/vision_condition.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <cmath>
 #include <cctype>
 #include <cstring>
@@ -38,8 +40,10 @@ void print_usage(const char * program, std::ostream & out) {
 
         << "  " << program << " run-image <shared.gguf> <flow.gguf> <dino.gguf>"
         << " <naf.gguf> <input-image> [output.obj|output.glb] [options]\n\n"
-        << "      default output is output.glb; run-image options include"
-        << " --vision-resolution N (smoke test)\n\n"
+        << "      default output is output.glb; the camera is estimated per"
+        << " image with MoGe-2 (override with --camera auto|default,"
+        << " --moge-onnx <path>); run-image also accepts --vision-resolution N"
+        << " (smoke test)\n\n"
         << "  " << program << " run-cascade-mv <shared.gguf> <mv-flow.gguf>"
         << " <conditions.p3dmvcon> [output.obj|output.glb] [options]\n\n"
         << "  " << program << " inspect-dinodata <condition.dinodata>\n\n"
@@ -98,11 +102,28 @@ bool parse_float(const char * text, float & value) {
     }
 }
 
+struct CameraEstimation {
+    enum class Mode {
+        // Default: estimate with MoGe-2 when onnxruntime and the model are
+        // available; otherwise warn and keep the fixed front camera.
+        kPreferAuto,
+        // --camera auto: require estimation; fail loudly when unavailable.
+        kForceAuto,
+        // --camera default: always use the fixed front camera.
+        kForceDefault,
+    };
+    Mode mode = Mode::kPreferAuto;
+    bool explicit_fov = false;
+    bool explicit_distance = false;
+    std::string moge_onnx_path = "weights/MoGe/moge-2-vitl-normal.onnx";
+};
+
 bool parse_cascade_options(int argc, char ** argv, int first,
                            pixal3d::Pixal3DInferenceConfig & config,
                            std::string * error,
                            pixal3d::Pixal3DImageConditionBundleConfig * image_config = nullptr,
                            int * texture_size = nullptr,
+                           CameraEstimation * camera_estimation = nullptr,
                            const char * command_name = "run") {
     for (int index = first; index < argc;) {
         const std::string option = argv[index++];
@@ -182,12 +203,29 @@ bool parse_cascade_options(int argc, char ** argv, int first,
                 if (error) *error = "--fov must be in (0, pi) radians";
                 return false;
             }
+            if (camera_estimation) camera_estimation->explicit_fov = true;
         } else if (option == "--distance" && index < argc) {
             if (!parse_float(argv[index++], config.camera.distance) ||
                 !(config.camera.distance > 0.0f)) {
                 if (error) *error = "--distance must be positive";
                 return false;
             }
+            if (camera_estimation) camera_estimation->explicit_distance = true;
+        } else if (option == "--camera" && index < argc && camera_estimation) {
+            const std::string mode = argv[index++];
+            if (mode == "auto") {
+                camera_estimation->mode = CameraEstimation::Mode::kForceAuto;
+            } else if (mode == "default") {
+                camera_estimation->mode = CameraEstimation::Mode::kForceDefault;
+            } else {
+                if (error) *error = "--camera must be auto or default";
+                return false;
+            }
+        } else if (option == "--moge-onnx" && index < argc && camera_estimation) {
+            camera_estimation->moge_onnx_path = argv[index++];
+        } else if ((option == "--camera" || option == "--moge-onnx") && !camera_estimation) {
+            if (error) *error = std::string(option) + " is only available for run-image";
+            return false;
         } else if (option == "--mesh-scale" && index < argc) {
             if (!parse_float(argv[index++], config.camera.mesh_scale) ||
                 !(config.camera.mesh_scale > 0.0f)) {
@@ -492,11 +530,13 @@ int main(int argc, char ** argv) {
             pixal3d::default_pixal3d_inference_config();
         pixal3d::Pixal3DImageConditionBundleConfig vision_config;
         int texture_size = 1024;
+        CameraEstimation camera_estimation;
         std::string error;
         OutputSpec output_spec;
         if (!select_output_spec(argc, argv, 7, output_spec, &error) ||
             !parse_cascade_options(argc, argv, output_spec.options_first, config, &error,
-                                   &vision_config, &texture_size, "run-image")) {
+                                   &vision_config, &texture_size, &camera_estimation,
+                                   "run-image")) {
             std::cerr << "error: " << error << "\n";
             return 2;
         }
@@ -518,6 +558,64 @@ int main(int argc, char ** argv) {
                   << (static_cast<double>(estimated_bytes) /
                       (1024.0 * 1024.0 * 1024.0)) << "\n";
 
+        pixal3d::Pixal3DImageF32 image;
+        if (!pixal3d::load_pixal3d_image_f32(argv[6], image, &error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+        // Resolve the camera before loading the vision models so an unusable
+        // MoGe setup fails in milliseconds instead of after gigabytes load.
+        bool estimate_camera = false;
+        switch (camera_estimation.mode) {
+        case CameraEstimation::Mode::kForceAuto:
+            if (camera_estimation.explicit_fov || camera_estimation.explicit_distance) {
+                std::cerr << "error: --camera auto cannot be combined with an "
+                             "explicit --fov/--distance\n";
+                return 2;
+            }
+            estimate_camera = true;
+            break;
+        case CameraEstimation::Mode::kForceDefault:
+            break;
+        case CameraEstimation::Mode::kPreferAuto:
+            if (camera_estimation.explicit_fov || camera_estimation.explicit_distance) {
+                break;  // an explicit camera wins over the default preference
+            }
+            if (!pixal3d::moge_camera_supported()) {
+                std::cerr << "pixal3d: warning: camera estimation unavailable "
+                             "(built without onnxruntime; reconfigure with "
+                             "PIXAL3D_ONNXRUNTIME_ROOT); using the default front "
+                             "camera, pass --camera default to silence\n";
+            } else if (!std::filesystem::exists(camera_estimation.moge_onnx_path)) {
+                std::cerr << "pixal3d: warning: MoGe model missing at "
+                          << camera_estimation.moge_onnx_path
+                          << " (run scripts/download_moge_weights.sh); using the "
+                             "default front camera, pass --camera default to silence"
+                          << std::endl;
+            } else {
+                estimate_camera = true;
+            }
+            break;
+        }
+        if (estimate_camera) {
+            // The reference wild path estimates the camera from the
+            // preprocessed condition image, not from the raw input.
+            pixal3d::Pixal3DImageF32 preprocessed;
+            if (!pixal3d::preprocess_pixal3d_image_f32(image, preprocessed, &error)) {
+                std::cerr << "error: " << error << "\n";
+                return 1;
+            }
+            pixal3d::MoGeCameraOptions moge_options;
+            if (!pixal3d::estimate_pixal3d_camera_with_moge_f32(
+                    preprocessed, camera_estimation.moge_onnx_path, moge_options,
+                    config.camera, &error)) {
+                std::cerr << "error: " << error << "\n";
+                return 1;
+            }
+            std::cout << std::fixed << std::setprecision(6)
+                      << "camera_estimated: " << config.camera.camera_angle_x << " rad, "
+                      << config.camera.distance << "\n";
+        }
         pixal3d::DinoV3Model dino_model;
         pixal3d::NafModel naf_model;
         std::cerr << "pixal3d: loading DINOv3 tensors" << std::endl;
@@ -528,11 +626,6 @@ int main(int argc, char ** argv) {
         }
         std::cerr << "pixal3d: vision tensors loaded" << std::endl;
         std::cout << "dino_backend    : " << dino_model.backend_name() << "\n";
-        pixal3d::Pixal3DImageF32 image;
-        if (!pixal3d::load_pixal3d_image_f32(argv[6], image, &error)) {
-            std::cerr << "error: " << error << "\n";
-            return 1;
-        }
         pixal3d::Pixal3DConditionBundleF32 bundle;
         std::cerr << "pixal3d: encoding image conditions" << std::endl;
         if (!pixal3d::encode_pixal3d_condition_bundle_from_image_f32(
@@ -562,6 +655,10 @@ int main(int argc, char ** argv) {
                   << "texture_size    : " << texture_size << "\n"
                   << "texture_channels: " << output.texture_decoded.channels << "\n"
                   << "material        : " << (has_suffix(output_spec.path, ".glb") ? "single_pbr" : "none") << "\n"
+                  << "camera          : fov=" << std::fixed << std::setprecision(6)
+                  << config.camera.camera_angle_x << " rad, distance="
+                  << config.camera.distance << ", mesh_scale="
+                  << config.camera.mesh_scale << "\n"
                   << "output          : " << output_spec.path << "\n";
         return 0;
     }
@@ -578,7 +675,7 @@ int main(int argc, char ** argv) {
         OutputSpec output_spec;
         if (!select_output_spec(argc, argv, 5, output_spec, &error) ||
             !parse_cascade_options(argc, argv, output_spec.options_first, config, &error,
-                                   nullptr, &texture_size, command.c_str())) {
+                                   nullptr, &texture_size, nullptr, command.c_str())) {
             std::cerr << "error: " << error << "\n";
             return 2;
         }
@@ -606,18 +703,6 @@ int main(int argc, char ** argv) {
             return 1;
         }
         const auto & mesh = output.meshes.front();
-        std::string camera_summary;
-        if (multi_view) {
-            camera_summary = "per-view poses from ";
-            camera_summary += argv[4];
-        } else {
-            std::ostringstream text;
-            text << "fov=" << std::fixed << std::setprecision(6)
-                 << config.camera.camera_angle_x << " rad, distance="
-                 << config.camera.distance << ", mesh_scale="
-                 << config.camera.mesh_scale;
-            camera_summary = text.str();
-        }
         std::cout << "resolution      : " << output.resolution << "\n"
                   << "vertices        : " << mesh.vertices.size() / 3 << "\n"
                   << "triangles       : " << mesh.faces.size() / 3 << "\n"
@@ -625,7 +710,16 @@ int main(int argc, char ** argv) {
                   << "texture_size    : " << texture_size << "\n"
                   << "texture_channels: " << output.texture_decoded.channels << "\n"
                   << "material        : " << (has_suffix(output_spec.path, ".glb") ? "single_pbr" : "none") << "\n"
-                  << "camera          : " << camera_summary << "\n"
+                  << "camera          : " << (multi_view
+                      ? std::string("per-view poses from ") + argv[4]
+                      : [](float fov, float distance, float scale) {
+                            std::ostringstream text;
+                            text << "fov=" << std::fixed << std::setprecision(6)
+                                 << fov << " rad, distance=" << distance
+                                 << ", mesh_scale=" << scale;
+                            return text.str();
+                        }(config.camera.camera_angle_x, config.camera.distance,
+                          config.camera.mesh_scale)) << "\n"
                   << "output          : " << output_spec.path << "\n";
         return 0;
     }

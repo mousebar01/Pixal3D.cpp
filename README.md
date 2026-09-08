@@ -81,6 +81,48 @@ select another final resolution. The point cap and changed threshold are
 diagnostic controls. `run-image` additionally accepts `--vision-resolution N`
 (>=16, divisible by 16) as a small smoke-test override.
 
+### Per-image camera estimation (run-image)
+
+The projection conditioning is sensitive to the camera that maps the image
+into the conditioning volume: images shot with a narrow lens combined with the
+wide default front camera (`--fov 0.8576 --distance 2.0`, the TRELLIS render
+convention) can place the subject outside the conditioning volume, and the
+generative stages then truncate it (for example a figure without its head).
+
+`run-image` therefore estimates the camera per image by default, matching the
+reference `inference.py` wild path: the official MoGe-2 ONNX export
+(`Ruicheng/moge-2-vitl-normal-onnx`) runs through onnxruntime, the pinhole
+focal is recovered from the predicted point map with the reference
+`recover_focal_shift` fit (64x64 nearest downsample plus a one-parameter
+Levenberg-Marquardt solve), and the distance follows the reference
+`distance_from_fov` rule, which keeps the subject inside the conditioning
+volume. The estimate is printed as `camera_estimated:` and echoed in the run
+summary as `camera:`. Explicit `--fov`/`--distance` still win over the
+estimation and skip it.
+
+When onnxruntime or the model file is unavailable the run falls back to the
+fixed front camera with a loud `pixal3d: warning:` naming the reason
+(estimate ~2 degrees from the reference path, well inside the pipeline's
+tolerance, but not bit-identical). `--moge-onnx <path>` selects the model
+file; the default location is `weights/MoGe/moge-2-vitl-normal.onnx`.
+
+Camera controls:
+
+- default: estimate when possible, warn and fall back otherwise.
+- `--camera auto`: require estimation; fail loudly when onnxruntime or the
+  model is missing. Cannot be combined with explicit `--fov`/`--distance`.
+- `--camera default`: always use the fixed front camera (also silences the
+  fallback warning).
+
+Download the pinned model with `./scripts/download_moge_weights.sh` (pinned
+size and SHA-256, `.part` resume, atomic rename).
+
+Building the estimation needs onnxruntime: point `PIXAL3D_ONNXRUNTIME_ROOT`
+at a prebuilt onnxruntime tree (containing `include/onnxruntime_cxx_api.h`
+and `lib/libonnxruntime.so`) when configuring CMake. Without it the build
+succeeds, the default run warns and falls back, and `--camera auto` fails
+with an explicit error.
+
 ### Mesh coordinate frames
 
 The decoded `DualGridMeshF32` vertices stay in the canonical decoder AABB
@@ -133,12 +175,15 @@ Download the pinned assets in the foreground:
 ```sh
 ./scripts/download_pixal3d_weights.sh
 ./scripts/download_naf_weights.sh
+./scripts/download_moge_weights.sh
 ```
 
 The Pixal3D downloader resumes `.part` files and verifies completed files by
 size and available SHA-256 metadata. The NAF downloader requires the GitHub CLI
-(`gh`) and verifies its pinned release. The full Pixal3D snapshot is roughly
-43 GiB; do not copy it into a Docker image.
+(`gh`) and verifies its pinned release. The MoGe downloader fetches the pinned
+`Ruicheng/moge-2-vitl-normal-onnx` asset used by `run-image` camera estimation
+(~1.3 GiB) and verifies size and SHA-256 before an atomic rename. The full
+Pixal3D snapshot is roughly 43 GiB; do not copy it into a Docker image.
 
 The converter groups eleven checkpoints into three packs:
 
