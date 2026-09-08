@@ -8,6 +8,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1213,6 +1214,11 @@ bool SLatDecoderModel::decode(
     const bool force_cpu = policy.kind == BackendPolicyKind::cpu;
     const bool force_gpu = policy.kind == BackendPolicyKind::gpu;
     const bool verbose = std::getenv("PIXAL3D_SLAT_VERBOSE") != nullptr;
+    const auto decode_start = std::chrono::steady_clock::now();
+    const auto elapsed = [start = decode_start]() {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+    };
     if (!force_cpu) {
         std::string gpu_error;
         if (impl_->init_gpu(&gpu_error)) {
@@ -1223,6 +1229,9 @@ bool SLatDecoderModel::decode(
                                   &gpu_error)) {
                 output = std::move(gpu_output);
                 if (predicted_subdivisions) *predicted_subdivisions = std::move(gpu_subdivisions);
+                std::cerr << "pixal3d: " << impl_->component
+                          << " SLat GPU decode took " << elapsed() << " s"
+                          << std::endl;
                 return true;
             }
         }
@@ -1233,10 +1242,12 @@ bool SLatDecoderModel::decode(
             impl_->backend_manager.close();
             return false;
         }
-        if (verbose && !gpu_error.empty()) {
-            std::cerr << "pixal3d: SLat decoder GPU unavailable; using CPU fallback: "
-                      << gpu_error << std::endl;
-        }
+        // A silent fallback would turn an hour-long CPU decode into an
+        // unexplained gap, so the reason is always reported.
+        std::cerr << "pixal3d: " << impl_->component
+                  << " SLat GPU decode failed; using CPU fallback"
+                  << (gpu_error.empty() ? std::string{} : ": " + gpu_error)
+                  << std::endl;
         impl_->gpu.close();
         impl_->backend_manager.close();
     }
@@ -1250,8 +1261,21 @@ bool SLatDecoderModel::decode(
     config.pred_subdiv = impl_->hp.pred_subdiv;
     config.model_channels = impl_->hp.model_channels;
     config.num_blocks = impl_->hp.num_blocks;
-    return slat_decoder_forward_f32(input, config, weights, guide_subdivisions,
-                                    output, predicted_subdivisions, error);
+    if (verbose) {
+        std::cerr << "pixal3d: " << impl_->component
+                  << " SLat CPU reference decode starting (points="
+                  << input.points() << ")" << std::endl;
+    }
+    const bool decoded = slat_decoder_forward_f32(input, config, weights,
+                                                  guide_subdivisions,
+                                                  output, predicted_subdivisions,
+                                                  error);
+    if (verbose) {
+        std::cerr << "pixal3d: " << impl_->component
+                  << " SLat CPU reference decode finished in " << elapsed()
+                  << " s" << std::endl;
+    }
+    return decoded;
 }
 
 bool SLatDecoderModel::decode_shape_mesh(

@@ -2,6 +2,7 @@
 #include "pixal3d/mesh_topology.h"
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -411,10 +412,16 @@ bool run_slat_stage_f32(
         return false;
     }
     if (!valid_normalization(normalization, hp.out_channels, error)) return false;
+    const auto sampling_start = std::chrono::steady_clock::now();
     if (!flow_model.sample(noise, sampler_config, condition.global, projection,
                            output.flow, error, concat_condition)) {
         return false;
     }
+    std::cerr << "pixal3d: SLat flow sampling (" << noise.points()
+              << " points) took "
+              << std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - sampling_start).count()
+              << " s" << std::endl;
     output.latent = output.flow.samples;
     for (std::size_t point = 0; point < output.latent.points(); ++point) {
         float * row = output.latent.feats.data() +
