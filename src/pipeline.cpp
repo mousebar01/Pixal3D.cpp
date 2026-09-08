@@ -260,7 +260,8 @@ bool dump_cascade_decoder_tensors(const Pixal3DCascadeOutputF32 & output,
         if (!write_sparse_dump(root, "shape_subdiv_" + std::to_string(level),
                                output.shape_subdivisions[level], error)) return false;
     }
-    return true;
+    return write_sparse_dump(root, "texture_slat", output.texture_slat.latent, error) &&
+           write_sparse_dump(root, "texture_decoded", output.texture_decoded, error);
 }
 
 bool valid_normalization(const SLatNormalizationF32 & normalization,
@@ -804,7 +805,6 @@ bool run_pixal3d_cascade_f32(
     }
     log_decoder_diagnostics("shape_decoder", output.shape_slat_high.latent,
                            output.shape_subdivisions, output.shape_decoded);
-    if (!dump_cascade_decoder_tensors(output, error)) return false;
     log_spatial_buckets("shape_decoded", output.shape_decoded.coords,
                         output.shape_decoded.spatial_x);
     if (!texture_decoder.decode(output.texture_slat.latent, &output.shape_subdivisions,
@@ -821,6 +821,7 @@ bool run_pixal3d_cascade_f32(
             return false;
         }
     }
+    if (!dump_cascade_decoder_tensors(output, error)) return false;
     if (!flexi_dual_grid_decode_mesh_f32(
             output.shape_decoded, output.resolution, config.voxel_margin,
             output.meshes, error)) return false;
