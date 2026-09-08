@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -605,6 +606,18 @@ int main(int argc, char ** argv) {
             return 1;
         }
         const auto & mesh = output.meshes.front();
+        std::string camera_summary;
+        if (multi_view) {
+            camera_summary = "per-view poses from ";
+            camera_summary += argv[4];
+        } else {
+            std::ostringstream text;
+            text << "fov=" << std::fixed << std::setprecision(6)
+                 << config.camera.camera_angle_x << " rad, distance="
+                 << config.camera.distance << ", mesh_scale="
+                 << config.camera.mesh_scale;
+            camera_summary = text.str();
+        }
         std::cout << "resolution      : " << output.resolution << "\n"
                   << "vertices        : " << mesh.vertices.size() / 3 << "\n"
                   << "triangles       : " << mesh.faces.size() / 3 << "\n"
@@ -612,6 +625,7 @@ int main(int argc, char ** argv) {
                   << "texture_size    : " << texture_size << "\n"
                   << "texture_channels: " << output.texture_decoded.channels << "\n"
                   << "material        : " << (has_suffix(output_spec.path, ".glb") ? "single_pbr" : "none") << "\n"
+                  << "camera          : " << camera_summary << "\n"
                   << "output          : " << output_spec.path << "\n";
         return 0;
     }
