@@ -71,13 +71,20 @@ Run options are `--seed`, `--resolution 1024`, `--max-tokens`, `--steps` (>0),
 `--occupancy-threshold`, `--max-structure-points` (>0), `--fov` (0..pi radians),
 `--distance` (>0), `--mesh-scale` (>0), `--max-model-gib`, and
 `--texture-size` (1..4096 for `.glb` output). The native exporter bakes a
-chart-unwrapped atlas: `meshopt_simplify` first decimates the export mesh to
-1,000,000 faces (the reference `to_glb` decimation target) because chart
-parameterization on the raw multi-million-face dual grid mesh is impractically
-slow, then xatlas - the same parameterization backend the reference wraps -
-computes the UVs. GLB texture output requires a build with libpng;
-PNM input remains available without PNG/JPEG support, and explicit `.obj`
-output remains geometry-only. The default final cascade resolution is `1024`,
+chart-unwrapped atlas through the mesh postprocess chain vendored from
+trellis.cpp (`third_party/trellis-postprocess`, MIT): weld hairline cracks,
+unify face winding, drop floating fragments, Taubin-smooth the voxel
+stair-step noise, then a CuMesh-port QEM decimation to the reference 1,000,000
+face target (the reference `to_glb` decimation target), hole filling, and
+xatlas UV unwrap with a trilinear bake of the decoded texture volume - the
+same parameterization backend the reference wraps. A BVH over the
+pre-decimation surface snaps texels that fall between voxels back onto the
+surface, matching the reference cuBVH correction. The raw dual grid mesh is
+inconsistently wound and sliver heavy, which stalls plain quadric
+simplification and degenerates charting; the postprocess chain exists to
+digest it. GLB texture output requires a build with libpng; PNM input remains
+available without PNG/JPEG support, and explicit `.obj` output remains
+geometry-only. The default final cascade resolution is `1024`,
 with seed `42`, 12 Euler steps, threshold `0`, and a front-view camera.
 `max_num_tokens` is a hard guard at this resolution; it does not silently
 select another final resolution. The point cap and changed threshold are
