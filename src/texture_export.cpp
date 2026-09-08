@@ -143,8 +143,10 @@ bool make_texture_volume(const SparseTensorF32 & input, int resolution,
     return true;
 }
 
-std::array<float, 6> sample_volume(const TextureVolume & volume, const Vec3 & position) {
+std::array<float, 6> sample_volume(const TextureVolume & volume, const Vec3 & position,
+                                   float & weight_sum) {
     std::array<float, 6> result{};
+    weight_sum = 0.0f;
     const float scale = static_cast<float>(volume.resolution);
     const float gx = (position.x + 0.5f) * scale;
     const float gy = (position.y + 0.5f) * scale;
@@ -170,6 +172,11 @@ std::array<float, 6> sample_volume(const TextureVolume & volume, const Vec3 & po
                 const float wy = dy ? ty : 1.0f - ty;
                 const float wz = dz ? tz : 1.0f - tz;
                 const float weight = wx * wy * wz;
+                // The decoded field only exists on the surface shell, so most
+                // trilinear neighbors are absent.  Accumulate the weight so the
+                // caller can renormalize; scaling by the covered fraction would
+                // darken every sample and braid coverage steps into the atlas.
+                weight_sum += weight;
                 for (std::size_t channel = 0; channel < result.size(); ++channel) {
                     result[channel] += found->second.value[channel] * weight;
                 }
@@ -370,7 +377,13 @@ bool bake_textures(const DualGridMeshF32 & mesh, const TextureVolume & volume,
                     float w0 = 0.0f, w1 = 0.0f, w2 = 0.0f;
                     if (!barycentric(sample_uv, shifted[0], shifted[1], shifted[2], w0, w1, w2)) continue;
                     const Vec3 position = positions[ia] * w0 + positions[ib] * w1 + positions[ic] * w2;
-                    write_baked_pixel(bake, x, y, sample_volume(volume, position));
+                    float weight_sum = 0.0f;
+                    const std::array<float, 6> value =
+                        sample_volume(volume, position, weight_sum);
+                    if (weight_sum <= 0.0f) continue;
+                    std::array<float, 6> normalized = value;
+                    for (float & channel : normalized) channel /= weight_sum;
+                    write_baked_pixel(bake, x, y, normalized);
                 }
             }
         }

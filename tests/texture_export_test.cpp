@@ -1,5 +1,10 @@
 #include "pixal3d/texture_export.h"
 
+#if defined(PIXAL3D_HAVE_PNG)
+#include <png.h>
+#include <zlib.h>
+#endif
+
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -12,13 +17,74 @@
 #include <string>
 #include <vector>
 
+namespace {
+
+#if defined(PIXAL3D_HAVE_PNG)
+struct PngSource {
+    const std::uint8_t * data = nullptr;
+    std::size_t size = 0;
+    std::size_t offset = 0;
+};
+
+void read_png_source(png_structp png, png_bytep out, png_size_t length) {
+    PngSource * source = static_cast<PngSource *>(png_get_io_ptr(png));
+    if (source->offset + length > source->size) png_error(png, "truncated PNG");
+    std::memcpy(out, source->data + source->offset, length);
+    source->offset += length;
+}
+
+// Minimal RGBA8 decode of one in-memory PNG through libpng.
+bool decode_png_rgba(const std::uint8_t * data, std::size_t size,
+                     std::vector<std::uint8_t> & rgba, int & width, int & height) {
+    if (size < 8 || std::memcmp(data, "\x89PNG\r\n\x1a\n", 8) != 0) return false;
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!png) return false;
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_read_struct(&png, nullptr, nullptr);
+        return false;
+    }
+    PngSource source{data, size, 0};
+    rgba.clear();
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_read_struct(&png, &info, nullptr);
+        return false;
+    }
+    png_set_read_fn(png, &source, read_png_source);
+    png_read_info(png, info);
+    width = static_cast<int>(png_get_image_width(png, info));
+    height = static_cast<int>(png_get_image_height(png, info));
+    if (png_get_bit_depth(png, info) != 8 ||
+        png_get_color_type(png, info) != PNG_COLOR_TYPE_RGBA) {
+        png_destroy_read_struct(&png, &info, nullptr);
+        return false;
+    }
+    rgba.resize(static_cast<std::size_t>(width) * height * 4);
+    std::vector<png_bytep> rows(height);
+    for (int row = 0; row < height; ++row) {
+        rows[row] = rgba.data() + static_cast<std::size_t>(row) * width * 4;
+    }
+    png_read_rows(png, rows.data(), nullptr, height);
+    png_read_end(png, info);
+    png_destroy_read_struct(&png, &info, nullptr);
+    return true;
+}
+#endif
+
+} // namespace
+
 int main() {
     pixal3d::DualGridMeshF32 mesh;
+    // The bake grid is locked to the cascade resolution (1024).  Shrink the
+    // tetrahedron so its samples fall inside a handful of grid cells and fill
+    // that block with voxels; a sparse surface field whose trilinear
+    // neighborhoods are empty must stay rejected rather than bake black.
+    constexpr float kMeshScale = 0.016f;
     mesh.vertices = {
-        -0.25f, -0.25f, -0.25f,
-         0.25f, -0.25f, -0.25f,
-         0.0f,   0.25f,  -0.25f,
-         0.0f,   0.0f,    0.25f,
+        -0.25f * kMeshScale, -0.25f * kMeshScale, -0.25f * kMeshScale,
+         0.25f * kMeshScale, -0.25f * kMeshScale, -0.25f * kMeshScale,
+         0.0f,                0.25f * kMeshScale, -0.25f * kMeshScale,
+         0.0f,                0.0f,                0.25f * kMeshScale,
     };
     mesh.faces = {0, 1, 2, 0, 3, 1, 1, 3, 2, 2, 3, 0};
     const auto original_vertices = mesh.vertices;
@@ -27,22 +93,21 @@ int main() {
     pixal3d::SparseTensorF32 texture;
     texture.batch_size = 1;
     texture.channels = 6;
-    texture.spatial_x = texture.spatial_y = texture.spatial_z = 2;
-    texture.coords = {
-        0, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 1, 1, 0,
-        0, 0, 0, 1,
-        0, 1, 0, 1,
-        0, 0, 1, 1,
-        0, 1, 1, 1,
-    };
-    texture.feats.reserve(texture.points() * 6);
-    for (std::size_t point = 0; point < texture.points(); ++point) {
-        texture.feats.insert(texture.feats.end(), {
-            0.2f + 0.05f * static_cast<float>(point),
-            0.3f, 0.4f, 0.1f, 0.8f, 1.0f});
+    texture.spatial_x = texture.spatial_y = texture.spatial_z = 1024;
+    // One occupied cell block around the whole mesh so every sample position
+    // finds trilinear neighbors (grid 508..516 plus one cell of margin).
+    constexpr std::int32_t kVoxelLow = 506;
+    constexpr std::int32_t kVoxelHigh = 517;
+    for (std::int32_t x = kVoxelLow; x <= kVoxelHigh; ++x) {
+        for (std::int32_t y = kVoxelLow; y <= kVoxelHigh; ++y) {
+            for (std::int32_t z = kVoxelLow; z <= kVoxelHigh; ++z) {
+                texture.coords.insert(texture.coords.end(), {0, x, y, z});
+                texture.feats.insert(texture.feats.end(), {
+                    0.2f + 0.3f * static_cast<float>((x - kVoxelLow) /
+                                                     (kVoxelHigh - kVoxelLow)),
+                    0.3f, 0.4f, 0.1f, 0.8f, 1.0f});
+            }
+        }
     }
     const auto original_coords = texture.coords;
     const auto original_feats = texture.feats;
@@ -91,8 +156,8 @@ int main() {
         std::cerr << "GLB JSON is missing PBR material fields\n";
         return 1;
     }
-    if (json.find("\"min\":[-0.25,-0.25,-0.25]") == std::string::npos ||
-        json.find("\"max\":[0.25,0.25,0.25]") == std::string::npos) {
+    if (json.find("\"min\":[-0.004,-0.004,-0.004]") == std::string::npos ||
+        json.find("\"max\":[0.004,0.004,0.004]") == std::string::npos) {
         std::cerr << "GLB POSITION bounds do not use the Python textured-GLB frame\n";
         return 1;
     }
@@ -109,10 +174,48 @@ int main() {
     }
     float first_position[3] = {};
     std::memcpy(first_position, bytes.data() + binary_begin, sizeof(first_position));
-    if (std::fabs(first_position[0] - 0.25f) > 1e-6f ||
-        std::fabs(first_position[1] + 0.25f) > 1e-6f ||
-        std::fabs(first_position[2] - 0.25f) > 1e-6f) {
+    if (std::fabs(first_position[0] - 0.004f) > 1e-6f ||
+        std::fabs(first_position[1] + 0.004f) > 1e-6f ||
+        std::fabs(first_position[2] - 0.004f) > 1e-6f) {
         std::cerr << "GLB first position does not use H=(-x,+y,-z)\n";
+        return 1;
+    }
+
+    // Decode the baked albedo atlas and require it to preserve the decoded
+    // field's brightness.  Sparse trilinear sampling that skips empty
+    // neighbors without renormalizing would scale colors by the covered
+    // fraction (about 0.1 here) and fail this check.
+    const std::size_t png_begin = binary.find(png_signature);
+    std::vector<std::uint8_t> rgba;
+    int png_width = 0, png_height = 0;
+    if (png_begin == std::string::npos ||
+        !decode_png_rgba(reinterpret_cast<const std::uint8_t *>(binary.data()) + png_begin,
+                         binary.size() - png_begin, rgba, png_width, png_height)) {
+        std::cerr << "cannot decode the baked albedo PNG\n";
+        return 1;
+    }
+    double covered_alpha = 0.0;
+    double covered_red = 0.0;
+    std::size_t covered = 0;
+    for (int pixel = 0; pixel < png_width * png_height; ++pixel) {
+        const std::uint8_t alpha = rgba[pixel * 4 + 3];
+        if (alpha < 8) continue;
+        covered += 1;
+        covered_alpha += alpha;
+        covered_red += rgba[pixel * 4 + 0];
+    }
+    if (covered == 0) {
+        std::cerr << "baked albedo has no covered texels\n";
+        return 1;
+    }
+    if (covered_alpha / covered < 250.0) {
+        std::cerr << "baked albedo is not opaque over covered texels\n";
+        return 1;
+    }
+    const double red_mean = covered_red / covered / 255.0;
+    if (red_mean < 0.15) {
+        std::cerr << "baked albedo lost brightness (red mean " << red_mean
+                  << "); sparse volume sampling is not renormalized\n";
         return 1;
     }
     if (std::getenv("PIXAL3D_KEEP_TEXTURE_EXPORT_TEST") == nullptr) {
