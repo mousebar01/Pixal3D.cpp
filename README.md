@@ -45,8 +45,12 @@ inspect-slat-decoder, inspect-slat-flow
 encode-condition-stage, encode-condition-bundle
 ```
 
-Positional arguments are the corresponding GGUF, condition, image, and OBJ
-paths; SLat inspection also takes its component name.
+Positional arguments are the corresponding GGUF, condition, and image paths;
+SLat inspection also takes its component name.  The output path for
+`run-cascade`, `run-image`, and `run-cascade-mv` is optional: when omitted,
+the command writes `output.glb` in the current directory.  GLB is the
+recommended textured asset format; an explicit `.obj` path selects the
+geometry-only compatibility writer.
 
 The SLat components are `shape_decoder|texture_decoder` and
 `shape_flow_512|shape_flow_1024|texture_flow_1024`. Typical runs:
@@ -54,33 +58,45 @@ The SLat components are `shape_decoder|texture_decoder` and
 ```sh
 ./build/bin/pixal3d inspect-pack build/weights/pixal3d-shared-f16.gguf
 ./build/bin/pixal3d estimate-model build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-base-flow-f32.gguf
+# Recommended: omit the output path to create ./output.glb with PBR textures.
+./build/bin/pixal3d run-cascade build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-base-flow-f32.gguf conditions.p3dcond --resolution 1024 --texture-size 1024 --seed 42 --max-model-gib 32
+# The same textured output with an explicit path.
+./build/bin/pixal3d run-cascade build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-base-flow-f32.gguf conditions.p3dcond output.glb --resolution 1024 --texture-size 1024 --seed 42 --max-model-gib 32
+# Compatibility output: explicit OBJ is geometry-only.
 ./build/bin/pixal3d run-cascade build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-base-flow-f32.gguf conditions.p3dcond output.obj --resolution 1024 --seed 42 --max-model-gib 32
-./build/bin/pixal3d run-cascade-mv build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-mv-flow-f32.gguf views.p3dmvcon output.obj --resolution 1024 --max-model-gib 32
+./build/bin/pixal3d run-cascade-mv build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-mv-flow-f32.gguf views.p3dmvcon output.glb --resolution 1024 --texture-size 1024 --max-model-gib 32
 ```
 
-Run options are `--seed`, `--resolution` (>=1024, divisible by 16),
-`--max-tokens`, `--steps` (>0), `--occupancy-threshold`,
-`--max-structure-points` (>0), `--fov` (0..pi radians), `--distance` (>0),
-`--mesh-scale` (>0), and `--max-model-gib`. The parser accepts any resolution
-that passes the numeric constraint, but that is not a model-support guarantee;
-see [Resolution support](#resolution-support). Defaults are seed `42`, the
-legacy experimental resolution `1536`, 12 Euler steps, threshold `0`, and a
-front-view camera. Use `--resolution 1024` for the primary supported target.
-The token cap may lower a requested value in 128-voxel steps, never below 1024.
-The point cap and changed threshold are diagnostic controls. `run-image`
-additionally accepts `--vision-resolution N` (>=16, divisible by 16) as a small
-smoke-test override.
+Run options are `--seed`, `--resolution 1024`, `--max-tokens`, `--steps` (>0),
+`--occupancy-threshold`, `--max-structure-points` (>0), `--fov` (0..pi radians),
+`--distance` (>0), `--mesh-scale` (>0), `--max-model-gib`, and
+`--texture-size` (1..4096 for `.glb` output). The native exporter defaults to a
+1024-pixel atlas; the official Python reference commonly uses a larger atlas
+for quality-oriented exports. GLB texture output requires a build with libpng;
+PNM input remains available without PNG/JPEG support, and explicit `.obj`
+output remains geometry-only. The default final cascade resolution is `1024`,
+with seed `42`, 12 Euler steps, threshold `0`, and a front-view camera.
+`max_num_tokens` is a hard guard at this resolution; it does not silently
+select another final resolution. The point cap and changed threshold are
+diagnostic controls. `run-image` additionally accepts `--vision-resolution N`
+(>=16, divisible by 16) as a small smoke-test override.
 
 ### Mesh coordinate frames
 
 The decoded `DualGridMeshF32` vertices stay in the canonical decoder AABB
-frame, with axes corresponding to the sparse `[x, y, z]` grid.  The OBJ writer
-applies the same final export rotation as the Python reference:
-`(x, y, z) -> (-x, -z, -y)`.  Face indices and winding are preserved because
-this transform has positive determinant.  Preview tools should therefore read
-the exported OBJ in its final frame rather than applying another axis swap.
+frame, with axes corresponding to the sparse `[x, y, z]` grid.  The explicit
+OBJ compatibility writer keeps the shape-only export frame
+`(x, y, z) -> (-x, -z, -y)`.  The textured GLB writer follows the main Python
+`to_glb()` path, whose internal axis swap followed by Pixal3D's outer rotation
+produces the final GLB frame `(x, y, z) -> (-x, +y, -z)`.  Both transforms have
+positive determinant, so face indices and winding are preserved.
 
-This export conversion is only a coordinate-frame change; it does not fill
+For the official textured GLB front view, place the camera on the GLB `-Z`
+side, look toward `+Z`, and use `+Y` as image-up.  For the explicit legacy OBJ
+frame, the equivalent reference-facing view is on the `-Y` side, looking toward
+`+Y`, with `-Z` as image-up.  Preview tools must not apply another axis swap.
+
+These export conversions only change coordinate frames; they do not fill
 missing geometry or replace the Python CuMesh remesh/decimation postprocess.
 
 
@@ -92,19 +108,12 @@ stage. Pixal3D.cpp uses the following support matrix:
 | Resolution | Role | Status |
 |---|---|---|
 | `512³` | Coarse/internal structure and low-resolution shape stage | Required internal cascade stage; not a standalone final-output guarantee |
-| `1024³` | Standard high-resolution shape/texture cascade target | Primary supported end-to-end target for the current C++ pipeline |
-| `1536³` | Test-time high-resolution cascade extension | Experimental and unverified; do not treat as formally supported |
+| `1024³` | Standard high-resolution shape/texture cascade target | Only supported final output resolution for the current C++ pipeline |
 
-The original TRELLIS paper does not define a `1536³` output target. The
-`1536³` path is a TRELLIS.2-style test-time cascade extension, not an
-independently trained model stage. It remains outside the standard validated
-matrix until the complete CUDA execution, numerical checks, and Python-reference
-parity gates pass.
-
-Other values accepted by `--resolution` are parser-compatible experiments, not
-supported resolutions. A multiple of 16 only satisfies argument validation; it
-does not prove that the model, decoder, memory use, or output quality has been
-validated at that size.
+The `512³` stage is an internal coarse shape stage. The outer C++ pipeline
+intentionally exposes only the validated `1024³` final target; upstream
+reference implementations may expose additional test-time cascade modes, but
+they are not part of this C++ configuration contract.
 
 `encode-condition-stage` accepts `--resolution` and `--naf-resolution`; stages
 are `ss`, `shape_512`, `shape_1024`, and `tex_1024`. `-` is valid as the NAF
@@ -114,8 +123,9 @@ only one stage; a production cascade needs all four stages or the in-memory API.
 
 ## Model packs and conversion
 
-Keep checkpoints, GGUF files, conditions, latent dumps, and OBJ outputs outside
-Git. Pixal3D weights are stored under the ignored directory `weights/Pixal3D/`.
+Keep checkpoints, GGUF files, conditions, latent dumps, OBJ/GLB outputs, and
+texture images outside Git. Pixal3D weights are stored under the ignored
+directory `weights/Pixal3D/`.
 The NAF release is stored under `weights/NAF/`.
 
 Download the pinned assets in the foreground:
@@ -423,8 +433,11 @@ backend placement.
 
 ## Current limitations
 
-- Wavefront OBJ output contains geometry only. Texture voxel attributes remain
-  in memory; material and texture sidecar output is not implemented.
+- OBJ output remains geometry-only. GLB output now includes an approximate
+  single PBR material, base-color texture, and metallic-roughness texture
+  baked from the six-channel texture voxel output. Its native spherical UV
+  unwrap is deterministic but is not bit-exact with Python CuMesh unwrap,
+  remeshing, or decimation.
 - Cascade mesh output applies a CPU bounded boundary-loop fan fill matching the
   observable CuMesh `fill_holes(0.03)` contract. A separate
   `repair_non_manifold_edges_f32()` helper can split vertices for export-stage

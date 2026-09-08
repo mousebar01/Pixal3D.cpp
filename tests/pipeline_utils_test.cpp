@@ -34,12 +34,13 @@ int main() {
 
     coords.clear();
     actual_resolution = 0;
-    assert(pixal3d::quantize_slat_coords_f32(
-        upsampled, 512, 1536, 2, coords, actual_resolution, &error));
-    // The token cap forces the same 128-step fallback used by the Python
-    // cascade until its hard floor at 1024.
-    assert(actual_resolution == 1024);
-    assert(coords == expected);
+    assert(!pixal3d::quantize_slat_coords_f32(
+        upsampled, 512, 1536, 0, coords, actual_resolution, &error));
+    assert(!error.empty());
+
+    assert(!pixal3d::quantize_slat_coords_f32(
+        upsampled, 512, 1024, 2, coords, actual_resolution, &error));
+    assert(!error.empty());
 
     assert(!pixal3d::quantize_slat_coords_f32(
         upsampled, 512, 1000, 0, coords, actual_resolution, &error));

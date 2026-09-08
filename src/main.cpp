@@ -13,6 +13,8 @@
 
 #include <cstdint>
 #include <cmath>
+#include <cctype>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -31,13 +33,14 @@ void print_usage(const char * program, std::ostream & out) {
         << "  " << program << " estimate-model <shared.gguf> <flow.gguf>\n\n"
 
         << "  " << program << " run-cascade <shared.gguf> <flow.gguf>"
-        << " <conditions.p3dcond> <output.obj> [options]\n\n"
+        << " <conditions.p3dcond> [output.obj|output.glb] [options]\n\n"
 
         << "  " << program << " run-image <shared.gguf> <flow.gguf> <dino.gguf>"
-        << " <naf.gguf> <input-image> <output.obj> [options]\n\n"
-        << "      run-image options include --vision-resolution N (smoke test)\n\n"
+        << " <naf.gguf> <input-image> [output.obj|output.glb] [options]\n\n"
+        << "      default output is output.glb; run-image options include"
+        << " --vision-resolution N (smoke test)\n\n"
         << "  " << program << " run-cascade-mv <shared.gguf> <mv-flow.gguf>"
-        << " <conditions.p3dmvcon> <output.obj> [options]\n\n"
+        << " <conditions.p3dmvcon> [output.obj|output.glb] [options]\n\n"
         << "  " << program << " inspect-dinodata <condition.dinodata>\n\n"
         << "  " << program << " inspect-dino-vit <dino.gguf>\n\n"
 
@@ -98,6 +101,7 @@ bool parse_cascade_options(int argc, char ** argv, int first,
                            pixal3d::Pixal3DInferenceConfig & config,
                            std::string * error,
                            pixal3d::Pixal3DImageConditionBundleConfig * image_config = nullptr,
+                           int * texture_size = nullptr,
                            const char * command_name = "run") {
     for (int index = first; index < argc;) {
         const std::string option = argv[index++];
@@ -127,9 +131,14 @@ bool parse_cascade_options(int argc, char ** argv, int first,
             }
         } else if (option == "--resolution" && index < argc) {
             if (!parse_int(argv[index++], config.cascade.requested_resolution) ||
-                config.cascade.requested_resolution < 1024 ||
-                config.cascade.requested_resolution % 16 != 0) {
-                if (error) *error = "--resolution must be a multiple of 16 >= 1024";
+                config.cascade.requested_resolution != 1024) {
+                if (error) *error = "--resolution must be 1024";
+                return false;
+            }
+        } else if (option == "--texture-size" && index < argc && texture_size) {
+            if (!parse_int(argv[index++], *texture_size) || *texture_size < 1 ||
+                *texture_size > 4096) {
+                if (error) *error = "--texture-size must be in the range 1..4096";
                 return false;
             }
         } else if (option == "--max-tokens" && index < argc) {
@@ -204,6 +213,64 @@ bool parse_cascade_options(int argc, char ** argv, int first,
         config.camera.camera_angle_x, config.camera.distance,
         config.camera.mesh_scale);
     return true;
+}
+
+bool has_suffix(const std::string & path, const char * suffix) {
+    const std::size_t suffix_length = std::strlen(suffix);
+    if (path.size() < suffix_length) return false;
+    for (std::size_t index = 0; index < suffix_length; ++index) {
+        const unsigned char actual = static_cast<unsigned char>(
+            path[path.size() - suffix_length + index]);
+        const unsigned char expected = static_cast<unsigned char>(suffix[index]);
+        if (std::tolower(actual) != std::tolower(expected)) return false;
+    }
+    return true;
+}
+
+struct OutputSpec {
+    std::string path = "output.glb";
+    int options_first = 0;
+};
+
+bool select_output_spec(int argc, char ** argv, int output_index,
+                        OutputSpec & spec, std::string * error) {
+    spec = OutputSpec{};
+    spec.options_first = output_index;
+    if (output_index < argc && argv[output_index][0] != '-') {
+        spec.path = argv[output_index];
+        spec.options_first = output_index + 1;
+    }
+    if (!has_suffix(spec.path, ".obj") && !has_suffix(spec.path, ".glb")) {
+        if (error) *error = "output path must end in .obj or .glb";
+        return false;
+    }
+    return true;
+}
+
+const char * output_format(const std::string & path) {
+    return has_suffix(path, ".glb") ? "glb" : "obj";
+}
+
+bool write_mesh_output(const pixal3d::Pixal3DCascadeOutputF32 & output,
+                       const std::string & path,
+                       int texture_size,
+                       std::string * error) {
+    if (output.meshes.empty()) {
+        if (error) *error = "cascade produced no mesh";
+        return false;
+    }
+    const auto & mesh = output.meshes.front();
+    if (has_suffix(path, ".obj")) {
+        return pixal3d::write_pixal3d_obj(mesh, path, error);
+    }
+    if (has_suffix(path, ".glb")) {
+        pixal3d::Pixal3DGlbOptions options;
+        options.texture_size = texture_size;
+        return pixal3d::write_pixal3d_glb(
+            mesh, output.texture_decoded, output.resolution, options, path, error);
+    }
+    if (error) *error = "output path must end in .obj or .glb";
+    return false;
 }
 
 } // namespace
@@ -416,15 +483,19 @@ int main(int argc, char ** argv) {
         return 0;
     }
     if (command == "run-image") {
-        if (argc < 8) {
+        if (argc < 7) {
             print_usage(argv[0], std::cerr);
             return 2;
         }
         pixal3d::Pixal3DInferenceConfig config =
             pixal3d::default_pixal3d_inference_config();
         pixal3d::Pixal3DImageConditionBundleConfig vision_config;
+        int texture_size = 1024;
         std::string error;
-        if (!parse_cascade_options(argc, argv, 8, config, &error, &vision_config)) {
+        OutputSpec output_spec;
+        if (!select_output_spec(argc, argv, 7, output_spec, &error) ||
+            !parse_cascade_options(argc, argv, output_spec.options_first, config, &error,
+                                   &vision_config, &texture_size, "run-image")) {
             std::cerr << "error: " << error << "\n";
             return 2;
         }
@@ -466,7 +537,7 @@ int main(int argc, char ** argv) {
         if (!pixal3d::encode_pixal3d_condition_bundle_from_image_f32(
                 dino_model, &naf_model, image,
                 vision_config, bundle, &error)) {
-                std::cerr << "error: " << error << "\n";
+            std::cerr << "error: " << error << "\n";
             return 1;
         }
         std::cerr << "pixal3d: image conditions encoded" << std::endl;
@@ -478,11 +549,7 @@ int main(int argc, char ** argv) {
             std::cerr << "error: " << error << "\n";
             return 1;
         }
-        if (output.meshes.empty()) {
-            std::cerr << "error: cascade produced no mesh\n";
-            return 1;
-        }
-        if (!pixal3d::write_pixal3d_obj(output.meshes.front(), argv[7], &error)) {
+        if (!write_mesh_output(output, output_spec.path, texture_size, &error)) {
             std::cerr << "error: " << error << "\n";
             return 1;
         }
@@ -490,20 +557,27 @@ int main(int argc, char ** argv) {
         std::cout << "resolution      : " << output.resolution << "\n"
                   << "vertices        : " << mesh.vertices.size() / 3 << "\n"
                   << "triangles       : " << mesh.faces.size() / 3 << "\n"
-                  << "output          : " << argv[7] << "\n";
+                  << "format          : " << output_format(output_spec.path) << "\n"
+                  << "texture_size    : " << texture_size << "\n"
+                  << "texture_channels: " << output.texture_decoded.channels << "\n"
+                  << "material        : " << (has_suffix(output_spec.path, ".glb") ? "single_pbr" : "none") << "\n"
+                  << "output          : " << output_spec.path << "\n";
         return 0;
     }
     if (command == "run-cascade" || command == "run-cascade-mv") {
         const bool multi_view = command == "run-cascade-mv";
-        if (argc < 6) {
+        if (argc < 5) {
             print_usage(argv[0], std::cerr);
             return 2;
         }
         pixal3d::Pixal3DInferenceConfig config =
             pixal3d::default_pixal3d_inference_config();
+        int texture_size = 1024;
         std::string error;
-        if (!parse_cascade_options(argc, argv, 6, config, &error, nullptr,
-                                   "run-cascade")) {
+        OutputSpec output_spec;
+        if (!select_output_spec(argc, argv, 5, output_spec, &error) ||
+            !parse_cascade_options(argc, argv, output_spec.options_first, config, &error,
+                                   nullptr, &texture_size, command.c_str())) {
             std::cerr << "error: " << error << "\n";
             return 2;
         }
@@ -526,11 +600,7 @@ int main(int argc, char ** argv) {
             std::cerr << "error: " << error << "\n";
             return 1;
         }
-        if (output.meshes.empty()) {
-            std::cerr << "error: cascade produced no mesh\n";
-            return 1;
-        }
-        if (!pixal3d::write_pixal3d_obj(output.meshes.front(), argv[5], &error)) {
+        if (!write_mesh_output(output, output_spec.path, texture_size, &error)) {
             std::cerr << "error: " << error << "\n";
             return 1;
         }
@@ -538,7 +608,11 @@ int main(int argc, char ** argv) {
         std::cout << "resolution      : " << output.resolution << "\n"
                   << "vertices        : " << mesh.vertices.size() / 3 << "\n"
                   << "triangles       : " << mesh.faces.size() / 3 << "\n"
-                  << "output          : " << argv[5] << "\n";
+                  << "format          : " << output_format(output_spec.path) << "\n"
+                  << "texture_size    : " << texture_size << "\n"
+                  << "texture_channels: " << output.texture_decoded.channels << "\n"
+                  << "material        : " << (has_suffix(output_spec.path, ".glb") ? "single_pbr" : "none") << "\n"
+                  << "output          : " << output_spec.path << "\n";
         return 0;
     }
     if (command != "inspect-pack" || argc != 3) {

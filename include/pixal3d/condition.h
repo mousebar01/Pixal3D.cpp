@@ -76,8 +76,8 @@ struct Pixal3DMultiViewConditionBundleF32 {
 
 // A compact, external-condition file.  Its on-disk magic is P3DCOND\0 and
 // its payload is little-endian F32.  It stores 2D feature maps rather than
-// dense 3D projections, avoiding multi-gigabyte grid duplication and allowing
-// the C++ side to handle 1024/1536 token-budget grid overrides.
+// dense 3D projections, avoiding multi-gigabyte grid duplication while keeping
+// the trained stage resolutions explicit.
 struct Pixal3DConditionBundleF32 {
     std::uint32_t format_version = 0;
     std::vector<Pixal3DConditionStageF32> stages;

@@ -283,8 +283,8 @@ bool valid_normalization(const SLatNormalizationF32 & normalization,
 }
 
 bool checked_grid_resolution(int resolution, int & grid, std::string * error) {
-    if (resolution < 1024 || resolution % 16 != 0) {
-        set_error(error, "SLat cascade resolution must be a multiple of 16 and at least 1024");
+    if (resolution != 1024) {
+        set_error(error, "SLat cascade resolution must be 1024");
         return false;
     }
     grid = resolution / 16;
@@ -445,31 +445,23 @@ bool quantize_slat_coords_f32(
         set_error(error, "invalid SLat cascade coordinate quantization input");
         return false;
     }
-    int candidate = requested_resolution;
-    std::set<std::array<std::int32_t, 4>> unique;
-    while (true) {
-        if (!quantize_at_resolution(upsampled_coords, low_resolution, candidate,
-                                    unique, error)) return false;
-        if (max_num_tokens == 0 || unique.size() < max_num_tokens || candidate == 1024) {
-            actual_resolution = candidate;
-            coords.reserve(unique.size() * 4);
-            for (const auto & coord : unique) {
-                coords.insert(coords.end(), coord.begin(), coord.end());
-            }
-            return true;
-        }
-        if (candidate - 128 < 1024) {
-            actual_resolution = 1024;
-            if (!quantize_at_resolution(upsampled_coords, low_resolution, actual_resolution,
-                                        unique, error)) return false;
-            coords.reserve(unique.size() * 4);
-            for (const auto & coord : unique) {
-                coords.insert(coords.end(), coord.begin(), coord.end());
-            }
-            return true;
-        }
-        candidate -= 128;
+    if (requested_resolution != 1024) {
+        set_error(error, "SLat cascade resolution must be 1024");
+        return false;
     }
+    std::set<std::array<std::int32_t, 4>> unique;
+    if (!quantize_at_resolution(upsampled_coords, low_resolution, 1024,
+                                unique, error)) return false;
+    if (max_num_tokens != 0 && unique.size() > max_num_tokens) {
+        set_error(error, "quantized SLat coordinate count exceeds max_num_tokens at resolution 1024");
+        return false;
+    }
+    actual_resolution = 1024;
+    coords.reserve(unique.size() * 4);
+    for (const auto & coord : unique) {
+        coords.insert(coords.end(), coord.begin(), coord.end());
+    }
+    return true;
 }
 
 bool full_grid_coords(int resolution, std::vector<std::int32_t> & coords,
@@ -618,9 +610,8 @@ bool run_pixal3d_cascade_f32(
                                   shape_flow_high, texture_flow, shape_decoder,
                                   texture_decoder, error)) return false;
     if (!std::isfinite(config.voxel_margin) || config.voxel_margin < 0.0f ||
-        config.decoder_upsample_times < 0 || config.requested_resolution < 1024 ||
-        config.requested_resolution % 16 != 0) {
-        set_error(error, "invalid Pixal3D cascade configuration");
+        config.decoder_upsample_times < 0 || config.requested_resolution != 1024) {
+        set_error(error, "invalid Pixal3D cascade configuration: final resolution must be 1024");
         return false;
     }
     const SSFlowHParams & ss_hp = ss_flow.hparams();
@@ -636,8 +627,9 @@ bool run_pixal3d_cascade_f32(
         texture_dec_hp.component != "texture_decoder" || texture_dec_hp.pred_subdiv ||
         shape_low_hp.out_channels != shape_dec_hp.latent_channels ||
         shape_high_hp.out_channels != shape_dec_hp.latent_channels ||
-        texture_hp.out_channels != texture_dec_hp.latent_channels) {
-        set_error(error, "cascade model metadata is not compatible across stages");
+        texture_hp.out_channels != texture_dec_hp.latent_channels ||
+        texture_dec_hp.out_channels != 6) {
+        set_error(error, "cascade model metadata is not compatible across stages or texture decoder does not expose six PBR channels");
         return false;
     }
     if (config.sparse_structure.target_resolution > 0 &&

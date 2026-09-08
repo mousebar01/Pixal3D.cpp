@@ -259,7 +259,7 @@ Pixal3DInferenceConfig default_pixal3d_inference_config() {
     config.cascade.shape_normalization.std = make_shape_std();
     config.cascade.texture_normalization.mean = make_texture_mean();
     config.cascade.texture_normalization.std = make_texture_std();
-    config.cascade.requested_resolution = 1536;
+    config.cascade.requested_resolution = 1024;
     config.cascade.max_num_tokens = 49152;
     config.cascade.decoder_upsample_times = 4;
     config.cascade.voxel_margin = 0.5f;
@@ -482,7 +482,8 @@ bool write_pixal3d_obj(const DualGridMeshF32 & mesh,
         const float x = mesh.vertices[vertex * 3 + 0];
         const float y = mesh.vertices[vertex * 3 + 1];
         const float z = mesh.vertices[vertex * 3 + 2];
-        // Match the Python reference export transform: (x, y, z) -> (-x, -z, -y).
+        // Preserve the legacy shape-only OBJ compatibility frame.  The native
+        // textured GLB writer uses the Python main-path frame separately.
         file << "v " << -x << " " << -z << " " << -y << "\n";
     }
     for (std::size_t face = 0; face < mesh.faces.size(); face += 3) {

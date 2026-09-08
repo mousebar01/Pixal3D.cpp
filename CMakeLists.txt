@@ -81,6 +81,7 @@ add_library(pixal3d_core
     src/slat_flow.cpp
     src/ss_decoder.cpp
     src/ss_flow.cpp
+    src/texture_export.cpp
     src/vision_condition.cpp
     src/image.cpp
 )
@@ -206,6 +207,11 @@ if(BUILD_TESTING AND PIXAL3D_BUILD_CLI)
     target_compile_features(pixal3d_inference_test PRIVATE cxx_std_17)
     target_link_libraries(pixal3d_inference_test PRIVATE pixal3d_core)
     add_test(NAME pixal3d_inference COMMAND pixal3d_inference_test)
+    add_executable(pixal3d_texture_export_test tests/texture_export_test.cpp)
+    target_compile_features(pixal3d_texture_export_test PRIVATE cxx_std_17)
+    target_link_libraries(pixal3d_texture_export_test PRIVATE pixal3d_core)
+    add_test(NAME pixal3d_texture_export COMMAND pixal3d_texture_export_test)
+    set_tests_properties(pixal3d_texture_export PROPERTIES LABELS "unit;cpu")
     add_executable(pixal3d_ss_flow_fixture tests/ss_flow_numeric_fixture.cpp)
     target_compile_features(pixal3d_ss_flow_fixture PRIVATE cxx_std_17)
     target_link_libraries(pixal3d_ss_flow_fixture PRIVATE pixal3d_core)

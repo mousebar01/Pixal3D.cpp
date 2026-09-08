@@ -2,6 +2,7 @@
 
 #include "pixal3d/condition.h"
 #include "pixal3d/pipeline.h"
+#include "pixal3d/texture_export.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -11,8 +12,8 @@
 namespace pixal3d {
 
 // Options for running the production seven-model cascade from an externally
-// generated P3DCOND file.  The default values mirror weights/Pixal3D's
-// pipeline.json (1536 cascade, 12 Euler steps).  max_model_bytes is a hard
+// generated P3DCOND file.  The validated C++ defaults use the 1024 cascade and
+// 12 Euler steps.  max_model_bytes is a hard
 // pre-load resident F32 weight estimate; zero disables that guard.
 struct Pixal3DInferenceConfig {
     Pixal3DCascadeConfig cascade;
@@ -78,10 +79,9 @@ bool run_pixal3d_from_multiview_condition_stages(
     std::string * error = nullptr);
 
 // Write one decoded mesh as an ordinary 1-indexed Wavefront OBJ.  Vertices
-// are emitted in the Python reference export frame (x, y, z) -> (-x, -z, -y);
-// DualGridMeshF32 remains in the canonical decoder mesh frame.  Texture voxel
-// attributes remain available in Pixal3DCascadeOutputF32::texture_decoded for
-// a future material/voxel sidecar writer.
+// are emitted in the legacy shape-only/reference compatibility frame
+// (x, y, z) -> (-x, -z, -y).  DualGridMeshF32 remains in the canonical decoder
+// mesh frame.  Use write_pixal3d_glb() for the textured Python-main GLB frame.
 bool write_pixal3d_obj(const DualGridMeshF32 & mesh,
                        const std::string & path,
                        std::string * error = nullptr);

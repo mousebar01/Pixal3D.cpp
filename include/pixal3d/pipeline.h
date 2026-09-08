@@ -148,10 +148,10 @@ bool run_slat_stage_f32(
     std::string * error = nullptr,
     const SparseTensorF32 * concat_condition = nullptr);
 
-// Match Pixal3DImageTo3DPipeline.sample_shape_slat_cascade(): map decoder
-// coordinates at low-resolution grid units to a high-resolution SLat grid,
-// lexicographically unique them, and lower the requested resolution by 128
-// until max_num_tokens is met (the reference never lowers below 1024).
+// Match the validated Pixal3D cascade target: map decoder coordinates at
+// low-resolution grid units to the 1024 SLat grid and lexicographically
+// unique them.  A non-zero max_num_tokens is a hard guard; it never changes
+// the final resolution implicitly.
 bool quantize_slat_coords_f32(
     const SparseTensorF32 & upsampled_coords,
     int low_resolution,

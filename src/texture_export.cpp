@@ -1,0 +1,589 @@
+#include "pixal3d/texture_export.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <queue>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#if defined(PIXAL3D_HAVE_PNG)
+#include <png.h>
+#endif
+
+namespace pixal3d {
+namespace {
+
+constexpr float kPi = 3.14159265358979323846f;
+
+void set_error(std::string * error, const std::string & message) {
+    if (error) *error = message;
+}
+
+struct Vec3 {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+struct Vec2 {
+    float x = 0.0f;
+    float y = 0.0f;
+};
+
+Vec3 operator+(const Vec3 & a, const Vec3 & b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+Vec3 operator-(const Vec3 & a, const Vec3 & b) {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+Vec3 operator*(const Vec3 & a, float scale) {
+    return {a.x * scale, a.y * scale, a.z * scale};
+}
+
+float dot(const Vec3 & a, const Vec3 & b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+Vec3 cross(const Vec3 & a, const Vec3 & b) {
+    return {a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x};
+}
+
+Vec3 normalize(const Vec3 & value) {
+    const float length = std::sqrt(dot(value, value));
+    if (!(length > 1.0e-20f) || !std::isfinite(length)) return {0.0f, 0.0f, 1.0f};
+    return value * (1.0f / length);
+}
+
+std::uint64_t voxel_key(std::int32_t x, std::int32_t y, std::int32_t z) {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 42) |
+           (static_cast<std::uint64_t>(static_cast<std::uint32_t>(y)) << 21) |
+           static_cast<std::uint64_t>(static_cast<std::uint32_t>(z));
+}
+
+struct VoxelSample {
+    std::array<float, 6> value{};
+};
+
+struct TextureVolume {
+    int resolution = 0;
+    std::unordered_map<std::uint64_t, VoxelSample> values;
+};
+
+bool validate_mesh(const DualGridMeshF32 & mesh, std::string * error) {
+    if (mesh.vertices.empty() || mesh.vertices.size() % 3 != 0 ||
+        mesh.faces.empty() || mesh.faces.size() % 3 != 0) {
+        set_error(error, "GLB export requires non-empty packed mesh vertices and triangles");
+        return false;
+    }
+    const std::size_t vertex_count = mesh.vertices.size() / 3;
+    for (float value : mesh.vertices) {
+        if (!std::isfinite(value)) {
+            set_error(error, "GLB export mesh contains a non-finite vertex");
+            return false;
+        }
+    }
+    for (std::int32_t index : mesh.faces) {
+        if (index < 0 || static_cast<std::size_t>(index) >= vertex_count) {
+            set_error(error, "GLB export mesh face index is outside the vertex buffer");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool make_texture_volume(const SparseTensorF32 & input, int resolution,
+                         TextureVolume & volume, std::string * error) {
+    if (!input.valid(error)) return false;
+    if (input.channels != 6) {
+        set_error(error, "GLB export requires six texture channels (base_color, metallic, roughness, alpha)");
+        return false;
+    }
+    volume = TextureVolume{};
+    volume.resolution = resolution;
+    volume.values.reserve(input.points() * 2 + 1);
+    for (std::size_t point = 0; point < input.points(); ++point) {
+        const std::size_t coord_base = point * 4;
+        const std::int32_t batch = input.coords[coord_base + 0];
+        if (batch != 0) {
+            set_error(error, "GLB export currently supports the first texture batch only");
+            return false;
+        }
+        const std::int32_t x = input.coords[coord_base + 1];
+        const std::int32_t y = input.coords[coord_base + 2];
+        const std::int32_t z = input.coords[coord_base + 3];
+        if (x < 0 || y < 0 || z < 0 || x >= resolution || y >= resolution || z >= resolution) {
+            set_error(error, "texture voxel coordinate is outside the cascade resolution");
+            return false;
+        }
+        VoxelSample sample;
+        for (std::size_t channel = 0; channel < sample.value.size(); ++channel) {
+            const float value = input.feats[point * 6 + channel];
+            if (!std::isfinite(value)) {
+                set_error(error, "texture voxel attributes contain a non-finite value");
+                return false;
+            }
+            sample.value[channel] = value;
+        }
+        volume.values[voxel_key(x, y, z)] = sample;
+    }
+    return true;
+}
+
+std::array<float, 6> sample_volume(const TextureVolume & volume, const Vec3 & position) {
+    std::array<float, 6> result{};
+    const float scale = static_cast<float>(volume.resolution);
+    const float gx = (position.x + 0.5f) * scale;
+    const float gy = (position.y + 0.5f) * scale;
+    const float gz = (position.z + 0.5f) * scale;
+    if (!std::isfinite(gx) || !std::isfinite(gy) || !std::isfinite(gz)) return result;
+    const int x0 = static_cast<int>(std::floor(gx));
+    const int y0 = static_cast<int>(std::floor(gy));
+    const int z0 = static_cast<int>(std::floor(gz));
+    const float tx = gx - static_cast<float>(x0);
+    const float ty = gy - static_cast<float>(y0);
+    const float tz = gz - static_cast<float>(z0);
+    for (int dz = 0; dz <= 1; ++dz) {
+        for (int dy = 0; dy <= 1; ++dy) {
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int x = x0 + dx;
+                const int y = y0 + dy;
+                const int z = z0 + dz;
+                if (x < 0 || y < 0 || z < 0 || x >= volume.resolution ||
+                    y >= volume.resolution || z >= volume.resolution) continue;
+                const auto found = volume.values.find(voxel_key(x, y, z));
+                if (found == volume.values.end()) continue;
+                const float wx = dx ? tx : 1.0f - tx;
+                const float wy = dy ? ty : 1.0f - ty;
+                const float wz = dz ? tz : 1.0f - tz;
+                const float weight = wx * wy * wz;
+                for (std::size_t channel = 0; channel < result.size(); ++channel) {
+                    result[channel] += found->second.value[channel] * weight;
+                }
+            }
+        }
+    }
+    return result;
+}
+
+std::uint8_t to_byte(float value) {
+    if (!std::isfinite(value)) value = 0.0f;
+    value = std::clamp(value, 0.0f, 1.0f);
+    return static_cast<std::uint8_t>(std::lround(value * 255.0f));
+}
+
+#if defined(PIXAL3D_HAVE_PNG)
+bool encode_png(const std::vector<std::uint8_t> & pixels, int width, int height, int channels,
+               std::vector<std::uint8_t> & encoded, std::string * error) {
+    encoded.clear();
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!png) {
+        set_error(error, "cannot create libpng writer");
+        return false;
+    }
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_write_struct(&png, nullptr);
+        set_error(error, "cannot create libpng image info");
+        return false;
+    }
+    struct Sink {
+        std::vector<std::uint8_t> * bytes = nullptr;
+    } sink{&encoded};
+    if (setjmp(png_jmpbuf(png)) != 0) {
+        png_destroy_write_struct(&png, &info);
+        set_error(error, "libpng failed while encoding texture image");
+        return false;
+    }
+    png_set_write_fn(
+        png, &sink,
+        [](png_structp png_ptr, png_bytep data, png_size_t length) {
+            auto * target = static_cast<Sink *>(png_get_io_ptr(png_ptr));
+            target->bytes->insert(target->bytes->end(), data, data + length);
+        },
+        [](png_structp) {});
+    const int color_type = channels == 4 ? PNG_COLOR_TYPE_RGBA : PNG_COLOR_TYPE_RGB;
+    png_set_IHDR(png, info, width, height, 8, color_type, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+    const std::size_t row_bytes = static_cast<std::size_t>(width) *
+                                  static_cast<std::size_t>(channels);
+    for (int row = 0; row < height; ++row) {
+        png_write_row(png, const_cast<png_bytep>(
+            pixels.data() + static_cast<std::size_t>(row) * row_bytes));
+    }
+    png_write_end(png, info);
+    png_destroy_write_struct(&png, &info);
+    return true;
+}
+#else
+bool encode_png(const std::vector<std::uint8_t> &, int, int, int,
+                std::vector<std::uint8_t> &, std::string * error) {
+    set_error(error, "GLB texture export requires libpng; reconfigure with PNG support");
+    return false;
+}
+#endif
+
+struct TextureBake {
+    int size = 0;
+    std::vector<std::uint8_t> base_color;
+    std::vector<std::uint8_t> metallic_roughness;
+    std::vector<std::uint8_t> valid;
+};
+
+bool barycentric(const Vec2 & p, const Vec2 & a, const Vec2 & b, const Vec2 & c,
+                 float & w0, float & w1, float & w2) {
+    const float denominator = (b.y - c.y) * (a.x - c.x) +
+                              (c.x - b.x) * (a.y - c.y);
+    if (std::fabs(denominator) < 1.0e-12f) return false;
+    w0 = ((b.y - c.y) * (p.x - c.x) + (c.x - b.x) * (p.y - c.y)) / denominator;
+    w1 = ((c.y - a.y) * (p.x - c.x) + (a.x - c.x) * (p.y - c.y)) / denominator;
+    w2 = 1.0f - w0 - w1;
+    return w0 >= -1.0e-5f && w1 >= -1.0e-5f && w2 >= -1.0e-5f;
+}
+
+void write_baked_pixel(TextureBake & bake, int x, int y, const std::array<float, 6> & value) {
+    if (x < 0 || y < 0 || x >= bake.size || y >= bake.size) return;
+    const std::size_t pixel = static_cast<std::size_t>(y * bake.size + x);
+    if (bake.valid[pixel]) return;
+    bake.valid[pixel] = 1;
+    bake.base_color[pixel * 4 + 0] = to_byte(value[0]);
+    bake.base_color[pixel * 4 + 1] = to_byte(value[1]);
+    bake.base_color[pixel * 4 + 2] = to_byte(value[2]);
+    bake.base_color[pixel * 4 + 3] = to_byte(value[5]);
+    bake.metallic_roughness[pixel * 3 + 0] = 0;
+    bake.metallic_roughness[pixel * 3 + 1] = to_byte(value[4]);
+    bake.metallic_roughness[pixel * 3 + 2] = to_byte(value[3]);
+}
+
+void fill_baked_gaps(TextureBake & bake) {
+    const std::size_t pixel_count = bake.valid.size();
+    std::vector<std::int32_t> source(pixel_count, -1);
+    std::queue<std::size_t> pending;
+    for (std::size_t index = 0; index < pixel_count; ++index) {
+        if (bake.valid[index]) {
+            source[index] = static_cast<std::int32_t>(index);
+            pending.push(index);
+        }
+    }
+    const int width = bake.size;
+    const int height = bake.size;
+    while (!pending.empty()) {
+        const std::size_t current = pending.front();
+        pending.pop();
+        const int x = static_cast<int>(current % static_cast<std::size_t>(width));
+        const int y = static_cast<int>(current / static_cast<std::size_t>(width));
+        const std::array<std::pair<int, int>, 4> neighbors = {
+            std::make_pair(x - 1, y), std::make_pair(x + 1, y),
+            std::make_pair(x, y - 1), std::make_pair(x, y + 1)};
+        for (const auto & neighbor : neighbors) {
+            if (neighbor.first < 0 || neighbor.second < 0 ||
+                neighbor.first >= width || neighbor.second >= height) continue;
+            const std::size_t next = static_cast<std::size_t>(neighbor.second * width + neighbor.first);
+            if (source[next] >= 0) continue;
+            source[next] = source[current];
+            pending.push(next);
+        }
+    }
+    for (std::size_t index = 0; index < pixel_count; ++index) {
+        if (bake.valid[index] || source[index] < 0) continue;
+        const std::size_t from = static_cast<std::size_t>(source[index]);
+        std::copy_n(bake.base_color.data() + from * 4, 4,
+                    bake.base_color.data() + index * 4);
+        std::copy_n(bake.metallic_roughness.data() + from * 3, 3,
+                    bake.metallic_roughness.data() + index * 3);
+        bake.valid[index] = 1;
+    }
+}
+
+bool bake_textures(const DualGridMeshF32 & mesh, const TextureVolume & volume,
+                   int texture_size, TextureBake & bake, std::string * error) {
+    bake = TextureBake{};
+    bake.size = texture_size;
+    const std::size_t pixels = static_cast<std::size_t>(texture_size) *
+                               static_cast<std::size_t>(texture_size);
+    bake.base_color.assign(pixels * 4, 0);
+    bake.metallic_roughness.assign(pixels * 3, 0);
+    bake.valid.assign(pixels, 0);
+    const std::size_t vertices = mesh.vertices.size() / 3;
+    std::vector<Vec3> positions(vertices);
+    std::vector<Vec3> normals(vertices, {0.0f, 0.0f, 0.0f});
+    std::vector<Vec2> uvs(vertices);
+    for (std::size_t vertex = 0; vertex < vertices; ++vertex) {
+        positions[vertex] = {mesh.vertices[vertex * 3 + 0], mesh.vertices[vertex * 3 + 1],
+                             mesh.vertices[vertex * 3 + 2]};
+        const Vec3 p = positions[vertex];
+        const float radius = std::sqrt(dot(p, p));
+        const float u = radius > 1.0e-20f ?
+            0.5f + std::atan2(p.y, p.x) / (2.0f * kPi) : 0.5f;
+        const float v = radius > 1.0e-20f ?
+            0.5f + std::asin(std::clamp(p.z / radius, -1.0f, 1.0f)) /
+                kPi : 0.5f;
+        uvs[vertex] = {u - std::floor(u), 1.0f - std::clamp(v, 0.0f, 1.0f)};
+    }
+    for (std::size_t face = 0; face < mesh.faces.size(); face += 3) {
+        const std::size_t ia = static_cast<std::size_t>(mesh.faces[face + 0]);
+        const std::size_t ib = static_cast<std::size_t>(mesh.faces[face + 1]);
+        const std::size_t ic = static_cast<std::size_t>(mesh.faces[face + 2]);
+        const Vec3 e1 = positions[ib] - positions[ia];
+        const Vec3 e2 = positions[ic] - positions[ia];
+        const Vec3 normal = cross(e1, e2);
+        normals[ia] = normals[ia] + normal;
+        normals[ib] = normals[ib] + normal;
+        normals[ic] = normals[ic] + normal;
+        std::array<Vec2, 3> uv = {uvs[ia], uvs[ib], uvs[ic]};
+        const float minimum_u = std::min({uv[0].x, uv[1].x, uv[2].x});
+        const float maximum_u = std::max({uv[0].x, uv[1].x, uv[2].x});
+        if (maximum_u - minimum_u > 0.5f) {
+            for (Vec2 & value : uv) if (value.x < 0.5f) value.x += 1.0f;
+        }
+        for (int shift = -1; shift <= 1; ++shift) {
+            std::array<Vec2, 3> shifted = uv;
+            for (Vec2 & value : shifted) value.x -= static_cast<float>(shift);
+            const float min_x = std::max(0.0f, std::min({shifted[0].x, shifted[1].x, shifted[2].x}));
+            const float max_x = std::min(1.0f, std::max({shifted[0].x, shifted[1].x, shifted[2].x}));
+            const float min_y = std::max(0.0f, std::min({shifted[0].y, shifted[1].y, shifted[2].y}));
+            const float max_y = std::min(1.0f, std::max({shifted[0].y, shifted[1].y, shifted[2].y}));
+            if (min_x > max_x || min_y > max_y) continue;
+            const int x0 = std::max(0, static_cast<int>(std::floor(min_x * texture_size)) - 1);
+            const int x1 = std::min(texture_size - 1, static_cast<int>(std::ceil(max_x * texture_size)) + 1);
+            const int y0 = std::max(0, static_cast<int>(std::floor(min_y * texture_size)) - 1);
+            const int y1 = std::min(texture_size - 1, static_cast<int>(std::ceil(max_y * texture_size)) + 1);
+            for (int y = y0; y <= y1; ++y) {
+                for (int x = x0; x <= x1; ++x) {
+                    const Vec2 sample_uv{
+                        (static_cast<float>(x) + 0.5f) / static_cast<float>(texture_size),
+                        (static_cast<float>(y) + 0.5f) / static_cast<float>(texture_size)};
+                    float w0 = 0.0f, w1 = 0.0f, w2 = 0.0f;
+                    if (!barycentric(sample_uv, shifted[0], shifted[1], shifted[2], w0, w1, w2)) continue;
+                    const Vec3 position = positions[ia] * w0 + positions[ib] * w1 + positions[ic] * w2;
+                    write_baked_pixel(bake, x, y, sample_volume(volume, position));
+                }
+            }
+        }
+    }
+    if (std::none_of(bake.valid.begin(), bake.valid.end(), [](std::uint8_t value) { return value != 0; })) {
+        set_error(error, "GLB texture bake produced no covered texels");
+        return false;
+    }
+    fill_baked_gaps(bake);
+    for (std::size_t vertex = 0; vertex < vertices; ++vertex) normals[vertex] = normalize(normals[vertex]);
+    return true;
+}
+
+void append_u32(std::vector<std::uint8_t> & output, std::uint32_t value) {
+    output.push_back(static_cast<std::uint8_t>(value & 0xffu));
+    output.push_back(static_cast<std::uint8_t>((value >> 8) & 0xffu));
+    output.push_back(static_cast<std::uint8_t>((value >> 16) & 0xffu));
+    output.push_back(static_cast<std::uint8_t>((value >> 24) & 0xffu));
+}
+
+void append_f32(std::vector<std::uint8_t> & output, float value) {
+    std::uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value), "unexpected float size");
+    std::memcpy(&bits, &value, sizeof(bits));
+    append_u32(output, bits);
+}
+
+void align4(std::vector<std::uint8_t> & output, std::uint8_t value = 0) {
+    while (output.size() % 4 != 0) output.push_back(value);
+}
+
+std::string json_escape(const std::string & value) {
+    std::string result;
+    for (char character : value) {
+        if (character == '"' || character == '\\') {
+            result.push_back('\\');
+            result.push_back(character);
+        } else if (character == '\n') {
+            result += "\\n";
+        } else {
+            result.push_back(character);
+        }
+    }
+    return result;
+}
+
+bool write_glb(const std::string & path, const std::string & json,
+               const std::vector<std::uint8_t> & binary, std::string * error) {
+    std::vector<std::uint8_t> json_chunk(json.begin(), json.end());
+    while (json_chunk.size() % 4 != 0) json_chunk.push_back(' ');
+    std::vector<std::uint8_t> bin_chunk = binary;
+    while (bin_chunk.size() % 4 != 0) bin_chunk.push_back(0);
+    const std::uint64_t total_size = 12ull + 8ull + json_chunk.size() + 8ull + bin_chunk.size();
+    if (total_size > std::numeric_limits<std::uint32_t>::max()) {
+        set_error(error, "GLB output exceeds the 32-bit container size limit");
+        return false;
+    }
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        set_error(error, "cannot open GLB output: " + path);
+        return false;
+    }
+    std::vector<std::uint8_t> header;
+    append_u32(header, 0x46546c67u);
+    append_u32(header, 2u);
+    append_u32(header, static_cast<std::uint32_t>(total_size));
+    append_u32(header, static_cast<std::uint32_t>(json_chunk.size()));
+    append_u32(header, 0x4e4f534au);
+    header.insert(header.end(), json_chunk.begin(), json_chunk.end());
+    append_u32(header, static_cast<std::uint32_t>(bin_chunk.size()));
+    append_u32(header, 0x004e4942u);
+    header.insert(header.end(), bin_chunk.begin(), bin_chunk.end());
+    file.write(reinterpret_cast<const char *>(header.data()), static_cast<std::streamsize>(header.size()));
+    if (!file) {
+        set_error(error, "failed while writing GLB output: " + path);
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
+                       const SparseTensorF32 & texture_decoded,
+                       int resolution,
+                       const Pixal3DGlbOptions & options,
+                       const std::string & path,
+                       std::string * error) {
+    if (!validate_mesh(mesh, error)) return false;
+    if (resolution != 1024) {
+        set_error(error, "GLB export requires the supported 1024 cascade resolution");
+        return false;
+    }
+    if (options.texture_size <= 0 || options.texture_size > 4096) {
+        set_error(error, "GLB texture size must be in the range 1..4096");
+        return false;
+    }
+    TextureVolume volume;
+    if (!make_texture_volume(texture_decoded, resolution, volume, error)) return false;
+    TextureBake bake;
+    if (!bake_textures(mesh, volume, options.texture_size, bake, error)) return false;
+    std::vector<std::uint8_t> base_png;
+    std::vector<std::uint8_t> mr_png;
+    if (!encode_png(bake.base_color, bake.size, bake.size, 4, base_png, error) ||
+        !encode_png(bake.metallic_roughness, bake.size, bake.size, 3, mr_png, error)) return false;
+
+    const std::size_t vertex_count = mesh.vertices.size() / 3;
+    const std::size_t index_count = mesh.faces.size();
+    std::vector<Vec3> normals(vertex_count, {0.0f, 0.0f, 0.0f});
+    std::vector<Vec3> positions(vertex_count);
+    std::vector<Vec2> uvs(vertex_count);
+    for (std::size_t vertex = 0; vertex < vertex_count; ++vertex) {
+        positions[vertex] = {mesh.vertices[vertex * 3 + 0], mesh.vertices[vertex * 3 + 1],
+                             mesh.vertices[vertex * 3 + 2]};
+        const Vec3 p = positions[vertex];
+        const float radius = std::sqrt(dot(p, p));
+        const float u = radius > 1.0e-20f ?
+            0.5f + std::atan2(p.y, p.x) / (2.0f * kPi) : 0.5f;
+        const float v = radius > 1.0e-20f ?
+            0.5f + std::asin(std::clamp(p.z / radius, -1.0f, 1.0f)) /
+                kPi : 0.5f;
+        uvs[vertex] = {u - std::floor(u), 1.0f - std::clamp(v, 0.0f, 1.0f)};
+    }
+    for (std::size_t face = 0; face < index_count; face += 3) {
+        const std::size_t ia = static_cast<std::size_t>(mesh.faces[face + 0]);
+        const std::size_t ib = static_cast<std::size_t>(mesh.faces[face + 1]);
+        const std::size_t ic = static_cast<std::size_t>(mesh.faces[face + 2]);
+        const Vec3 normal = cross(positions[ib] - positions[ia], positions[ic] - positions[ia]);
+        normals[ia] = normals[ia] + normal;
+        normals[ib] = normals[ib] + normal;
+        normals[ic] = normals[ic] + normal;
+    }
+    for (Vec3 & normal : normals) normal = normalize(normal);
+
+    std::vector<std::uint8_t> binary;
+    const auto append_blob = [&binary](const void * data, std::size_t bytes) {
+        align4(binary);
+        const std::size_t offset = binary.size();
+        const auto * source = static_cast<const std::uint8_t *>(data);
+        binary.insert(binary.end(), source, source + bytes);
+        return offset;
+    };
+    std::vector<std::uint8_t> position_bytes;
+    std::vector<std::uint8_t> normal_bytes;
+    std::vector<std::uint8_t> uv_bytes;
+    std::vector<std::uint8_t> index_bytes;
+    position_bytes.reserve(vertex_count * 12);
+    normal_bytes.reserve(vertex_count * 12);
+    uv_bytes.reserve(vertex_count * 8);
+    index_bytes.reserve(index_count * 4);
+    // Match the final coordinate frame of the Python textured GLB path.
+    // o_voxel.postprocess.to_glb() first maps (x, y, z) -> (x, z, -y),
+    // then Pixal3D applies (-x, -z, -y), yielding H=(-x, +y, -z).
+    const Vec3 first_exported{-positions.front().x, positions.front().y, -positions.front().z};
+    Vec3 minimum = first_exported;
+    Vec3 maximum = first_exported;
+    for (std::size_t vertex = 0; vertex < vertex_count; ++vertex) {
+        const Vec3 p = positions[vertex];
+        const Vec3 exported{-p.x, p.y, -p.z};
+        append_f32(position_bytes, exported.x);
+        append_f32(position_bytes, exported.y);
+        append_f32(position_bytes, exported.z);
+        const Vec3 n = normals[vertex];
+        const Vec3 exported_normal{-n.x, n.y, -n.z};
+        append_f32(normal_bytes, exported_normal.x);
+        append_f32(normal_bytes, exported_normal.y);
+        append_f32(normal_bytes, exported_normal.z);
+        append_f32(uv_bytes, uvs[vertex].x);
+        append_f32(uv_bytes, uvs[vertex].y);
+        minimum.x = std::min(minimum.x, exported.x);
+        minimum.y = std::min(minimum.y, exported.y);
+        minimum.z = std::min(minimum.z, exported.z);
+        maximum.x = std::max(maximum.x, exported.x);
+        maximum.y = std::max(maximum.y, exported.y);
+        maximum.z = std::max(maximum.z, exported.z);
+    }
+    for (std::int32_t index : mesh.faces) append_u32(index_bytes, static_cast<std::uint32_t>(index));
+    const std::size_t position_offset = append_blob(position_bytes.data(), position_bytes.size());
+    const std::size_t normal_offset = append_blob(normal_bytes.data(), normal_bytes.size());
+    const std::size_t uv_offset = append_blob(uv_bytes.data(), uv_bytes.size());
+    const std::size_t index_offset = append_blob(index_bytes.data(), index_bytes.size());
+    const std::size_t base_png_offset = append_blob(base_png.data(), base_png.size());
+    const std::size_t mr_png_offset = append_blob(mr_png.data(), mr_png.size());
+    const std::size_t base_png_length = base_png.size();
+    const std::size_t mr_png_length = mr_png.size();
+
+    std::ostringstream json;
+    json << "{"
+         << "\"asset\":{\"version\":\"2.0\",\"generator\":\"Pixal3D.cpp native approximate PBR exporter\"},"
+         << "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],"
+         << "\"nodes\":[{\"mesh\":0}],"
+         << "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]}],"
+         << "\"materials\":[{\"name\":\"Pixal3D PBR material\",\"doubleSided\":true,\"alphaMode\":\"OPAQUE\",\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},\"metallicRoughnessTexture\":{\"index\":1},\"metallicFactor\":1.0,\"roughnessFactor\":1.0,\"baseColorFactor\":[1,1,1,1]}}],"
+         << "\"textures\":[{\"sampler\":0,\"source\":0},{\"sampler\":0,\"source\":1}],"
+         << "\"samplers\":[{\"magFilter\":9729,\"minFilter\":9987,\"wrapS\":10497,\"wrapT\":10497}],"
+         << "\"images\":[{\"bufferView\":4,\"mimeType\":\"image/png\"},{\"bufferView\":5,\"mimeType\":\"image/png\"}],"
+         << "\"accessors\":["
+         << "{\"bufferView\":0,\"componentType\":5126,\"count\":" << vertex_count << ",\"type\":\"VEC3\",\"min\":["
+         << minimum.x << "," << minimum.y << "," << minimum.z << "],\"max\":["
+         << maximum.x << "," << maximum.y << "," << maximum.z << "]},"
+         << "{\"bufferView\":1,\"componentType\":5126,\"count\":" << vertex_count << ",\"type\":\"VEC3\"},"
+         << "{\"bufferView\":2,\"componentType\":5126,\"count\":" << vertex_count << ",\"type\":\"VEC2\"},"
+         << "{\"bufferView\":3,\"componentType\":5125,\"count\":" << index_count << ",\"type\":\"SCALAR\"}],"
+         << "\"bufferViews\":["
+         << "{\"buffer\":0,\"byteOffset\":" << position_offset << ",\"byteLength\":" << position_bytes.size() << ",\"target\":34962},"
+         << "{\"buffer\":0,\"byteOffset\":" << normal_offset << ",\"byteLength\":" << normal_bytes.size() << ",\"target\":34962},"
+         << "{\"buffer\":0,\"byteOffset\":" << uv_offset << ",\"byteLength\":" << uv_bytes.size() << ",\"target\":34962},"
+         << "{\"buffer\":0,\"byteOffset\":" << index_offset << ",\"byteLength\":" << index_bytes.size() << ",\"target\":34963},"
+         << "{\"buffer\":0,\"byteOffset\":" << base_png_offset << ",\"byteLength\":" << base_png_length << "},"
+         << "{\"buffer\":0,\"byteOffset\":" << mr_png_offset << ",\"byteLength\":" << mr_png_length << "}],"
+         << "\"buffers\":[{\"byteLength\":" << ((binary.size() + 3u) & ~std::size_t(3u)) << "}]"
+         << "}";
+    return write_glb(path, json.str(), binary, error);
+}
+
+} // namespace pixal3d

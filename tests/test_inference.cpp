@@ -9,7 +9,7 @@
 int main() {
     const pixal3d::Pixal3DInferenceConfig config =
         pixal3d::default_pixal3d_inference_config();
-    if (config.cascade.requested_resolution != 1536 ||
+    if (config.cascade.requested_resolution != 1024 ||
         config.cascade.max_num_tokens != 49152 ||
         config.cascade.shape_normalization.mean.size() != 32 ||
         config.cascade.texture_normalization.std.size() != 32 ||

@@ -12,11 +12,11 @@ def look_at(camera, target):
     camera.rotation_euler = (Vector(target) - camera.location).to_track_quat("-Z", "Y").to_euler()
 
 
-def look_at_export_front(camera, target):
-    # The Python reference camera looks along internal +Y with image-up along
-    # internal +Z.  After the OBJ export transform (x, y, z) -> (-x, -z, -y),
-    # this becomes export -Z with image-up along export -Y.
-    # Build the camera basis explicitly so the preview matches that frame.
+def look_at_legacy_obj_front(camera, target):
+    # The explicit OBJ compatibility writer uses E=(x, y, z)->(-x, -z, -y).
+    # The canonical front camera is on -Y looking toward +Y with +Z image-up.
+    # Applying E maps that camera to OBJ +Z looking toward -Z with -Y up.
+    # Build the basis explicitly so Blender's default +Y up does not rotate it.
     forward = (Vector(target) - camera.location).normalized()
     up = Vector((0.0, -1.0, 0.0))
     up = (up - forward * up.dot(forward)).normalized()
@@ -110,13 +110,13 @@ def main():
 
     camera_distance = extent * 2.25
     if args.view == "front":
-        # The supplied character image is presented from the export-frame
-        # front side.  Keep this view independent from the training camera
-        # convention so visual inspection does not invert front/back.
+        # The official textured Python GLB uses H=(-x, +y, -z), so its
+        # reference front is the -Z side looking toward +Z with +Y up.
         camera_location = (center.x, center.y, center.z - camera_distance)
     elif args.view == "reference-front":
-        # The Python reference camera is at internal (0, -distance, 0).
-        # Under the OBJ export transform this lies on export +Z.
+        # The explicit OBJ compatibility writer uses E=(-x, -z, -y).  The
+        # canonical front camera on -Y therefore becomes OBJ +Z, looking -Z,
+        # with OBJ -Y as image-up.
         camera_location = (center.x, center.y, center.z + camera_distance)
     else:
         camera_location = (center.x + camera_distance,
@@ -127,7 +127,7 @@ def main():
     camera.data.lens = 52
     camera.data.sensor_width = 36
     if args.view == "reference-front":
-        look_at_export_front(camera, center)
+        look_at_legacy_obj_front(camera, center)
     else:
         look_at(camera, center)
     scene.camera = camera
@@ -145,16 +145,6 @@ def main():
     area("key", (center.x + extent * 1.1, center.y - extent * 1.2, center.z - extent * 1.7), 320, extent * 1.2, (0.78, 0.88, 1.0))
     area("fill", (center.x - extent * 1.0, center.y - extent * 0.5, center.z - extent * 0.35), 140, extent * 1.5, (0.48, 0.62, 1.0))
     area("rim", (center.x - extent * 0.3, center.y + extent * 1.3, center.z + extent * 1.2), 260, extent, (0.52, 0.70, 1.0))
-
-    bpy.ops.mesh.primitive_plane_add(size=extent * 8, location=(center.x, center.y, maximum.z + extent * 0.04))
-    ground = bpy.context.object
-    ground_mat = bpy.data.materials.new("Preview ground")
-    ground_mat.diffuse_color = (0.025, 0.035, 0.06, 1.0)
-    ground_mat.use_nodes = True
-    ground_bsdf = ground_mat.node_tree.nodes.get("Principled BSDF")
-    ground_bsdf.inputs["Base Color"].default_value = (0.018, 0.026, 0.05, 1.0)
-    ground_bsdf.inputs["Roughness"].default_value = 0.78
-    ground.data.materials.append(ground_mat)
 
     scene.view_settings.view_transform = "Standard"
     scene.view_settings.look = "Medium High Contrast"
