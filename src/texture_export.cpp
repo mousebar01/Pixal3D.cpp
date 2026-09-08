@@ -5,11 +5,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <queue>
@@ -339,65 +341,223 @@ bool simplify_export_mesh(const DualGridMeshF32 & mesh, std::size_t target,
     for (std::size_t index = 0; index < mesh.faces.size(); ++index) {
         indices[index] = static_cast<std::uint32_t>(mesh.faces[index]);
     }
-    if (target == 0 || mesh.faces.size() / 3 <= target) return true;
-    std::vector<std::uint32_t> destination(mesh.faces.size());
-    float result_error = 0.0f;
-    const std::size_t simplified = meshopt_simplify(
-        destination.data(), indices.data(), indices.size(), mesh.vertices.data(),
-        mesh.vertices.size() / 3, sizeof(float) * 3, target * 3, 1.0e-2f, 0,
-        &result_error);
-    if (simplified < 3 || simplified % 3 != 0) {
-        set_error(error, "mesh simplification produced no usable faces");
+    if (target != 0 && mesh.faces.size() / 3 > target) {
+        std::vector<std::uint32_t> destination(mesh.faces.size());
+        float result_error = 0.0f;
+        const std::size_t simplified = meshopt_simplify(
+            destination.data(), indices.data(), indices.size(), mesh.vertices.data(),
+            mesh.vertices.size() / 3, sizeof(float) * 3, target * 3, 1.0e-2f, 0,
+            &result_error);
+        if (simplified < 3 || simplified % 3 != 0) {
+            set_error(error, "mesh simplification produced no usable faces");
+            return false;
+        }
+        indices.assign(destination.begin(), destination.begin() + simplified);
+    }
+
+    // xatlas ignores faces at or below its FLT_EPSILON area threshold, and
+    // every ignored face acts as a cut that keeps splitting charts into
+    // single-texel fragments.  Simplification leaves collapsed faces behind,
+    // so prune them exactly like the reference remove_degenerate_faces pass.
+    const std::size_t before_prune = indices.size() / 3;
+    std::vector<std::uint32_t> pruned;
+    pruned.reserve(indices.size());
+    for (std::size_t face = 0; face < before_prune; ++face) {
+        const std::uint32_t a = indices[face * 3 + 0];
+        const std::uint32_t b = indices[face * 3 + 1];
+        const std::uint32_t c = indices[face * 3 + 2];
+        if (a == b || b == c || a == c) continue;
+        const float ux = mesh.vertices[std::size_t(b) * 3 + 0] - mesh.vertices[std::size_t(a) * 3 + 0];
+        const float uy = mesh.vertices[std::size_t(b) * 3 + 1] - mesh.vertices[std::size_t(a) * 3 + 1];
+        const float uz = mesh.vertices[std::size_t(b) * 3 + 2] - mesh.vertices[std::size_t(a) * 3 + 2];
+        const float vx = mesh.vertices[std::size_t(c) * 3 + 0] - mesh.vertices[std::size_t(a) * 3 + 0];
+        const float vy = mesh.vertices[std::size_t(c) * 3 + 1] - mesh.vertices[std::size_t(a) * 3 + 1];
+        const float vz = mesh.vertices[std::size_t(c) * 3 + 2] - mesh.vertices[std::size_t(a) * 3 + 2];
+        const float cx = uy * vz - uz * vy;
+        const float cy = uz * vx - ux * vz;
+        const float cz = ux * vy - uy * vx;
+        const float area = 0.5f * std::sqrt(cx * cx + cy * cy + cz * cz);
+        if (area <= std::numeric_limits<float>::epsilon()) continue;
+        pruned.push_back(a);
+        pruned.push_back(b);
+        pruned.push_back(c);
+    }
+    indices.swap(pruned);
+    if (indices.size() < 3) {
+        set_error(error, "mesh simplification pruned every face");
         return false;
     }
-    indices.assign(destination.begin(), destination.begin() + simplified);
     return true;
 }
 
 // Parameterize the mesh with xatlas, the same backend the reference
-// postprocess wraps.  Positions and faces come from the canonical decoder
-// mesh; the UVs land in [0, 1] after packing.
+// postprocess wraps.  The dual grid export mesh is one multi-million-face
+// connected component, and xatlas chart growing stalls on a mesh that large
+// (progress sits at a few percent for hours).  The reference postprocess
+// therefore splits the surface first and parameterizes each cluster as an
+// independent xatlas mesh, which finishes in under a minute; faces are
+// bucketed by centroid into a uniform spatial grid the same way.  All charts
+// still pack into a single atlas, so the GLB keeps one texture.  Positions
+// and faces come from the canonical decoder mesh; the UVs land in [0, 1]
+// after packing.
 bool unwrap_charts(const DualGridMeshF32 & mesh,
-                   const std::vector<std::uint32_t> & indices, ExportMesh & out,
-                   std::string * error) {
+                   const std::vector<std::uint32_t> & indices, int texture_size,
+                   ExportMesh & out, std::string * error) {
     const std::size_t vertex_count = mesh.vertices.size() / 3;
-    xatlas::Atlas * atlas = xatlas::Create();
-    xatlas::MeshDecl decl;
-    decl.vertexCount = static_cast<std::uint32_t>(vertex_count);
-    decl.vertexPositionData = mesh.vertices.data();
-    decl.vertexPositionStride = sizeof(float) * 3;
-    decl.indexCount = indices.size();
-    decl.indexData = indices.data();
-    decl.indexFormat = xatlas::IndexFormat::UInt32;
-    const xatlas::AddMeshError added = xatlas::AddMesh(atlas, decl);
-    if (added != xatlas::AddMeshError::Success) {
-        xatlas::Destroy(atlas);
-        set_error(error, std::string("xatlas rejected the export mesh: ") +
-                             xatlas::StringForEnum(added));
+    const std::size_t face_count = indices.size() / 3;
+    Vec3 minimum{mesh.vertices[0], mesh.vertices[1], mesh.vertices[2]};
+    Vec3 maximum = minimum;
+    for (std::size_t vertex = 0; vertex < vertex_count; ++vertex) {
+        const Vec3 position{mesh.vertices[vertex * 3 + 0],
+                            mesh.vertices[vertex * 3 + 1],
+                            mesh.vertices[vertex * 3 + 2]};
+        minimum = {std::min(minimum.x, position.x), std::min(minimum.y, position.y),
+                   std::min(minimum.z, position.z)};
+        maximum = {std::max(maximum.x, position.x), std::max(maximum.y, position.y),
+                   std::max(maximum.z, position.z)};
+    }
+    const float extent = std::max({maximum.x - minimum.x, maximum.y - minimum.y,
+                                   maximum.z - minimum.z});
+    if (!std::isfinite(extent) || extent <= 0.0f) {
+        set_error(error, "export mesh has a degenerate bounding extent");
         return false;
     }
-    xatlas::Generate(atlas);
-    const xatlas::Mesh & output = atlas->meshes[0];
-    if (output.indexCount == 0 || output.vertexCount == 0 ||
-        atlas->width == 0 || atlas->height == 0) {
+
+    // One bucket per grid cell keeps xatlas input meshes in the low thousands
+    // of faces, which it charts in milliseconds.  Bucket keys are ordered so
+    // the atlas layout is deterministic.
+    const std::size_t grid = face_count < 1000 ? 1 : 24;
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> buckets;
+    buckets.reserve(face_count / 8 + 1);
+    const float minimum_component[3] = {minimum.x, minimum.y, minimum.z};
+    for (std::size_t face = 0; face < face_count; ++face) {
+        float centroid[3] = {0.0f, 0.0f, 0.0f};
+        for (int corner = 0; corner < 3; ++corner) {
+            const std::uint32_t vertex = indices[face * 3 + corner];
+            for (int axis = 0; axis < 3; ++axis) {
+                centroid[axis] += mesh.vertices[std::size_t(vertex) * 3 + axis];
+            }
+        }
+        std::uint64_t key = 0;
+        for (int axis = 0; axis < 3; ++axis) {
+            centroid[axis] /= 3.0f;
+            const float normalized =
+                (centroid[axis] - minimum_component[axis]) / extent;
+            const auto cell = std::size_t(std::clamp(normalized, 0.0f, 0.9999f) *
+                                          static_cast<float>(grid));
+            key |= std::uint64_t(cell) << (20 * (2 - axis));
+        }
+        buckets[key].push_back(static_cast<std::uint32_t>(face));
+    }
+    std::vector<std::uint64_t> bucket_keys;
+    bucket_keys.reserve(buckets.size());
+    for (const auto & bucket : buckets) bucket_keys.push_back(bucket.first);
+    std::sort(bucket_keys.begin(), bucket_keys.end());
+
+    // Local vertex remap per bucket, so output vertices can be traced back to
+    // the canonical decoder mesh.
+    std::vector<std::vector<std::uint32_t>> bucket_vertices(bucket_keys.size());
+    std::vector<std::vector<float>> bucket_positions(bucket_keys.size());
+    std::vector<std::vector<std::uint32_t>> bucket_indices(bucket_keys.size());
+    for (std::size_t bucket = 0; bucket < bucket_keys.size(); ++bucket) {
+        std::unordered_map<std::uint32_t, std::uint32_t> remap;
+        for (std::uint32_t face : buckets[bucket_keys[bucket]]) {
+            for (int corner = 0; corner < 3; ++corner) {
+                const std::uint32_t vertex = indices[face * 3 + corner];
+                const auto inserted = remap.emplace(vertex,
+                                                    std::uint32_t(bucket_vertices[bucket].size()));
+                if (inserted.second) {
+                    bucket_vertices[bucket].push_back(vertex);
+                    for (int axis = 0; axis < 3; ++axis) {
+                        bucket_positions[bucket].push_back(
+                            mesh.vertices[std::size_t(vertex) * 3 + axis]);
+                    }
+                }
+                bucket_indices[bucket].push_back(inserted.first->second);
+            }
+        }
+    }
+
+    xatlas::Atlas * atlas = nullptr;
+    float texels_per_unit = 0.19f * texture_size / extent;
+    for (int attempt = 0; attempt < 3 && !atlas; ++attempt) {
+        // PackCharts cannot be re-run in place, so an over-dense packing is
+        // retried from scratch at half the texel density.
+        atlas = xatlas::Create();
+        for (std::size_t bucket = 0; bucket < bucket_keys.size(); ++bucket) {
+            xatlas::MeshDecl decl;
+            decl.vertexCount = static_cast<std::uint32_t>(bucket_positions[bucket].size() / 3);
+            decl.vertexPositionData = bucket_positions[bucket].data();
+            decl.vertexPositionStride = sizeof(float) * 3;
+            decl.indexCount = static_cast<std::uint32_t>(bucket_indices[bucket].size());
+            decl.indexData = bucket_indices[bucket].data();
+            decl.indexFormat = xatlas::IndexFormat::UInt32;
+            const xatlas::AddMeshError added = xatlas::AddMesh(atlas, decl);
+            if (added != xatlas::AddMeshError::Success) {
+                xatlas::Destroy(atlas);
+                set_error(error, std::string("xatlas rejected export mesh cluster ") +
+                                     std::to_string(bucket) + ": " +
+                                     xatlas::StringForEnum(added));
+                return false;
+            }
+        }
+        xatlas::ComputeCharts(atlas, xatlas::ChartOptions());
+        xatlas::PackOptions pack_options;
+        pack_options.resolution = texture_size;
+        pack_options.texelsPerUnit = texels_per_unit;
+        xatlas::PackCharts(atlas, pack_options);
+        if (atlas->atlasCount > 1) {
+            xatlas::Destroy(atlas);
+            atlas = nullptr;
+            texels_per_unit *= 0.5f;
+        }
+    }
+    if (atlas == nullptr) {
+        set_error(error, "xatlas could not pack the unwrapped charts into a " +
+                             std::to_string(texture_size) + "x" +
+                             std::to_string(texture_size) + " atlas");
+        return false;
+    }
+    if (atlas->meshCount == 0 || atlas->width == 0 || atlas->height == 0) {
         xatlas::Destroy(atlas);
         set_error(error, "xatlas produced an empty UV atlas");
         return false;
     }
-    out.positions.resize(output.vertexCount);
-    out.uvs.resize(output.vertexCount);
-    for (std::uint32_t vertex = 0; vertex < output.vertexCount; ++vertex) {
-        const xatlas::Vertex & source = output.vertexArray[vertex];
-        out.positions[vertex] = {
-            mesh.vertices[static_cast<std::size_t>(source.xref) * 3 + 0],
-            mesh.vertices[static_cast<std::size_t>(source.xref) * 3 + 1],
-            mesh.vertices[static_cast<std::size_t>(source.xref) * 3 + 2]};
-        out.uvs[vertex] = {
-            source.uv[0] / static_cast<float>(atlas->width),
-            source.uv[1] / static_cast<float>(atlas->height)};
+    for (std::uint32_t bucket = 0; bucket < atlas->meshCount; ++bucket) {
+        const xatlas::Mesh & output = atlas->meshes[bucket];
+        if (output.indexCount == 0 || output.vertexCount == 0) continue;
+        const std::vector<std::uint32_t> & local_to_global =
+            bucket_vertices[bucket];
+        const std::uint32_t vertex_base = static_cast<std::uint32_t>(out.positions.size());
+        out.positions.resize(out.positions.size() + output.vertexCount);
+        out.uvs.resize(out.uvs.size() + output.vertexCount);
+        for (std::uint32_t vertex = 0; vertex < output.vertexCount; ++vertex) {
+            const xatlas::Vertex & source = output.vertexArray[vertex];
+            const std::uint32_t global = local_to_global[source.xref];
+            out.positions[vertex_base + vertex] = {
+                mesh.vertices[std::size_t(global) * 3 + 0],
+                mesh.vertices[std::size_t(global) * 3 + 1],
+                mesh.vertices[std::size_t(global) * 3 + 2]};
+            out.uvs[vertex_base + vertex] = {
+                source.uv[0] / static_cast<float>(atlas->width),
+                source.uv[1] / static_cast<float>(atlas->height)};
+        }
+        out.indices.reserve(out.indices.size() + output.indexCount);
+        for (std::uint32_t index = 0; index < output.indexCount; ++index) {
+            out.indices.push_back(vertex_base + output.indexArray[index]);
+        }
     }
-    out.indices.assign(output.indexArray, output.indexArray + output.indexCount);
+    const std::uint32_t atlas_width = atlas->width;
+    const std::uint32_t atlas_height = atlas->height;
     xatlas::Destroy(atlas);
+    if (out.indices.size() < 3 || out.positions.empty()) {
+        set_error(error, "xatlas produced no unwrapped faces");
+        return false;
+    }
+    if (atlas_width == 0 || atlas_height == 0) {
+        set_error(error, "xatlas produced a zero-sized atlas");
+        return false;
+    }
     return true;
 }
 
@@ -546,13 +706,30 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
     }
     TextureVolume volume;
     if (!make_texture_volume(texture_decoded, resolution, volume, error)) return false;
+    const auto export_start = std::chrono::steady_clock::now();
+    const auto phase_log = [&export_start](const std::string & label) {
+        std::cerr << "pixal3d: export " << label << " took "
+                  << std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - export_start).count()
+                  << " s" << std::endl;
+    };
+    phase_log("texture volume (" + std::to_string(texture_decoded.points()) +
+              " points)");
     std::vector<std::uint32_t> simplified_indices;
     if (!simplify_export_mesh(mesh, options.simplify_target, simplified_indices,
                               error)) return false;
+    phase_log("simplify (" + std::to_string(mesh.faces.size() / 3) + " -> " +
+              std::to_string(simplified_indices.size() / 3) + " faces)");
     ExportMesh mesh_export;
-    if (!unwrap_charts(mesh, simplified_indices, mesh_export, error)) return false;
+    if (!unwrap_charts(mesh, simplified_indices, options.texture_size,
+                       mesh_export, error)) return false;
+    phase_log("xatlas unwrap (" + std::to_string(mesh_export.positions.size()) +
+              " vertices, " + std::to_string(mesh_export.indices.size() / 3) +
+              " faces)");
     TextureBake bake;
     if (!bake_textures(mesh_export, volume, options.texture_size, bake, error)) return false;
+    phase_log("bake (" + std::to_string(bake.size) + "x" +
+              std::to_string(bake.size) + ")");
     std::vector<std::uint8_t> base_png;
     std::vector<std::uint8_t> mr_png;
     if (!encode_png(bake.base_color, bake.size, bake.size, 4, base_png, error) ||
