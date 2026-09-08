@@ -70,9 +70,12 @@ The SLat components are `shape_decoder|texture_decoder` and
 Run options are `--seed`, `--resolution 1024`, `--max-tokens`, `--steps` (>0),
 `--occupancy-threshold`, `--max-structure-points` (>0), `--fov` (0..pi radians),
 `--distance` (>0), `--mesh-scale` (>0), `--max-model-gib`, and
-`--texture-size` (1..4096 for `.glb` output). The native exporter defaults to a
-1024-pixel atlas; the official Python reference commonly uses a larger atlas
-for quality-oriented exports. GLB texture output requires a build with libpng;
+`--texture-size` (1..4096 for `.glb` output). The native exporter bakes a
+chart-unwrapped atlas: `meshopt_simplify` first decimates the export mesh to
+1,000,000 faces (the reference `to_glb` decimation target) because chart
+parameterization on the raw multi-million-face dual grid mesh is impractically
+slow, then xatlas - the same parameterization backend the reference wraps -
+computes the UVs. GLB texture output requires a build with libpng;
 PNM input remains available without PNG/JPEG support, and explicit `.obj`
 output remains geometry-only. The default final cascade resolution is `1024`,
 with seed `42`, 12 Euler steps, threshold `0`, and a front-view camera.
