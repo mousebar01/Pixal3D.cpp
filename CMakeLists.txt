@@ -112,6 +112,21 @@ target_include_directories(pixal3d_meshopt PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/meshoptimizer>")
 target_link_libraries(pixal3d_core PUBLIC pixal3d_meshopt)
 
+# Vendored mesh postprocess chain for the GLB export path
+# (third_party/trellis-postprocess, MIT; pwilkin/trellis.cpp 2516c48).
+# weld/clean/orient/decimate/holes + xatlas unwrap with trilinear voxel-PBR
+# bake; also uses the vendored xatlas and meshoptimizer targets above.
+add_library(pixal3d_trellis_post STATIC
+    third_party/trellis-postprocess/uv_bake.cpp
+    third_party/trellis-postprocess/decimate_qem.cpp
+    third_party/trellis-postprocess/tri_bvh.cpp
+)
+target_compile_features(pixal3d_trellis_post PUBLIC cxx_std_17)
+target_include_directories(pixal3d_trellis_post PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/trellis-postprocess>")
+target_link_libraries(pixal3d_trellis_post PUBLIC pixal3d_xatlas pixal3d_meshopt)
+target_link_libraries(pixal3d_core PUBLIC pixal3d_trellis_post)
+
 if(OpenMP_CXX_FOUND)
     target_link_libraries(pixal3d_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
