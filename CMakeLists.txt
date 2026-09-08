@@ -95,6 +95,23 @@ target_include_directories(pixal3d_core
 
 target_compile_features(pixal3d_core PUBLIC cxx_std_17)
 target_link_libraries(pixal3d_core PUBLIC ${PIXAL3D_GGML_TARGET})
+
+# Vendored chart parameterization backend for the GLB texture bake
+# (third_party/xatlas, MIT; jpcy/xatlas master f700c7790aaa030e794b52ba7791a05c085faf0c).
+add_library(pixal3d_xatlas STATIC third_party/xatlas/xatlas.cpp)
+target_compile_features(pixal3d_xatlas PUBLIC cxx_std_17)
+target_include_directories(pixal3d_xatlas PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/xatlas>")
+target_link_libraries(pixal3d_core PUBLIC pixal3d_xatlas)
+
+# Vendored mesh simplifier for the GLB export decimation pass
+# (third_party/meshoptimizer, MIT; zeux/meshoptimizer v1.2).
+add_library(pixal3d_meshopt STATIC third_party/meshoptimizer/simplifier.cpp)
+target_compile_features(pixal3d_meshopt PUBLIC cxx_std_17)
+target_include_directories(pixal3d_meshopt PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/meshoptimizer>")
+target_link_libraries(pixal3d_core PUBLIC pixal3d_meshopt)
+
 if(OpenMP_CXX_FOUND)
     target_link_libraries(pixal3d_core PUBLIC OpenMP::OpenMP_CXX)
 endif()

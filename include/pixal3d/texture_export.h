@@ -3,6 +3,7 @@
 #include "pixal3d/dual_grid.h"
 #include "pixal3d/sparse.h"
 
+#include <cstddef>
 #include <string>
 
 namespace pixal3d {
@@ -13,6 +14,12 @@ namespace pixal3d {
 // (x, y, z) -> (-x, +y, -z).
 struct Pixal3DGlbOptions {
     int texture_size = 1024;
+    // Face-count target for the export decimation pass (quadric simplification
+    // via the vendored meshoptimizer), matching the reference to_glb
+    // decimation_target.  Simplification runs before UV unwrapping because
+    // chart parameterization on the raw multi-million-face dual grid mesh is
+    // impractically slow.  0 keeps the raw mesh.
+    std::size_t simplify_target = 1000000;
 };
 
 // Write one mesh and its decoded Pixal3D PBR voxel attributes as a glTF 2.0

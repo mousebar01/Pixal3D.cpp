@@ -1,5 +1,8 @@
 #include "pixal3d/texture_export.h"
 
+#include <meshoptimizer.h>
+#include <xatlas.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -316,7 +319,89 @@ void fill_baked_gaps(TextureBake & bake) {
     }
 }
 
-bool bake_textures(const DualGridMeshF32 & mesh, const TextureVolume & volume,
+// Chart-unwrapped export mesh.  Chart seams duplicate vertices, so the
+// exported vertex set is generally larger than the decoder mesh's; positions
+// are identical because xatlas only splits and welds, never displaces.
+struct ExportMesh {
+    std::vector<Vec3> positions;
+    std::vector<Vec2> uvs;
+    std::vector<std::uint32_t> indices;
+};
+
+// Quadric simplification to the reference decimation target.  Mirrors the
+// reference to_glb standard branch, which always decimates before UV
+// unwrapping; running xatlas on the raw multi-million-face dual grid mesh is
+// impractically slow.  Indices reference the input vertex buffer unchanged.
+bool simplify_export_mesh(const DualGridMeshF32 & mesh, std::size_t target,
+                          std::vector<std::uint32_t> & indices,
+                          std::string * error) {
+    indices.assign(mesh.faces.size(), 0);
+    for (std::size_t index = 0; index < mesh.faces.size(); ++index) {
+        indices[index] = static_cast<std::uint32_t>(mesh.faces[index]);
+    }
+    if (target == 0 || mesh.faces.size() / 3 <= target) return true;
+    std::vector<std::uint32_t> destination(mesh.faces.size());
+    float result_error = 0.0f;
+    const std::size_t simplified = meshopt_simplify(
+        destination.data(), indices.data(), indices.size(), mesh.vertices.data(),
+        mesh.vertices.size() / 3, sizeof(float) * 3, target * 3, 1.0e-2f, 0,
+        &result_error);
+    if (simplified < 3 || simplified % 3 != 0) {
+        set_error(error, "mesh simplification produced no usable faces");
+        return false;
+    }
+    indices.assign(destination.begin(), destination.begin() + simplified);
+    return true;
+}
+
+// Parameterize the mesh with xatlas, the same backend the reference
+// postprocess wraps.  Positions and faces come from the canonical decoder
+// mesh; the UVs land in [0, 1] after packing.
+bool unwrap_charts(const DualGridMeshF32 & mesh,
+                   const std::vector<std::uint32_t> & indices, ExportMesh & out,
+                   std::string * error) {
+    const std::size_t vertex_count = mesh.vertices.size() / 3;
+    xatlas::Atlas * atlas = xatlas::Create();
+    xatlas::MeshDecl decl;
+    decl.vertexCount = static_cast<std::uint32_t>(vertex_count);
+    decl.vertexPositionData = mesh.vertices.data();
+    decl.vertexPositionStride = sizeof(float) * 3;
+    decl.indexCount = indices.size();
+    decl.indexData = indices.data();
+    decl.indexFormat = xatlas::IndexFormat::UInt32;
+    const xatlas::AddMeshError added = xatlas::AddMesh(atlas, decl);
+    if (added != xatlas::AddMeshError::Success) {
+        xatlas::Destroy(atlas);
+        set_error(error, std::string("xatlas rejected the export mesh: ") +
+                             xatlas::StringForEnum(added));
+        return false;
+    }
+    xatlas::Generate(atlas);
+    const xatlas::Mesh & output = atlas->meshes[0];
+    if (output.indexCount == 0 || output.vertexCount == 0 ||
+        atlas->width == 0 || atlas->height == 0) {
+        xatlas::Destroy(atlas);
+        set_error(error, "xatlas produced an empty UV atlas");
+        return false;
+    }
+    out.positions.resize(output.vertexCount);
+    out.uvs.resize(output.vertexCount);
+    for (std::uint32_t vertex = 0; vertex < output.vertexCount; ++vertex) {
+        const xatlas::Vertex & source = output.vertexArray[vertex];
+        out.positions[vertex] = {
+            mesh.vertices[static_cast<std::size_t>(source.xref) * 3 + 0],
+            mesh.vertices[static_cast<std::size_t>(source.xref) * 3 + 1],
+            mesh.vertices[static_cast<std::size_t>(source.xref) * 3 + 2]};
+        out.uvs[vertex] = {
+            source.uv[0] / static_cast<float>(atlas->width),
+            source.uv[1] / static_cast<float>(atlas->height)};
+    }
+    out.indices.assign(output.indexArray, output.indexArray + output.indexCount);
+    xatlas::Destroy(atlas);
+    return true;
+}
+
+bool bake_textures(const ExportMesh & mesh, const TextureVolume & volume,
                    int texture_size, TextureBake & bake, std::string * error) {
     bake = TextureBake{};
     bake.size = texture_size;
@@ -325,33 +410,11 @@ bool bake_textures(const DualGridMeshF32 & mesh, const TextureVolume & volume,
     bake.base_color.assign(pixels * 4, 0);
     bake.metallic_roughness.assign(pixels * 3, 0);
     bake.valid.assign(pixels, 0);
-    const std::size_t vertices = mesh.vertices.size() / 3;
-    std::vector<Vec3> positions(vertices);
-    std::vector<Vec3> normals(vertices, {0.0f, 0.0f, 0.0f});
-    std::vector<Vec2> uvs(vertices);
-    for (std::size_t vertex = 0; vertex < vertices; ++vertex) {
-        positions[vertex] = {mesh.vertices[vertex * 3 + 0], mesh.vertices[vertex * 3 + 1],
-                             mesh.vertices[vertex * 3 + 2]};
-        const Vec3 p = positions[vertex];
-        const float radius = std::sqrt(dot(p, p));
-        const float u = radius > 1.0e-20f ?
-            0.5f + std::atan2(p.y, p.x) / (2.0f * kPi) : 0.5f;
-        const float v = radius > 1.0e-20f ?
-            0.5f + std::asin(std::clamp(p.z / radius, -1.0f, 1.0f)) /
-                kPi : 0.5f;
-        uvs[vertex] = {u - std::floor(u), 1.0f - std::clamp(v, 0.0f, 1.0f)};
-    }
-    for (std::size_t face = 0; face < mesh.faces.size(); face += 3) {
-        const std::size_t ia = static_cast<std::size_t>(mesh.faces[face + 0]);
-        const std::size_t ib = static_cast<std::size_t>(mesh.faces[face + 1]);
-        const std::size_t ic = static_cast<std::size_t>(mesh.faces[face + 2]);
-        const Vec3 e1 = positions[ib] - positions[ia];
-        const Vec3 e2 = positions[ic] - positions[ia];
-        const Vec3 normal = cross(e1, e2);
-        normals[ia] = normals[ia] + normal;
-        normals[ib] = normals[ib] + normal;
-        normals[ic] = normals[ic] + normal;
-        std::array<Vec2, 3> uv = {uvs[ia], uvs[ib], uvs[ic]};
+    for (std::size_t face = 0; face < mesh.indices.size() / 3; ++face) {
+        const std::size_t ia = static_cast<std::size_t>(mesh.indices[face * 3 + 0]);
+        const std::size_t ib = static_cast<std::size_t>(mesh.indices[face * 3 + 1]);
+        const std::size_t ic = static_cast<std::size_t>(mesh.indices[face * 3 + 2]);
+        std::array<Vec2, 3> uv = {mesh.uvs[ia], mesh.uvs[ib], mesh.uvs[ic]};
         const float minimum_u = std::min({uv[0].x, uv[1].x, uv[2].x});
         const float maximum_u = std::max({uv[0].x, uv[1].x, uv[2].x});
         if (maximum_u - minimum_u > 0.5f) {
@@ -376,7 +439,8 @@ bool bake_textures(const DualGridMeshF32 & mesh, const TextureVolume & volume,
                         (static_cast<float>(y) + 0.5f) / static_cast<float>(texture_size)};
                     float w0 = 0.0f, w1 = 0.0f, w2 = 0.0f;
                     if (!barycentric(sample_uv, shifted[0], shifted[1], shifted[2], w0, w1, w2)) continue;
-                    const Vec3 position = positions[ia] * w0 + positions[ib] * w1 + positions[ic] * w2;
+                    const Vec3 position = mesh.positions[ia] * w0 + mesh.positions[ib] * w1 +
+                                          mesh.positions[ic] * w2;
                     float weight_sum = 0.0f;
                     const std::array<float, 6> value =
                         sample_volume(volume, position, weight_sum);
@@ -393,7 +457,6 @@ bool bake_textures(const DualGridMeshF32 & mesh, const TextureVolume & volume,
         return false;
     }
     fill_baked_gaps(bake);
-    for (std::size_t vertex = 0; vertex < vertices; ++vertex) normals[vertex] = normalize(normals[vertex]);
     return true;
 }
 
@@ -483,35 +546,27 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
     }
     TextureVolume volume;
     if (!make_texture_volume(texture_decoded, resolution, volume, error)) return false;
+    std::vector<std::uint32_t> simplified_indices;
+    if (!simplify_export_mesh(mesh, options.simplify_target, simplified_indices,
+                              error)) return false;
+    ExportMesh mesh_export;
+    if (!unwrap_charts(mesh, simplified_indices, mesh_export, error)) return false;
     TextureBake bake;
-    if (!bake_textures(mesh, volume, options.texture_size, bake, error)) return false;
+    if (!bake_textures(mesh_export, volume, options.texture_size, bake, error)) return false;
     std::vector<std::uint8_t> base_png;
     std::vector<std::uint8_t> mr_png;
     if (!encode_png(bake.base_color, bake.size, bake.size, 4, base_png, error) ||
         !encode_png(bake.metallic_roughness, bake.size, bake.size, 3, mr_png, error)) return false;
 
-    const std::size_t vertex_count = mesh.vertices.size() / 3;
-    const std::size_t index_count = mesh.faces.size();
+    const std::size_t vertex_count = mesh_export.positions.size();
+    const std::size_t index_count = mesh_export.indices.size();
     std::vector<Vec3> normals(vertex_count, {0.0f, 0.0f, 0.0f});
-    std::vector<Vec3> positions(vertex_count);
-    std::vector<Vec2> uvs(vertex_count);
-    for (std::size_t vertex = 0; vertex < vertex_count; ++vertex) {
-        positions[vertex] = {mesh.vertices[vertex * 3 + 0], mesh.vertices[vertex * 3 + 1],
-                             mesh.vertices[vertex * 3 + 2]};
-        const Vec3 p = positions[vertex];
-        const float radius = std::sqrt(dot(p, p));
-        const float u = radius > 1.0e-20f ?
-            0.5f + std::atan2(p.y, p.x) / (2.0f * kPi) : 0.5f;
-        const float v = radius > 1.0e-20f ?
-            0.5f + std::asin(std::clamp(p.z / radius, -1.0f, 1.0f)) /
-                kPi : 0.5f;
-        uvs[vertex] = {u - std::floor(u), 1.0f - std::clamp(v, 0.0f, 1.0f)};
-    }
     for (std::size_t face = 0; face < index_count; face += 3) {
-        const std::size_t ia = static_cast<std::size_t>(mesh.faces[face + 0]);
-        const std::size_t ib = static_cast<std::size_t>(mesh.faces[face + 1]);
-        const std::size_t ic = static_cast<std::size_t>(mesh.faces[face + 2]);
-        const Vec3 normal = cross(positions[ib] - positions[ia], positions[ic] - positions[ia]);
+        const std::size_t ia = static_cast<std::size_t>(mesh_export.indices[face + 0]);
+        const std::size_t ib = static_cast<std::size_t>(mesh_export.indices[face + 1]);
+        const std::size_t ic = static_cast<std::size_t>(mesh_export.indices[face + 2]);
+        const Vec3 normal = cross(mesh_export.positions[ib] - mesh_export.positions[ia],
+                                  mesh_export.positions[ic] - mesh_export.positions[ia]);
         normals[ia] = normals[ia] + normal;
         normals[ib] = normals[ib] + normal;
         normals[ic] = normals[ic] + normal;
@@ -537,11 +592,13 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
     // Match the final coordinate frame of the Python textured GLB path.
     // o_voxel.postprocess.to_glb() first maps (x, y, z) -> (x, z, -y),
     // then Pixal3D applies (-x, -z, -y), yielding H=(-x, +y, -z).
-    const Vec3 first_exported{-positions.front().x, positions.front().y, -positions.front().z};
+    const Vec3 first_exported{-mesh_export.positions.front().x,
+                              mesh_export.positions.front().y,
+                              -mesh_export.positions.front().z};
     Vec3 minimum = first_exported;
     Vec3 maximum = first_exported;
     for (std::size_t vertex = 0; vertex < vertex_count; ++vertex) {
-        const Vec3 p = positions[vertex];
+        const Vec3 p = mesh_export.positions[vertex];
         const Vec3 exported{-p.x, p.y, -p.z};
         append_f32(position_bytes, exported.x);
         append_f32(position_bytes, exported.y);
@@ -551,8 +608,8 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
         append_f32(normal_bytes, exported_normal.x);
         append_f32(normal_bytes, exported_normal.y);
         append_f32(normal_bytes, exported_normal.z);
-        append_f32(uv_bytes, uvs[vertex].x);
-        append_f32(uv_bytes, uvs[vertex].y);
+        append_f32(uv_bytes, mesh_export.uvs[vertex].x);
+        append_f32(uv_bytes, mesh_export.uvs[vertex].y);
         minimum.x = std::min(minimum.x, exported.x);
         minimum.y = std::min(minimum.y, exported.y);
         minimum.z = std::min(minimum.z, exported.z);
@@ -560,7 +617,7 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
         maximum.y = std::max(maximum.y, exported.y);
         maximum.z = std::max(maximum.z, exported.z);
     }
-    for (std::int32_t index : mesh.faces) append_u32(index_bytes, static_cast<std::uint32_t>(index));
+    for (std::uint32_t index : mesh_export.indices) append_u32(index_bytes, index);
     const std::size_t position_offset = append_blob(position_bytes.data(), position_bytes.size());
     const std::size_t normal_offset = append_blob(normal_bytes.data(), normal_bytes.size());
     const std::size_t uv_offset = append_blob(uv_bytes.data(), uv_bytes.size());
