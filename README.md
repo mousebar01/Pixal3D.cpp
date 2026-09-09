@@ -151,6 +151,14 @@ frame, the equivalent reference-facing view is on the `-Y` side, looking toward
 These export conversions only change coordinate frames; they do not fill
 missing geometry or replace the Python CuMesh remesh/decimation postprocess.
 
+A headless preview of the textured GLB is available with
+`blender -b -P scripts/render_glb_preview.py -- <model.glb> <out_prefix>`.
+Its orbit azimuths follow the multiview dataset naming (azim000 is the front
+view), and `--transforms <path/to/transforms.json>` reproduces the capture
+viewpoints and field of view exactly.  The capture matrices predate the
+GLB's H flip, so the script applies the matching 180-degree turn before
+placing the cameras.
+
 
 ## Resolution support
 
