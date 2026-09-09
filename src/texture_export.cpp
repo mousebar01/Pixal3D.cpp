@@ -323,9 +323,9 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
     index_bytes.reserve(index_count * 4);
     // Match the final coordinate frame of the Python textured GLB path.
     // o_voxel.postprocess.to_glb() first maps (x, y, z) -> (x, z, -y),
-    // then Pixal3D applies (-x, -z, -y), yielding H=(-x, +y, -z).  The baked
-    // UVs are stored in the bake's internal convention, so apply the same
-    // V-flip the trellis GLB writer applies before serialization.
+    // then Pixal3D applies (-x, -z, -y), yielding H=(-x, +y, -z).  The
+    // trellis uv_bake emits GLB-convention UVs directly (verified by render
+    // comparison); applying the reference's V-flip here mirrors the texture.
     const Vec3 first_exported{-positions.front().x, positions.front().y,
                               -positions.front().z};
     Vec3 minimum = first_exported;
@@ -342,7 +342,7 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
         append_f32(normal_bytes, exported_normal.y);
         append_f32(normal_bytes, exported_normal.z);
         append_f32(uv_bytes, baked.uv[vertex * 2 + 0]);
-        append_f32(uv_bytes, 1.0f - baked.uv[vertex * 2 + 1]);
+        append_f32(uv_bytes, baked.uv[vertex * 2 + 1]);
         minimum.x = std::min(minimum.x, exported.x);
         minimum.y = std::min(minimum.y, exported.y);
         minimum.z = std::min(minimum.z, exported.z);
