@@ -1,3 +1,5 @@
+// Fast-Quadric-Mesh-Simplify header used by mesh_qem_decimate.cpp
+// (Sven Forstmann 2014, MIT; vendored via pwilkin/trellis.cpp thirdparty/fqms).
 /////////////////////////////////////////////
 //
 // Mesh Simplification Tutorial

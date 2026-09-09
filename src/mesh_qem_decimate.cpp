@@ -6,7 +6,7 @@
 // threshold-ladder driver (thresh=1e-8, x10 when a round removes <1% of faces, until the
 // face target is met). This replaces the meshopt/FQMS stand-in whose non-adaptive, sliny
 // output was the geometry-quality gap vs the reference (issues #1/#2).
-#include "uv_bake.h"
+#include "pixal3d/mesh_postprocess.h"
 #include <vector>
 #include <cstdint>
 #include <cstring>
@@ -16,7 +16,7 @@
 #include <limits>
 #include <unordered_map>
 
-namespace trellis {
+namespace pixal3d {
 
 // Self-contained CUDA/HIP port (src/decimate_qem.cu). Guarded prototype: only present when
 // a GPU backend was compiled in; falls through to the CPU path below on false / failure.
@@ -247,4 +247,4 @@ void decimate_qem(const std::vector<float>& in_verts, int V0, const std::vector<
     fflush(stdout);
 }
 
-} // namespace trellis
+} // namespace pixal3d

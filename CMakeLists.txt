@@ -83,6 +83,9 @@ add_library(pixal3d_core
     src/ss_decoder.cpp
     src/ss_flow.cpp
     src/texture_export.cpp
+    src/mesh_postprocess.cpp
+    src/mesh_qem_decimate.cpp
+    src/tri_bvh.cpp
     src/vision_condition.cpp
     src/image.cpp
 )
@@ -104,28 +107,13 @@ target_include_directories(pixal3d_xatlas PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/xatlas>")
 target_link_libraries(pixal3d_core PUBLIC pixal3d_xatlas)
 
-# Vendored mesh simplifier for the GLB export decimation pass
-# (third_party/meshoptimizer, MIT; zeux/meshoptimizer v1.2).
-add_library(pixal3d_meshopt STATIC third_party/meshoptimizer/simplifier.cpp)
-target_compile_features(pixal3d_meshopt PUBLIC cxx_std_17)
-target_include_directories(pixal3d_meshopt PUBLIC
-    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/meshoptimizer>")
-target_link_libraries(pixal3d_core PUBLIC pixal3d_meshopt)
-
 # Vendored mesh postprocess chain for the GLB export path
 # (third_party/trellis-postprocess, MIT; pwilkin/trellis.cpp 2516c48).
 # weld/clean/orient/decimate/holes + xatlas unwrap with trilinear voxel-PBR
 # bake; also uses the vendored xatlas and meshoptimizer targets above.
-add_library(pixal3d_trellis_post STATIC
-    third_party/trellis-postprocess/uv_bake.cpp
-    third_party/trellis-postprocess/decimate_qem.cpp
-    third_party/trellis-postprocess/tri_bvh.cpp
-)
-target_compile_features(pixal3d_trellis_post PUBLIC cxx_std_17)
-target_include_directories(pixal3d_trellis_post PUBLIC
-    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/trellis-postprocess>")
-target_link_libraries(pixal3d_trellis_post PUBLIC pixal3d_xatlas pixal3d_meshopt)
-target_link_libraries(pixal3d_core PUBLIC pixal3d_trellis_post)
+# The mesh postprocess sources (mesh_postprocess.cpp, mesh_qem_decimate.cpp,
+# tri_bvh.cpp) are compiled directly into pixal3d_core; they use the vendored
+# xatlas target above.
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(pixal3d_core PUBLIC OpenMP::OpenMP_CXX)

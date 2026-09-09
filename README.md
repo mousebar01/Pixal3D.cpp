@@ -71,8 +71,8 @@ Run options are `--seed`, `--resolution 1024`, `--max-tokens`, `--steps` (>0),
 `--occupancy-threshold`, `--max-structure-points` (>0), `--fov` (0..pi radians),
 `--distance` (>0), `--mesh-scale` (>0), `--max-model-gib`, and
 `--texture-size` (1..4096 for `.glb` output). The native exporter bakes a
-chart-unwrapped atlas through the mesh postprocess chain vendored from
-trellis.cpp (`third_party/trellis-postprocess`, MIT): weld hairline cracks,
+chart-unwrapped atlas through the mesh postprocess chain in
+`src/mesh_postprocess.cpp` (adapted from pwilkin/trellis.cpp, MIT): weld hairline cracks,
 unify face winding, drop floating fragments, Taubin-smooth the voxel
 stair-step noise, then a CuMesh-port QEM decimation to the reference 1,000,000
 face target (the reference `to_glb` decimation target), hole filling, and

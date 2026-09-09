@@ -1,7 +1,7 @@
 #include "pixal3d/texture_export.h"
 
-#include "tri_bvh.h"
-#include "uv_bake.h"
+#include "pixal3d/mesh_postprocess.h"
+#include "pixal3d/tri_bvh.h"
 
 #include <algorithm>
 #include <array>
@@ -225,14 +225,14 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
                                texture_decoded.coords[point * 4 + 2],
                                texture_decoded.coords[point * 4 + 3]};
     }
-    trellis::VoxelPbr vox;
+    VoxelPbr vox;
     vox.coords = &voxel_coords;
     vox.feats = &texture_decoded.feats;
     vox.res = resolution;
 
-    // Mesh postprocess chain from the vendored trellis.cpp modules (see
-    // third_party/trellis-postprocess): weld hairline cracks, unify winding,
-    // drop floating fragments, Taubin-smooth the voxel stair-step noise, then
+    // Mesh postprocess chain (mesh_postprocess.cpp, adapted from
+    // pwilkin/trellis.cpp): weld hairline cracks, unify winding, drop
+    // floating fragments, Taubin-smooth the voxel stair-step noise, then
     // CuMesh-port QEM decimation to the reference target and hole filling.
     // The dual grid mesh ships inconsistently wound, cracked, and too sliver
     // heavy for a plain meshopt pass; this chain is the same one trellis.cpp
@@ -246,30 +246,30 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
                          std::chrono::steady_clock::now() - export_start).count()
                   << " s" << std::endl;
     };
-    trellis::weld_vertices(verts, faces, nullptr, 1.0f / 8192.0f);
-    trellis::clean_mesh(static_cast<int>(verts.size() / 3), faces);
-    trellis::drop_small_components(verts, faces, 0.02f);
-    trellis::taubin_smooth(verts, faces, 5, 0.5f, -0.53f);
+    weld_vertices(verts, faces, nullptr, 1.0f / 8192.0f);
+    clean_mesh(static_cast<int>(verts.size() / 3), faces);
+    drop_small_components(verts, faces, 0.02f);
+    taubin_smooth(verts, faces, 5, 0.5f, -0.53f);
     phase_log("weld+clean+smooth (" + std::to_string(faces.size() / 3) + " faces)");
 
     // Snap BVH over the pre-decimation surface, the equivalent of the
     // reference cuBVH off-shell correction for texels between voxels.
-    trellis::TriBvh snap_bvh = trellis::TriBvh::build(
+    TriBvh snap_bvh = TriBvh::build(
         verts.data(), static_cast<std::int64_t>(verts.size() / 3),
         faces.data(), static_cast<std::int64_t>(faces.size() / 3));
     vox.snap = &snap_bvh;
 
     std::vector<float> decimated_verts;
     std::vector<std::int32_t> decimated_faces;
-    trellis::decimate_qem(verts, static_cast<int>(verts.size() / 3), faces,
+    decimate_qem(verts, static_cast<int>(verts.size() / 3), faces,
                           static_cast<int>(faces.size() / 3),
                           static_cast<int>(options.simplify_target),
                           decimated_verts, decimated_faces);
-    trellis::fill_small_holes(decimated_faces, 64);
+    fill_small_holes(decimated_faces, 64);
     phase_log("qem decimate (" + std::to_string(faces.size() / 3) + " -> " +
               std::to_string(decimated_faces.size() / 3) + " faces)");
 
-    const trellis::BakedMesh baked = trellis::uv_bake(
+    const BakedMesh baked = uv_bake(
         decimated_verts, static_cast<int>(decimated_verts.size() / 3),
         decimated_faces, static_cast<int>(decimated_faces.size() / 3),
         {}, options.texture_size, &vox);
@@ -324,7 +324,7 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
     // Match the final coordinate frame of the Python textured GLB path.
     // o_voxel.postprocess.to_glb() first maps (x, y, z) -> (x, z, -y),
     // then Pixal3D applies (-x, -z, -y), yielding H=(-x, +y, -z).  The
-    // trellis uv_bake emits GLB-convention UVs directly (verified by render
+    // uv_bake emits GLB-convention UVs directly (verified by render
     // comparison); applying the reference's V-flip here mirrors the texture.
     const Vec3 first_exported{-positions.front().x, positions.front().y,
                               -positions.front().z};

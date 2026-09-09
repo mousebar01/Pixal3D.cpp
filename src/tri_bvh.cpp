@@ -1,9 +1,9 @@
-#include "tri_bvh.h"
+#include "pixal3d/tri_bvh.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 
-namespace trellis {
+namespace pixal3d {
 
 namespace {
 
@@ -156,4 +156,4 @@ TriBvh::Hit TriBvh::closest(const float p[3], float max_dist) const {
     return hit;
 }
 
-}  // namespace trellis
+}  // namespace pixal3d

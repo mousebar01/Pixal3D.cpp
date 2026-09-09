@@ -1,3 +1,5 @@
+// Median-split AABB triangle tree with exact closest-point queries.
+// Adapted from pwilkin/trellis.cpp 2516c48b (MIT).
 // Median-split AABB tree over triangles with exact closest-point queries.
 // Non-owning: the caller's vertex/index arrays must outlive the tree. Used by
 // the texture bake (per-texel snap to the original surface, mirroring the
@@ -7,7 +9,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace trellis {
+namespace pixal3d {
 
 class TriBvh {
 public:
@@ -34,4 +36,4 @@ private:
     const int32_t* faces_ = nullptr;
 };
 
-}  // namespace trellis
+}  // namespace pixal3d
