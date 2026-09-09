@@ -183,7 +183,9 @@ only one stage; a production cascade needs all four stages or the in-memory API.
 
 ## Model packs and conversion
 
-Keep checkpoints, GGUF files, conditions, latent dumps, OBJ/GLB outputs, and
+Converted GGUF model packs are published in the [Pixal3D.cpp Hugging Face
+repository](https://huggingface.co/mousebar01/Pixal3D.cpp-GGUF). Keep
+checkpoints, GGUF files, conditions, latent dumps, OBJ/GLB outputs, and
 texture images outside Git. Pixal3D weights are stored under the ignored
 directory `weights/Pixal3D/`.
 The NAF release is stored under `weights/NAF/`.
