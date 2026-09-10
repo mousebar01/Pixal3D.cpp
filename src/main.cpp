@@ -40,10 +40,9 @@ void print_usage(const char * program, std::ostream & out) {
 
         << "  " << program << " run-image <shared.gguf> <flow.gguf> <dino.gguf>"
         << " <naf.gguf> <input-image> [output.obj|output.glb] [options]\n\n"
-        << "      default output is output.glb; the camera is estimated per"
-        << " image with MoGe-2 (override with --camera auto|default,"
-        << " --moge-onnx <path>); run-image also accepts --vision-resolution N"
-        << " (smoke test)\n\n"
+        << "      default output is output.glb; camera estimation with MoGe-2"
+        << " is required (--moge-onnx <path> overrides its model); run-image"
+        << " also accepts --vision-resolution N (smoke test)\n\n"
         << "  " << program << " run-cascade-mv <shared.gguf> <mv-flow.gguf>"
         << " <conditions.p3dmvcon> [output.obj|output.glb] [options]\n\n"
         << "  " << program << " inspect-dinodata <condition.dinodata>\n\n"
@@ -103,18 +102,6 @@ bool parse_float(const char * text, float & value) {
 }
 
 struct CameraEstimation {
-    enum class Mode {
-        // Default: estimate with MoGe-2 when onnxruntime and the model are
-        // available; otherwise warn and keep the fixed front camera.
-        kPreferAuto,
-        // --camera auto: require estimation; fail loudly when unavailable.
-        kForceAuto,
-        // --camera default: always use the fixed front camera.
-        kForceDefault,
-    };
-    Mode mode = Mode::kPreferAuto;
-    bool explicit_fov = false;
-    bool explicit_distance = false;
     std::string moge_onnx_path = "weights/MoGe/moge-2-vitl-normal.onnx";
 };
 
@@ -197,34 +184,30 @@ bool parse_cascade_options(int argc, char ** argv, int first,
             }
             config.cascade.max_structure_points = static_cast<std::size_t>(points);
         } else if (option == "--fov" && index < argc) {
+            if (camera_estimation) {
+                if (error) *error = "--fov cannot be used with run-image; MoGe camera estimation is required";
+                return false;
+            }
             if (!parse_float(argv[index++], config.camera.camera_angle_x) ||
                 !(config.camera.camera_angle_x > 0.0f &&
                   config.camera.camera_angle_x < 3.1415927f)) {
                 if (error) *error = "--fov must be in (0, pi) radians";
                 return false;
             }
-            if (camera_estimation) camera_estimation->explicit_fov = true;
         } else if (option == "--distance" && index < argc) {
+            if (camera_estimation) {
+                if (error) *error = "--distance cannot be used with run-image; MoGe camera estimation is required";
+                return false;
+            }
             if (!parse_float(argv[index++], config.camera.distance) ||
                 !(config.camera.distance > 0.0f)) {
                 if (error) *error = "--distance must be positive";
                 return false;
             }
-            if (camera_estimation) camera_estimation->explicit_distance = true;
-        } else if (option == "--camera" && index < argc && camera_estimation) {
-            const std::string mode = argv[index++];
-            if (mode == "auto") {
-                camera_estimation->mode = CameraEstimation::Mode::kForceAuto;
-            } else if (mode == "default") {
-                camera_estimation->mode = CameraEstimation::Mode::kForceDefault;
-            } else {
-                if (error) *error = "--camera must be auto or default";
-                return false;
-            }
         } else if (option == "--moge-onnx" && index < argc && camera_estimation) {
             camera_estimation->moge_onnx_path = argv[index++];
-        } else if ((option == "--camera" || option == "--moge-onnx") && !camera_estimation) {
-            if (error) *error = std::string(option) + " is only available for run-image";
+        } else if (option == "--moge-onnx" && !camera_estimation) {
+            if (error) *error = "--moge-onnx is only available for run-image";
             return false;
         } else if (option == "--mesh-scale" && index < argc) {
             if (!parse_float(argv[index++], config.camera.mesh_scale) ||
@@ -252,6 +235,25 @@ bool parse_cascade_options(int argc, char ** argv, int first,
         config.camera.camera_angle_x, config.camera.distance,
         config.camera.mesh_scale);
     return true;
+}
+
+std::string resolve_moge_model_path(const std::string & configured,
+                                    const char * program) {
+    const std::filesystem::path configured_path(configured);
+    if (configured_path.is_absolute() || std::filesystem::exists(configured_path)) {
+        return configured;
+    }
+    std::error_code filesystem_error;
+    std::filesystem::path executable =
+        std::filesystem::absolute(program, filesystem_error);
+    if (filesystem_error) return configured;
+    executable = executable.parent_path();
+    for (int level = 0; level < 4 && !executable.empty(); ++level) {
+        const std::filesystem::path candidate = executable / configured_path;
+        if (std::filesystem::exists(candidate)) return candidate.string();
+        executable = executable.parent_path();
+    }
+    return configured;
 }
 
 bool has_suffix(const std::string & path, const char * suffix) {
@@ -563,59 +565,41 @@ int main(int argc, char ** argv) {
             std::cerr << "error: " << error << "\n";
             return 1;
         }
-        // Resolve the camera before loading the vision models so an unusable
-        // MoGe setup fails in milliseconds instead of after gigabytes load.
-        bool estimate_camera = false;
-        switch (camera_estimation.mode) {
-        case CameraEstimation::Mode::kForceAuto:
-            if (camera_estimation.explicit_fov || camera_estimation.explicit_distance) {
-                std::cerr << "error: --camera auto cannot be combined with an "
-                             "explicit --fov/--distance\n";
-                return 2;
-            }
-            estimate_camera = true;
-            break;
-        case CameraEstimation::Mode::kForceDefault:
-            break;
-        case CameraEstimation::Mode::kPreferAuto:
-            if (camera_estimation.explicit_fov || camera_estimation.explicit_distance) {
-                break;  // an explicit camera wins over the default preference
-            }
-            if (!pixal3d::moge_camera_supported()) {
-                std::cerr << "pixal3d: warning: camera estimation unavailable "
-                             "(built without onnxruntime; reconfigure with "
-                             "PIXAL3D_ONNXRUNTIME_ROOT); using the default front "
-                             "camera, pass --camera default to silence\n";
-            } else if (!std::filesystem::exists(camera_estimation.moge_onnx_path)) {
-                std::cerr << "pixal3d: warning: MoGe model missing at "
-                          << camera_estimation.moge_onnx_path
-                          << " (run scripts/download_moge_weights.sh); using the "
-                             "default front camera, pass --camera default to silence"
-                          << std::endl;
-            } else {
-                estimate_camera = true;
-            }
-            break;
+        // MoGe is a required preflight for run-image. Resolve the camera before
+        // loading the vision models so a missing runtime or model fails before
+        // allocating gigabytes of model memory.
+        camera_estimation.moge_onnx_path = resolve_moge_model_path(
+            camera_estimation.moge_onnx_path, argv[0]);
+        if (!pixal3d::moge_camera_supported()) {
+            std::cerr << "error: run-image requires MoGe camera estimation, but this "
+                         "binary was built without onnxruntime; configure with "
+                         "-DPIXAL3D_ONNXRUNTIME_ROOT=<onnxruntime-root>\n";
+            return 1;
         }
-        if (estimate_camera) {
-            // The reference wild path estimates the camera from the
-            // preprocessed condition image, not from the raw input.
-            pixal3d::Pixal3DImageF32 preprocessed;
-            if (!pixal3d::preprocess_pixal3d_image_f32(image, preprocessed, &error)) {
-                std::cerr << "error: " << error << "\n";
-                return 1;
-            }
-            pixal3d::MoGeCameraOptions moge_options;
-            if (!pixal3d::estimate_pixal3d_camera_with_moge_f32(
-                    preprocessed, camera_estimation.moge_onnx_path, moge_options,
-                    config.camera, &error)) {
-                std::cerr << "error: " << error << "\n";
-                return 1;
-            }
-            std::cout << std::fixed << std::setprecision(6)
-                      << "camera_estimated: " << config.camera.camera_angle_x << " rad, "
-                      << config.camera.distance << "\n";
+        if (!std::filesystem::exists(camera_estimation.moge_onnx_path)) {
+            std::cerr << "error: run-image requires the MoGe model at "
+                      << camera_estimation.moge_onnx_path
+                      << "; run scripts/download_moge_weights.sh or pass "
+                         "--moge-onnx <path>\n";
+            return 1;
         }
+        // The reference wild path estimates the camera from the preprocessed
+        // condition image, not from the raw input.
+        pixal3d::Pixal3DImageF32 preprocessed;
+        if (!pixal3d::preprocess_pixal3d_image_f32(image, preprocessed, &error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+        pixal3d::MoGeCameraOptions moge_options;
+        if (!pixal3d::estimate_pixal3d_camera_with_moge_f32(
+                preprocessed, camera_estimation.moge_onnx_path, moge_options,
+                config.camera, &error)) {
+            std::cerr << "error: " << error << "\n";
+            return 1;
+        }
+        std::cout << std::fixed << std::setprecision(6)
+                  << "camera_estimated: " << config.camera.camera_angle_x << " rad, "
+                  << config.camera.distance << "\n";
         pixal3d::DinoV3Model dino_model;
         pixal3d::NafModel naf_model;
         std::cerr << "pixal3d: loading DINOv3 tensors" << std::endl;

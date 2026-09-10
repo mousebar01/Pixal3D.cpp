@@ -131,26 +131,28 @@ if(JPEG_FOUND)
     target_link_libraries(pixal3d_core PUBLIC ${JPEG_LIBRARIES})
 endif()
 
-# Optional MoGe-2 ONNX camera estimation (pixal3d/moge_camera.h).  Point
+# MoGe-2 ONNX camera estimation is required by the run-image path. Point
 # PIXAL3D_ONNXRUNTIME_ROOT at a prebuilt onnxruntime tree that contains
 # include/onnxruntime_cxx_api.h and lib/libonnxruntime.so.
 set(PIXAL3D_ONNXRUNTIME_ROOT "" CACHE PATH
-    "Prebuilt onnxruntime root directory (optional)")
+    "Prebuilt onnxruntime root directory (required for run-image)")
 find_path(ONNXRUNTIME_INCLUDE_DIR
     onnxruntime_cxx_api.h
     HINTS "${PIXAL3D_ONNXRUNTIME_ROOT}/include")
 find_library(ONNXRUNTIME_LIBRARY
     onnxruntime
     HINTS "${PIXAL3D_ONNXRUNTIME_ROOT}/lib")
-if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIBRARY)
-    set(PIXAL3D_HAVE_ONNXRUNTIME TRUE)
-    target_compile_definitions(pixal3d_core PUBLIC PIXAL3D_HAVE_ONNXRUNTIME=1)
-    target_include_directories(pixal3d_core PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-    target_link_libraries(pixal3d_core PUBLIC ${ONNXRUNTIME_LIBRARY})
-    message(STATUS "MoGe camera estimation enabled (onnxruntime: ${ONNXRUNTIME_LIBRARY})")
-else()
-    message(STATUS "MoGe camera estimation disabled (set PIXAL3D_ONNXRUNTIME_ROOT to enable)")
+if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIBRARY)
+    message(FATAL_ERROR
+        "MoGe camera estimation requires onnxruntime. Set "
+        "PIXAL3D_ONNXRUNTIME_ROOT to a tree containing "
+        "include/onnxruntime_cxx_api.h and lib/libonnxruntime.so.")
 endif()
+set(PIXAL3D_HAVE_ONNXRUNTIME TRUE)
+target_compile_definitions(pixal3d_core PUBLIC PIXAL3D_HAVE_ONNXRUNTIME=1)
+target_include_directories(pixal3d_core PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+target_link_libraries(pixal3d_core PUBLIC ${ONNXRUNTIME_LIBRARY})
+message(STATUS "MoGe camera estimation enabled (required; onnxruntime: ${ONNXRUNTIME_LIBRARY})")
 
 if(PIXAL3D_ENABLE_CUDA)
     target_compile_definitions(pixal3d_core PUBLIC PIXAL3D_ENABLE_CUDA=1)

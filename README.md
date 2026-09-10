@@ -15,12 +15,16 @@ unrestricted Python parity and production image quality are not claimed.
 - PNG/JPEG development libraries are optional; PNM (`P2`, `P3`, `P5`, `P6`)
   input is always available
 - OpenMP is optional
+- ONNX Runtime is required for MoGe camera estimation and `run-image`
 
-Initialize the submodule and make a portable CPU build:
+Initialize the submodule and make a portable CPU build. Set
+`PIXAL3D_ONNXRUNTIME_ROOT` to a prebuilt ONNX Runtime tree containing
+`include/onnxruntime_cxx_api.h` and `lib/libonnxruntime.so`:
 
 ```sh
 git submodule update --init --recursive
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+  -DPIXAL3D_ONNXRUNTIME_ROOT=/path/to/onnxruntime
 cmake --build build --parallel
 (cd build && ctest --output-on-failure)
 ./build/bin/pixal3d --help
@@ -70,7 +74,9 @@ The SLat components are `shape_decoder|texture_decoder` and
 Run options are `--seed`, `--resolution 1024`, `--max-tokens`, `--steps` (>0),
 `--occupancy-threshold`, `--max-structure-points` (>0), `--fov` (0..pi radians),
 `--distance` (>0), `--mesh-scale` (>0), `--max-model-gib`, and
-`--texture-size` (1..4096 for `.glb` output). The native exporter bakes a
+`--texture-size` (1..4096 for `.glb` output). `--fov` and `--distance` apply to
+explicit-condition cascade commands; `run-image` always estimates its camera
+with MoGe. The native exporter bakes a
 chart-unwrapped atlas through the mesh postprocess chain in
 `src/mesh_postprocess.cpp` (adapted from pwilkin/trellis.cpp, MIT): weld hairline cracks,
 unify face winding, drop floating fragments, Taubin-smooth the voxel
@@ -99,39 +105,31 @@ wide default front camera (`--fov 0.8576 --distance 2.0`, the TRELLIS render
 convention) can place the subject outside the conditioning volume, and the
 generative stages then truncate it (for example a figure without its head).
 
-`run-image` therefore estimates the camera per image by default, matching the
-reference `inference.py` wild path: the official MoGe-2 ONNX export
+`run-image` always estimates the camera per image, matching the reference
+`inference.py` wild path: the official MoGe-2 ONNX export
 (`Ruicheng/moge-2-vitl-normal-onnx`) runs through onnxruntime, the pinhole
 focal is recovered from the predicted point map with the reference
 `recover_focal_shift` fit (64x64 nearest downsample plus a one-parameter
 Levenberg-Marquardt solve), and the distance follows the reference
 `distance_from_fov` rule, which keeps the subject inside the conditioning
 volume. The estimate is printed as `camera_estimated:` and echoed in the run
-summary as `camera:`. Explicit `--fov`/`--distance` still win over the
-estimation and skip it.
+summary as `camera:`. `run-image` does not accept explicit `--fov` or
+`--distance`; those options remain available for explicit-condition cascade
+commands.
 
-When onnxruntime or the model file is unavailable the run falls back to the
-fixed front camera with a loud `pixal3d: warning:` naming the reason
-(estimate ~2 degrees from the reference path, well inside the pipeline's
-tolerance, but not bit-identical). `--moge-onnx <path>` selects the model
-file; the default location is `weights/MoGe/moge-2-vitl-normal.onnx`.
-
-Camera controls:
-
-- default: estimate when possible, warn and fall back otherwise.
-- `--camera auto`: require estimation; fail loudly when onnxruntime or the
-  model is missing. Cannot be combined with explicit `--fov`/`--distance`.
-- `--camera default`: always use the fixed front camera (also silences the
-  fallback warning).
+MoGe is mandatory for `run-image`: if the ONNX Runtime backend or model file
+is unavailable, the command fails before loading the large vision and cascade
+weights. `--moge-onnx <path>` selects the required model file; the default
+location is `weights/MoGe/moge-2-vitl-normal.onnx`. There is no fixed-camera
+bypass for image inference.
 
 Download the pinned model with `./scripts/download_moge_weights.sh` (pinned
 size and SHA-256, `.part` resume, atomic rename).
 
-Building the estimation needs onnxruntime: point `PIXAL3D_ONNXRUNTIME_ROOT`
-at a prebuilt onnxruntime tree (containing `include/onnxruntime_cxx_api.h`
-and `lib/libonnxruntime.so`) when configuring CMake. Without it the build
-succeeds, the default run warns and falls back, and `--camera auto` fails
-with an explicit error.
+Building the image path requires onnxruntime: point
+`PIXAL3D_ONNXRUNTIME_ROOT` at a prebuilt onnxruntime tree (containing
+`include/onnxruntime_cxx_api.h` and `lib/libonnxruntime.so`) when configuring
+CMake. Configuration fails if the required headers or library are unavailable.
 
 ### Mesh coordinate frames
 
@@ -270,16 +268,16 @@ fusion, projecting only the sparse coordinates requested by the sampler.
 `run-image` reads PNG/JPEG when those libraries were found at configure time;
 otherwise use PNM. RGBA PNG inputs now follow the reference foreground path:
 longest-side cap, alpha foreground crop with 10% square margin, and black
-background compositing. RGB/JPEG inputs still do not run rembg, and native
-image inference does not perform MoGe camera estimation. For photographs, the
-optional helper can prepare an explicit input using rembg:
+background compositing. RGB/JPEG inputs still do not run rembg; for photographs,
+the optional helper can prepare an explicit foreground using rembg:
 
 ```sh
 python3 scripts/preprocess_pixal3d_image.py input.png prepared.png
 ```
 
-The native path uses manual front-camera defaults or the camera options above;
-`run-image` requires DINO and NAF GGUFs. Set
+The native path uses MoGe-estimated cameras for `run-image` and explicit/default
+projection cameras for condition-bundle commands; `run-image` requires DINO,
+NAF, and the MoGe ONNX model. Set
 `PIXAL3D_CASCADE_SPATIAL_TRACE=1` to print x/y/z occupancy buckets after SS,
 coordinate upsampling, high-resolution quantization, and shape decoding.
 
@@ -303,11 +301,13 @@ attention, gather, im2col, and convolution nodes cannot silently downgrade,
 while explicit CPU-resident work remains on the host. `PIXAL3D_SLAT_VERBOSE=1`
 logs SLat fallback reasons. Set `PIXAL3D_BACKEND_TRACE=1` to print final scheduler
 node placement, split/copy counts, per-backend compute buffers, and device memory
-snapshots (including persistent weight allocation). NAF GPU acceleration covers only the
+snapshots (including persistent weight allocation). Sparse coordinate
+expansion, subdivision selection, packing, and final host-side reference
+operations remain CPU-side. NAF GPU acceleration covers only the
 reflection/convolution stacks; GroupNorm, pooling, learned 2-D RoPE, and
 neighborhood attention remain CPU-resident. SLat decoder sparse coordinate,
-subdivision, packing, and host reference operations likewise remain CPU-side;
-its GPU path is partial, not a claim of whole-stage GPU execution.
+subdivision, and packing work likewise remain CPU-side; its GPU path is
+partial, not a claim of whole-stage GPU execution.
 
 ## Release packages
 
@@ -510,9 +510,9 @@ backend placement.
   mesh it removed 218,118 over-shared edges while increasing the mesh from 10
   to 57,343 connected components. It is not the Python CuMesh implementation
   and does not include the separate Python remesh/decimation postprocess.
-- Native image inference now applies the alpha-aware RGBA crop and black matte
-  used by the reference. It still has no rembg fallback for RGB inputs and no
-  MoGe camera estimation.
+- Native image inference applies the alpha-aware RGBA crop and black matte
+  used by the reference and requires MoGe camera estimation. It still has no
+  rembg fallback for RGB inputs; photographs may need explicit preprocessing.
 - GPU execution is partial and capability-driven. `auto` uses scheduler-managed
   CPU/GPU cooperation; forced GPU reports failures for required core nodes.
   CPU-resident preprocessing, sampling, sparse topology, and mesh extraction

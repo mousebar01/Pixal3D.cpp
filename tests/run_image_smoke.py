@@ -89,6 +89,10 @@ def main() -> int:
                         default=ROOT / "build/weights/dinov3-vitl16-pretrain-lvd1689m-f32.gguf")
     parser.add_argument("--naf", type=Path,
                         default=ROOT / "weights/NAF/naf_release-f32.gguf")
+    parser.add_argument(
+        "--moge-onnx", type=Path,
+        default=ROOT / "weights/MoGe/moge-2-vitl-normal.onnx",
+    )
     parser.add_argument("--resolution", type=int, default=1024)
     parser.add_argument("--vision-resolution", type=int, default=64)
     parser.add_argument("--steps", type=int, default=2)
@@ -99,7 +103,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    required = (args.binary, args.shared, args.flow, args.dino, args.naf)
+    required = (args.binary, args.shared, args.flow, args.dino, args.naf, args.moge_onnx)
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         print("missing required smoke-test input(s):", *missing, file=sys.stderr)
@@ -120,11 +124,12 @@ def main() -> int:
         ]
         default_command = [
             str(args.binary), "run-image", str(args.shared), str(args.flow),
-            str(args.dino), str(args.naf), str(image), *common,
+            str(args.dino), str(args.naf), str(image), str(default_output),
+            "--moge-onnx", str(args.moge_onnx), *common,
         ]
         print("$", " ".join(default_command), flush=True)
         result = subprocess.run(default_command, text=True, capture_output=True,
-                                cwd=directory)
+                                cwd=ROOT)
         if result.stdout:
             print(result.stdout, end="")
         if result.stderr:
@@ -133,6 +138,20 @@ def main() -> int:
             print("default run-image smoke failed with exit code", result.returncode,
                   file=sys.stderr)
             return result.returncode
+        if "camera_estimated:" not in result.stdout:
+            print("run-image did not report MoGe camera estimation", file=sys.stderr)
+            return 1
+        rejected_camera = [
+            str(args.binary), "run-image", str(args.shared), str(args.flow),
+            str(args.dino), str(args.naf), str(image),
+            "--camera", "default",
+        ]
+        rejected = subprocess.run(rejected_camera, text=True, capture_output=True,
+                                  cwd=ROOT)
+        if rejected.returncode == 0 or "unknown or incomplete run-image option" not in (
+                rejected.stdout + rejected.stderr):
+            print("run-image still accepts the removed --camera option", file=sys.stderr)
+            return 1
         if not default_output.is_file():
             print("default run-image did not create output.glb", file=sys.stderr)
             return 1
@@ -141,10 +160,11 @@ def main() -> int:
 
         obj_command = [
             str(args.binary), "run-image", str(args.shared), str(args.flow),
-            str(args.dino), str(args.naf), str(image), str(explicit_obj), *common,
+            str(args.dino), str(args.naf), str(image), str(explicit_obj),
+            "--moge-onnx", str(args.moge_onnx), *common,
         ]
         print("$", " ".join(obj_command), flush=True)
-        result = subprocess.run(obj_command, text=True, capture_output=True)
+        result = subprocess.run(obj_command, text=True, capture_output=True, cwd=ROOT)
         if result.stdout:
             print(result.stdout, end="")
         if result.stderr:
