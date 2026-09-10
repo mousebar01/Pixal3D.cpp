@@ -102,6 +102,11 @@ bool slat_decoder_trace_enabled() noexcept {
     return value && *value && std::strcmp(value, "0") != 0;
 }
 
+bool slat_decoder_fused_graph_enabled() noexcept {
+    const char * value = std::getenv("PIXAL3D_SLAT_DECODER_FUSED_GRAPH");
+    return value && *value && std::strcmp(value, "0") != 0;
+}
+
 } // namespace
 
 bool sparse_convnext_block_f32(const SparseTensorF32 & input,
@@ -585,6 +590,232 @@ struct SLatDecoderGpuState {
         return output.valid(error);
     }
 
+    bool run_convnext_stack(const SparseTensorF32 & input,
+                            const std::vector<SLatDecoderBlockWeightsF32> & blocks,
+                            std::size_t first_block,
+                            int block_count,
+                            float norm_eps,
+                            SparseTensorF32 & output,
+                            std::string * error) const {
+        if (!ready() || !input.valid(error) || !valid_eps(norm_eps, error) ||
+            block_count <= 0 || first_block > blocks.size() ||
+            static_cast<std::size_t>(block_count) > blocks.size() - first_block) {
+            set_error(error, "invalid SLat decoder fused ConvNeXt stack request");
+            return false;
+        }
+        const int channels = input.channels;
+        for (int block = 0; block < block_count; ++block) {
+            const SLatDecoderBlockWeightsF32 & current =
+                blocks[first_block + static_cast<std::size_t>(block)];
+            if (current.kind != SLatDecoderBlockKind::convnext ||
+                current.channels != channels || current.out_channels != channels ||
+                current.mlp_hidden <= 0 ||
+                !weight(current.conv1_weight) || !weight(current.conv1_bias) ||
+                !weight(current.norm_weight) || !weight(current.norm_bias) ||
+                !weight(current.mlp0_weight) || !weight(current.mlp0_bias) ||
+                !weight(current.mlp2_weight) || !weight(current.mlp2_bias)) {
+                set_error(error, "SLat decoder fused ConvNeXt block tensor mismatch");
+                return false;
+            }
+        }
+        const std::size_t points = input.points();
+        if (points == 0 || points > static_cast<std::size_t>(std::numeric_limits<int64_t>::max())) {
+            set_error(error, "SLat decoder fused ConvNeXt point count is invalid");
+            return false;
+        }
+
+        std::unordered_map<DecoderCoord, std::size_t, DecoderCoordHash> indices;
+        indices.reserve(points);
+        for (std::size_t point = 0; point < points; ++point) {
+            indices.emplace(DecoderCoord{input.coords[point * 4 + 0], input.coords[point * 4 + 1],
+                                         input.coords[point * 4 + 2], input.coords[point * 4 + 3]},
+                            point);
+        }
+        std::vector<std::vector<std::int32_t>> index_values(
+            27, std::vector<std::int32_t>(points, static_cast<std::int32_t>(points)));
+        for (int kernel = 0; kernel < 27; ++kernel) {
+            const int kd = kernel / 9;
+            const int kh = (kernel / 3) % 3;
+            const int kw = kernel % 3;
+            for (std::size_t point = 0; point < points; ++point) {
+                const DecoderCoord center{input.coords[point * 4 + 0], input.coords[point * 4 + 1],
+                                          input.coords[point * 4 + 2], input.coords[point * 4 + 3]};
+                const DecoderCoord neighbor{center.batch, center.x + kd - 1,
+                                            center.y + kh - 1, center.z + kw - 1};
+                const auto found = indices.find(neighbor);
+                if (found != indices.end()) {
+                    index_values[static_cast<std::size_t>(kernel)][point] =
+                        static_cast<std::int32_t>(found->second);
+                }
+            }
+        }
+
+        constexpr std::size_t graph_capacity = 8192;
+        const std::size_t graph_memory = ggml_tensor_overhead() * graph_capacity +
+                                         ggml_graph_overhead_custom(graph_capacity, false);
+        ggml_init_params params{};
+        params.mem_size = graph_memory;
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) {
+            set_error(error, "failed to allocate SLat decoder fused ConvNeXt graph");
+            return false;
+        }
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_capacity, false);
+        ggml_tensor * input_tensor = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, channels, static_cast<int64_t>(points));
+        ggml_tensor * zero_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, 1);
+        if (!graph || !input_tensor || !zero_tensor) {
+            ggml_free(ctx);
+            set_error(error, "failed to allocate SLat decoder fused ConvNeXt inputs");
+            return false;
+        }
+        ggml_set_input(input_tensor);
+        ggml_set_input(zero_tensor);
+
+        std::vector<ggml_tensor *> index_tensors;
+        index_tensors.reserve(27);
+        for (int kernel = 0; kernel < 27; ++kernel) {
+            ggml_tensor * index_tensor = ggml_new_tensor_1d(
+                ctx, GGML_TYPE_I32, static_cast<int64_t>(points));
+            if (!index_tensor) {
+                ggml_free(ctx);
+                set_error(error, "failed to allocate SLat decoder fused gather indices");
+                return false;
+            }
+            ggml_set_input(index_tensor);
+            index_tensors.push_back(index_tensor);
+        }
+
+        auto linear = [&](ggml_tensor * value, const float * host_weight,
+                          const float * host_bias, int in_channels,
+                          int out_channels) -> ggml_tensor * {
+            ggml_tensor * weight_tensor = weight(host_weight);
+            ggml_tensor * bias_tensor = weight(host_bias);
+            if (!weight_tensor || !bias_tensor || weight_tensor->ne[0] != in_channels ||
+                weight_tensor->ne[1] != out_channels || bias_tensor->ne[0] != out_channels) {
+                return nullptr;
+            }
+            ggml_tensor * result = ggml_mul_mat(ctx, weight_tensor, value);
+            if (result) ggml_mul_mat_set_prec(result, GGML_PREC_F32);
+            return result ? ggml_add(ctx, result, bias_tensor) : nullptr;
+        };
+        auto conv = [&](ggml_tensor * value, const float * host_weight,
+                        const float * host_bias) -> ggml_tensor * {
+            ggml_tensor * weight_tensor = weight(host_weight);
+            ggml_tensor * bias_tensor = weight(host_bias);
+            if (!weight_tensor || !bias_tensor || weight_tensor->ne[0] != channels ||
+                weight_tensor->ne[1] != channels || weight_tensor->ne[2] != 27 ||
+                bias_tensor->ne[0] != channels) {
+                return nullptr;
+            }
+            ggml_tensor * padded = ggml_concat(ctx, value, zero_tensor, 1);
+            if (!padded) return nullptr;
+            ggml_tensor * accumulator = nullptr;
+            for (int kernel = 0; kernel < 27; ++kernel) {
+                ggml_tensor * gathered = ggml_get_rows(
+                    ctx, padded, index_tensors[static_cast<std::size_t>(kernel)]);
+                ggml_tensor * kernel_weight_view = ggml_view_2d(
+                    ctx, weight_tensor, channels, channels, weight_tensor->nb[1],
+                    static_cast<std::size_t>(kernel) * weight_tensor->nb[2]);
+                ggml_tensor * kernel_weight = kernel_weight_view
+                    ? ggml_cont(ctx, kernel_weight_view) : nullptr;
+                ggml_tensor * part = kernel_weight && gathered
+                    ? ggml_mul_mat(ctx, kernel_weight, gathered) : nullptr;
+                if (part) ggml_mul_mat_set_prec(part, GGML_PREC_F32);
+                if (!gathered || !kernel_weight || !part) return nullptr;
+                accumulator = accumulator ? ggml_add(ctx, accumulator, part) : part;
+            }
+            return accumulator ? ggml_cont(ctx, ggml_add(ctx, accumulator, bias_tensor)) : nullptr;
+        };
+
+        ggml_tensor * hidden = input_tensor;
+        for (int block = 0; block < block_count; ++block) {
+            const SLatDecoderBlockWeightsF32 & current =
+                blocks[first_block + static_cast<std::size_t>(block)];
+            ggml_tensor * convolved = conv(hidden, current.conv1_weight, current.conv1_bias);
+            ggml_tensor * normalized = convolved ? ggml_norm(ctx, convolved, norm_eps) : nullptr;
+            ggml_tensor * norm_weight = weight(current.norm_weight);
+            ggml_tensor * norm_bias = weight(current.norm_bias);
+            if (normalized && norm_weight && norm_bias) {
+                normalized = ggml_add(ctx, ggml_mul(ctx, normalized, norm_weight), norm_bias);
+            } else {
+                normalized = nullptr;
+            }
+            ggml_tensor * mlp_hidden = normalized
+                ? linear(normalized, current.mlp0_weight, current.mlp0_bias,
+                         channels, current.mlp_hidden) : nullptr;
+            if (mlp_hidden) mlp_hidden = ggml_silu(ctx, mlp_hidden);
+            ggml_tensor * result = mlp_hidden
+                ? linear(mlp_hidden, current.mlp2_weight, current.mlp2_bias,
+                         current.mlp_hidden, channels) : nullptr;
+            hidden = result ? ggml_add(ctx, result, hidden) : nullptr;
+            if (!hidden) {
+                ggml_free(ctx);
+                set_error(error, "failed to build SLat decoder fused ConvNeXt graph");
+                return false;
+            }
+        }
+
+        ggml_set_output(hidden);
+        ggml_build_forward_expand(graph, hidden);
+        const bool trace = slat_decoder_trace_enabled();
+        const double allocation_begin = trace ? backend_time_now_ms() : 0.0;
+        std::string scheduler_error;
+        BackendScheduler scheduler(*backend_manager, graph_capacity, false, true,
+                                   &scheduler_error, "SLat decoder fused ConvNeXt");
+        if (!scheduler.valid() ||
+            (backend_manager->requires_primary_backend() &&
+             !scheduler.require_primary_graph(graph, &scheduler_error)) ||
+            !scheduler.allocate_graph(graph, &scheduler_error)) {
+            scheduler.synchronize();
+            scheduler = BackendScheduler{};
+            ggml_free(ctx);
+            set_error(error, scheduler_error.empty()
+                ? "failed to allocate SLat decoder fused ConvNeXt graph" : scheduler_error);
+            return false;
+        }
+        if (trace) {
+            backend_log_timing("SLat-decoder-fused", "scheduler_allocate",
+                               backend_time_now_ms() - allocation_begin);
+        }
+        ggml_backend_tensor_set(input_tensor, input.feats.data(), 0,
+                                input.feats.size() * sizeof(float));
+        std::vector<float> zero_values(static_cast<std::size_t>(channels), 0.0f);
+        ggml_backend_tensor_set(zero_tensor, zero_values.data(), 0,
+                                zero_values.size() * sizeof(float));
+        for (std::size_t kernel = 0; kernel < index_tensors.size(); ++kernel) {
+            ggml_backend_tensor_set(index_tensors[kernel], index_values[kernel].data(), 0,
+                                    index_values[kernel].size() * sizeof(std::int32_t));
+        }
+        const double compute_begin = trace ? backend_time_now_ms() : 0.0;
+        const ggml_status status = scheduler.compute(graph, &scheduler_error);
+        if (trace) {
+            backend_log_timing("SLat-decoder-fused", "scheduler_compute",
+                               backend_time_now_ms() - compute_begin);
+        }
+        bool ok = status == GGML_STATUS_SUCCESS;
+        std::vector<float> result_values(points * static_cast<std::size_t>(channels));
+        if (ok) {
+            ggml_backend_tensor_get(hidden, result_values.data(), 0,
+                                    result_values.size() * sizeof(float));
+            ok = finish_sparse(input, channels, result_values, output, error);
+            if (trace) {
+                std::cerr << "pixal3d: SLat-decoder-fused blocks=" << block_count
+                          << " nodes=" << ggml_graph_n_nodes(graph)
+                          << " points=" << points
+                          << " channels=" << channels << std::endl;
+            }
+        } else {
+            set_error(error, "SLat decoder fused ConvNeXt graph compute failed" +
+                      (scheduler_error.empty() ? std::string{} : ": " + scheduler_error));
+        }
+        scheduler.synchronize();
+        scheduler = BackendScheduler{};
+        ggml_free(ctx);
+        return ok;
+    }
+
     bool run_conv(const SparseTensorF32 & input,
                   const float * host_weight,
                   const float * host_bias,
@@ -926,25 +1157,33 @@ bool SLatDecoderModel::Impl::decode_gpu(
                        config.model_channels.front(), hidden, error)) return false;
     if (predicted_subdivisions) predicted_subdivisions->clear();
     std::size_t block_index = 0;
+    const bool fused_graph = slat_decoder_fused_graph_enabled();
     for (std::size_t level = 0; level < config.model_channels.size(); ++level) {
-        for (int block = 0; block < config.num_blocks[level]; ++block) {
-            const SLatDecoderBlockWeightsF32 & current = weights.blocks[block_index];
-            SparseTensorF32 convolved;
-            if (!gpu.run_conv(hidden, current.conv1_weight, current.conv1_bias,
-                              hidden.channels, convolved, error)) return false;
-            SparseTensorF32 normalized;
-            if (!sparse_layer_norm(convolved, config.norm_eps, current.norm_weight,
-                                   current.norm_bias, normalized, error)) return false;
-            SparseTensorF32 mlp_hidden;
-            if (!sparse_linear(normalized, current.mlp0_weight, current.mlp0_bias,
-                               current.mlp_hidden, mlp_hidden, error)) return false;
-            silu_in_place(mlp_hidden);
-            SparseTensorF32 result;
-            if (!sparse_linear(mlp_hidden, current.mlp2_weight, current.mlp2_bias,
-                               hidden.channels, result, error) ||
-                !add_in_place(result, hidden, error)) return false;
-            hidden = std::move(result);
-            ++block_index;
+        const int level_blocks = config.num_blocks[level];
+        if (fused_graph && level_blocks > 0) {
+            if (!gpu.run_convnext_stack(hidden, weights.blocks, block_index, level_blocks,
+                                        config.norm_eps, hidden, error)) return false;
+            block_index += static_cast<std::size_t>(level_blocks);
+        } else {
+            for (int block = 0; block < level_blocks; ++block) {
+                const SLatDecoderBlockWeightsF32 & current = weights.blocks[block_index];
+                SparseTensorF32 convolved;
+                if (!gpu.run_conv(hidden, current.conv1_weight, current.conv1_bias,
+                                  hidden.channels, convolved, error)) return false;
+                SparseTensorF32 normalized;
+                if (!sparse_layer_norm(convolved, config.norm_eps, current.norm_weight,
+                                       current.norm_bias, normalized, error)) return false;
+                SparseTensorF32 mlp_hidden;
+                if (!sparse_linear(normalized, current.mlp0_weight, current.mlp0_bias,
+                                   current.mlp_hidden, mlp_hidden, error)) return false;
+                silu_in_place(mlp_hidden);
+                SparseTensorF32 result;
+                if (!sparse_linear(mlp_hidden, current.mlp2_weight, current.mlp2_bias,
+                                   hidden.channels, result, error) ||
+                    !add_in_place(result, hidden, error)) return false;
+                hidden = std::move(result);
+                ++block_index;
+            }
         }
         if (level + 1 >= config.model_channels.size()) continue;
         const SLatDecoderBlockWeightsF32 & current = weights.blocks[block_index];
