@@ -217,6 +217,15 @@ if(BUILD_TESTING AND PIXAL3D_BUILD_CLI)
                  COMMAND pixal3d_sparse_linear_cuda_benchmark --fixture)
         set_tests_properties(pixal3d_sparse_linear_cuda_fixture
             PROPERTIES LABELS "backend;cuda;parity")
+        add_executable(pixal3d_slat_decoder_gpu_first_fixture
+            tests/slat_decoder_gpu_first_fixture.cpp)
+        target_compile_features(pixal3d_slat_decoder_gpu_first_fixture PRIVATE cxx_std_17)
+        target_link_libraries(pixal3d_slat_decoder_gpu_first_fixture PRIVATE pixal3d_core)
+        add_test(NAME pixal3d_slat_decoder_gpu_first_fixture
+                 COMMAND pixal3d_slat_decoder_gpu_first_fixture)
+        set_tests_properties(pixal3d_slat_decoder_gpu_first_fixture
+            PROPERTIES LABELS "backend;cuda;parity;unit"
+                       SKIP_RETURN_CODE 77)
     endif()
     add_executable(pixal3d_dino_vit_numeric_fixture
         tests/dino_vit_numeric_fixture.cpp)

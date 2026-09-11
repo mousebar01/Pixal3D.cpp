@@ -157,6 +157,14 @@ bool slat_decoder_neighbor_cache_validation_enabled() noexcept {
     return environment_flag("PIXAL3D_VALIDATE_SPARSE_MAP_CACHE");
 }
 
+// GPU-first is the normal CUDA rollout path.  Set this to 0 only to reproduce
+// the pre-GPU-first hybrid decoder while debugging a placement or parity
+// regression; a failed GPU-first graph is never silently replaced by the
+// legacy partial graph.
+bool slat_decoder_gpu_first_enabled() noexcept {
+    return environment_flag("PIXAL3D_SLAT_DECODER_GPU_FIRST", true);
+}
+
 } // namespace
 
 bool sparse_convnext_block_f32(const SparseTensorF32 & input,
@@ -775,6 +783,140 @@ bool record_decoder_conv(SLatDecoderProfile * profile,
     return true;
 }
 
+// The GPU-first decoder keeps public SparseTensorF32 storage on the host only
+// at a topology boundary.  Inside one level, features use ggml's [channel,
+// point] layout, which is byte-identical to the public point-major [point,
+// channel] vector.  These helpers deliberately use existing ggml operations;
+// no decoder-specific CUDA kernels or weight relayout are introduced.
+ggml_tensor * name_gpu_tensor(ggml_tensor * tensor, const std::string & name) {
+    if (tensor && !name.empty()) ggml_set_name(tensor, name.c_str());
+    return tensor;
+}
+
+ggml_tensor * gpu_linear_node(ggml_context * ctx,
+                              ggml_tensor * input,
+                              ggml_tensor * weight,
+                              ggml_tensor * bias,
+                              const std::string & name) {
+    if (!ctx || !input || !weight || !bias) return nullptr;
+    ggml_tensor * product = ggml_mul_mat(ctx, weight, input);
+    if (!product) return nullptr;
+    ggml_mul_mat_set_prec(product, GGML_PREC_F32);
+    ggml_tensor * biased = ggml_add(ctx, product, bias);
+    if (!biased) return nullptr;
+    return name_gpu_tensor(ggml_cont(ctx, biased), name);
+}
+
+ggml_tensor * gpu_layer_norm_affine_node(ggml_context * ctx,
+                                          ggml_tensor * input,
+                                          ggml_tensor * gamma,
+                                          ggml_tensor * beta,
+                                          float epsilon,
+                                          const std::string & name) {
+    if (!ctx || !input || !gamma || !beta) return nullptr;
+    ggml_tensor * normalized = ggml_norm(ctx, input, epsilon);
+    if (!normalized) return nullptr;
+    ggml_tensor * scaled = ggml_mul(ctx, normalized, gamma);
+    if (!scaled) return nullptr;
+    ggml_tensor * shifted = ggml_add(ctx, scaled, beta);
+    if (!shifted) return nullptr;
+    return name_gpu_tensor(ggml_cont(ctx, shifted), name);
+}
+
+ggml_tensor * gpu_layer_norm_node(ggml_context * ctx,
+                                   ggml_tensor * input,
+                                   float epsilon,
+                                   const std::string & name) {
+    if (!ctx || !input) return nullptr;
+    ggml_tensor * normalized = ggml_norm(ctx, input, epsilon);
+    if (!normalized) return nullptr;
+    return name_gpu_tensor(ggml_cont(ctx, normalized), name);
+}
+
+ggml_tensor * gpu_sparse_conv_node(
+    ggml_context * ctx,
+    ggml_tensor * input,
+    ggml_tensor * zero_column,
+    ggml_tensor * weight,
+    ggml_tensor * bias,
+    const std::vector<ggml_tensor *> & index_tensors,
+    int input_channels,
+    int output_channels,
+    const std::string & name) {
+    if (!ctx || !input || !zero_column || !weight || !bias ||
+        index_tensors.size() != 27 || input_channels <= 0 || output_channels <= 0) {
+        return nullptr;
+    }
+    // Append one explicit zero point on device.  GET_ROWS then uses the same
+    // sentinel convention as the existing sparse-conv implementation without
+    // downloading or rebuilding an intermediate feature matrix.
+    ggml_tensor * padded = ggml_concat(ctx, input, zero_column, 1);
+    if (!padded) return nullptr;
+
+    ggml_tensor * accumulator = nullptr;
+    for (int kernel = 0; kernel < 27; ++kernel) {
+        ggml_tensor * gathered = ggml_get_rows(ctx, padded, index_tensors[
+            static_cast<std::size_t>(kernel)]);
+        if (!gathered) return nullptr;
+        ggml_tensor * weight_view = ggml_view_2d(
+            ctx, weight, input_channels, output_channels, weight->nb[1],
+            static_cast<std::size_t>(kernel) * weight->nb[2]);
+        ggml_tensor * contiguous_weight = weight_view
+            ? ggml_cont(ctx, weight_view) : nullptr;
+        ggml_tensor * part = contiguous_weight
+            ? ggml_mul_mat(ctx, contiguous_weight, gathered) : nullptr;
+        if (!part) return nullptr;
+        ggml_mul_mat_set_prec(part, GGML_PREC_F32);
+        accumulator = accumulator
+            ? ggml_add(ctx, accumulator, part) : part;
+        if (!accumulator) return nullptr;
+    }
+    ggml_tensor * biased = ggml_add(ctx, accumulator, bias);
+    if (!biased) return nullptr;
+    return name_gpu_tensor(ggml_cont(ctx, biased), name);
+}
+
+ggml_tensor * gpu_convnext_block_node(
+    ggml_context * ctx,
+    ggml_tensor * input,
+    ggml_tensor * zero_column,
+    const std::vector<ggml_tensor *> & index_tensors,
+    ggml_tensor * norm_weight,
+    ggml_tensor * norm_bias,
+    ggml_tensor * conv_weight,
+    ggml_tensor * conv_bias,
+    ggml_tensor * mlp0_weight,
+    ggml_tensor * mlp0_bias,
+    ggml_tensor * mlp2_weight,
+    ggml_tensor * mlp2_bias,
+    int channels,
+    int mlp_hidden,
+    float epsilon,
+    const std::string & name) {
+    if (!ctx || !input || !zero_column || !norm_weight || !norm_bias ||
+        !conv_weight || !conv_bias || !mlp0_weight || !mlp0_bias ||
+        !mlp2_weight || !mlp2_bias || channels <= 0 || mlp_hidden <= 0) {
+        return nullptr;
+    }
+    ggml_tensor * convolved = gpu_sparse_conv_node(
+        ctx, input, zero_column, conv_weight, conv_bias, index_tensors,
+        channels, channels, name + ".conv");
+    if (!convolved) return nullptr;
+    ggml_tensor * normalized = gpu_layer_norm_affine_node(
+        ctx, convolved, norm_weight, norm_bias, epsilon, name + ".norm");
+    if (!normalized) return nullptr;
+    ggml_tensor * hidden = gpu_linear_node(
+        ctx, normalized, mlp0_weight, mlp0_bias, name + ".mlp0");
+    if (!hidden) return nullptr;
+    hidden = name_gpu_tensor(ggml_silu(ctx, hidden), name + ".silu");
+    if (!hidden) return nullptr;
+    ggml_tensor * projected = gpu_linear_node(
+        ctx, hidden, mlp2_weight, mlp2_bias, name + ".mlp2");
+    if (!projected) return nullptr;
+    ggml_tensor * residual = ggml_add(ctx, projected, input);
+    return name_gpu_tensor(ggml_cont(ctx, residual), name);
+}
+
 void log_decoder_profile(const SLatDecoderProfile & profile,
                          const detail::SparseProfileStats & sparse) {
     std::cerr << "pixal3d: SLat-decoder-profile cache_enabled="
@@ -1123,6 +1265,29 @@ struct SLatDecoderGpuState {
         return it == host_tensors.end() ? nullptr : it->second;
     }
 
+    bool prepare_neighbor_map(const SparseTensorF32 & input,
+                              NeighborGatherMap & local_map,
+                              NeighborGatherMap *& gather_map,
+                              bool & cache_hit,
+                              std::uint64_t & coordinate_fingerprint,
+                              std::string * error);
+
+    bool run_convnext_level(
+        const SparseTensorF32 & input,
+        const SLatDecoderBlockWeightsF32 * blocks,
+        std::size_t block_count,
+        float norm_eps,
+        const float * prefix_weight,
+        const float * prefix_bias,
+        int prefix_out_channels,
+        bool final_layer_norm,
+        const float * output_weight,
+        const float * output_bias,
+        int output_channels,
+        const std::string & label,
+        SparseTensorF32 & output,
+        std::string * error);
+
     bool init(const Pixal3DPackReader & reader,
               const std::string & component,
               const std::unordered_map<std::string, std::vector<float>> & host,
@@ -1280,50 +1445,12 @@ struct SLatDecoderGpuState {
         decoder_profile_add_phase(profile, &SLatDecoderProfile::padded_input_build_ms,
                                   padded_input_begin);
 
-        std::uint64_t coordinate_fingerprint = 0;
-        if (profile) {
-            const double fingerprint_begin = backend_time_now_ms();
-            coordinate_fingerprint = decoder_coords_fingerprint(input.coords);
-            profile->coordinate_fingerprint_ms +=
-                backend_time_now_ms() - fingerprint_begin;
-        }
-
         NeighborGatherMap local_map;
         NeighborGatherMap * gather_map = nullptr;
         bool cache_hit = false;
-        if (neighbor_cache_enabled && has_neighbor_map) {
-            if (!neighbor_map_shape_matches(current_neighbor_map, input, profile != nullptr,
-                                            coordinate_fingerprint)) {
-                set_error(error,
-                          "SLat decoder neighbor map topology changed without invalidation "
-                          "(generation=" + std::to_string(topology_generation) + ")");
-                return false;
-            }
-            cache_hit = true;
-            if (validate_neighbor_cache) {
-                if (profile) ++profile->cache_validation_calls;
-                const double validation_begin = profile ? backend_time_now_ms() : 0.0;
-                const bool valid = validate_neighbor_gather_map(input, current_neighbor_map, error);
-                decoder_profile_add_phase(profile, &SLatDecoderProfile::cache_validation_ms,
-                                          validation_begin);
-                if (!valid) return false;
-            }
-            gather_map = &current_neighbor_map;
-        } else {
-            if (!build_neighbor_gather_map(input, coordinate_fingerprint, local_map, profile,
-                                           error)) {
-                return false;
-            }
-            if (neighbor_cache_enabled) {
-                current_neighbor_map = std::move(local_map);
-                has_neighbor_map = true;
-                gather_map = &current_neighbor_map;
-            } else {
-                gather_map = &local_map;
-            }
-        }
-        if (!record_decoder_conv(profile, topology_generation, input,
-                                 coordinate_fingerprint, cache_hit, error)) {
+        std::uint64_t coordinate_fingerprint = 0;
+        if (!prepare_neighbor_map(input, local_map, gather_map, cache_hit,
+                                  coordinate_fingerprint, error)) {
             return false;
         }
 
@@ -1476,6 +1603,496 @@ struct SLatDecoderGpuState {
     }
 };
 
+bool SLatDecoderGpuState::prepare_neighbor_map(
+    const SparseTensorF32 & input,
+    NeighborGatherMap & local_map,
+    NeighborGatherMap *& gather_map,
+    bool & cache_hit,
+    std::uint64_t & coordinate_fingerprint,
+    std::string * error) {
+    gather_map = nullptr;
+    cache_hit = false;
+    coordinate_fingerprint = 0;
+    if (profile) {
+        const double fingerprint_begin = backend_time_now_ms();
+        coordinate_fingerprint = decoder_coords_fingerprint(input.coords);
+        profile->coordinate_fingerprint_ms +=
+            backend_time_now_ms() - fingerprint_begin;
+    }
+
+    if (neighbor_cache_enabled && has_neighbor_map) {
+        if (!neighbor_map_shape_matches(current_neighbor_map, input, profile != nullptr,
+                                        coordinate_fingerprint)) {
+            set_error(error,
+                      "SLat decoder neighbor map topology changed without invalidation "
+                      "(generation=" + std::to_string(topology_generation) + ")");
+            return false;
+        }
+        cache_hit = true;
+        if (validate_neighbor_cache) {
+            if (profile) ++profile->cache_validation_calls;
+            const double validation_begin = profile ? backend_time_now_ms() : 0.0;
+            const bool valid = validate_neighbor_gather_map(input, current_neighbor_map, error);
+            decoder_profile_add_phase(profile, &SLatDecoderProfile::cache_validation_ms,
+                                      validation_begin);
+            if (!valid) return false;
+        }
+        gather_map = &current_neighbor_map;
+    } else {
+        if (!build_neighbor_gather_map(input, coordinate_fingerprint, local_map, profile,
+                                       error)) {
+            return false;
+        }
+        if (neighbor_cache_enabled) {
+            current_neighbor_map = std::move(local_map);
+            has_neighbor_map = true;
+            gather_map = &current_neighbor_map;
+        } else {
+            gather_map = &local_map;
+        }
+    }
+    return record_decoder_conv(profile, topology_generation, input,
+                               coordinate_fingerprint, cache_hit, error);
+}
+
+bool SLatDecoderGpuState::run_convnext_level(
+    const SparseTensorF32 & input,
+    const SLatDecoderBlockWeightsF32 * blocks,
+    std::size_t block_count,
+    float norm_eps,
+    const float * prefix_weight,
+    const float * prefix_bias,
+    int prefix_out_channels,
+    bool final_layer_norm,
+    const float * output_weight,
+    const float * output_bias,
+    int output_channels,
+    const std::string & label,
+    SparseTensorF32 & output,
+    std::string * error) {
+    output = SparseTensorF32{};
+    if (!ready() || !backend_manager || !backend_manager->initialized()) {
+        set_error(error, label + ": GPU state is not initialized");
+        return false;
+    }
+    if (!valid_eps(norm_eps, error)) return false;
+    if (block_count > 0 && !blocks) {
+        set_error(error, label + ": ConvNeXt block weights are missing");
+        return false;
+    }
+    const bool has_prefix = prefix_weight || prefix_bias;
+    if (has_prefix && (!prefix_weight || !prefix_bias || prefix_out_channels <= 0)) {
+        set_error(error, label + ": incomplete prefix linear specification");
+        return false;
+    }
+    const bool has_output = output_weight || output_bias;
+    if (has_output && (!output_weight || !output_bias || output_channels <= 0)) {
+        set_error(error, label + ": incomplete output linear specification");
+        return false;
+    }
+
+    const double input_validation_begin = profile ? backend_time_now_ms() : 0.0;
+    const bool input_valid = validate_decoder_sparse_tensor(
+        input, (label + ".input").c_str(), error);
+    decoder_profile_add_phase(profile, &SLatDecoderProfile::input_validation_ms,
+                              input_validation_begin);
+    if (!input_valid) return false;
+    const std::size_t points = input.points();
+    if (points == 0 || points > static_cast<std::size_t>(std::numeric_limits<int64_t>::max())) {
+        set_error(error, label + ": invalid point count");
+        return false;
+    }
+
+    const int feature_channels = has_prefix
+        ? prefix_out_channels
+        : (block_count > 0 ? blocks[0].channels : input.channels);
+    if (feature_channels <= 0) {
+        set_error(error, label + ": invalid feature channel count");
+        return false;
+    }
+    if (!has_prefix && block_count == 0 && input.channels != feature_channels) {
+        set_error(error, label + ": input feature channel count is inconsistent");
+        return false;
+    }
+    for (std::size_t index = 0; index < block_count; ++index) {
+        const SLatDecoderBlockWeightsF32 & block = blocks[index];
+        if (block.kind != SLatDecoderBlockKind::convnext ||
+            block.channels != feature_channels ||
+            block.out_channels != feature_channels || block.mlp_hidden <= 0) {
+            set_error(error, label + ": ConvNeXt block channel layout is inconsistent");
+            return false;
+        }
+    }
+
+    NeighborGatherMap local_graph_map;
+    NeighborGatherMap * graph_map = nullptr;
+    if (block_count > 0) {
+        for (std::size_t index = 0; index < block_count; ++index) {
+            NeighborGatherMap local_map;
+            NeighborGatherMap * map = nullptr;
+            bool cache_hit = false;
+            std::uint64_t coordinate_fingerprint = 0;
+            if (index == 0) {
+                if (!prepare_neighbor_map(input, local_graph_map, map, cache_hit,
+                                          coordinate_fingerprint, error)) {
+                    return false;
+                }
+                graph_map = map;
+            } else if (!prepare_neighbor_map(input, local_map, map, cache_hit,
+                                             coordinate_fingerprint, error)) {
+                return false;
+            }
+        }
+        if (!graph_map || graph_map->gather_indices.size() != points * 27) {
+            set_error(error, label + ": invalid GPU neighbor map");
+            return false;
+        }
+    }
+
+    auto lookup_weight = [this, &label, error](const float * host,
+                                                const std::string & name) -> ggml_tensor * {
+        if (!host) {
+            set_error(error, label + ": missing weight " + name);
+            return nullptr;
+        }
+        ggml_tensor * tensor = weight(host);
+        if (!tensor) {
+            set_error(error, label + ": weight is not resident on GPU: " + name);
+            return nullptr;
+        }
+        return tensor;
+    };
+
+    ggml_tensor * prefix_weight_tensor = nullptr;
+    ggml_tensor * prefix_bias_tensor = nullptr;
+    if (has_prefix) {
+        prefix_weight_tensor = lookup_weight(prefix_weight, "prefix.weight");
+        prefix_bias_tensor = lookup_weight(prefix_bias, "prefix.bias");
+        if (!prefix_weight_tensor || !prefix_bias_tensor) return false;
+        if (prefix_weight_tensor->type != GGML_TYPE_F32 ||
+            prefix_weight_tensor->ne[0] != input.channels ||
+            prefix_weight_tensor->ne[1] != prefix_out_channels ||
+            prefix_bias_tensor->type != GGML_TYPE_F32 ||
+            prefix_bias_tensor->ne[0] != prefix_out_channels) {
+            set_error(error, label + ": prefix linear tensor shape mismatch");
+            return false;
+        }
+    }
+
+    ggml_tensor * output_weight_tensor = nullptr;
+    ggml_tensor * output_bias_tensor = nullptr;
+    if (has_output) {
+        output_weight_tensor = lookup_weight(output_weight, "output.weight");
+        output_bias_tensor = lookup_weight(output_bias, "output.bias");
+        if (!output_weight_tensor || !output_bias_tensor) return false;
+        if (output_weight_tensor->type != GGML_TYPE_F32 ||
+            output_weight_tensor->ne[0] != feature_channels ||
+            output_weight_tensor->ne[1] != output_channels ||
+            output_bias_tensor->type != GGML_TYPE_F32 ||
+            output_bias_tensor->ne[0] != output_channels) {
+            set_error(error, label + ": output linear tensor shape mismatch");
+            return false;
+        }
+    }
+
+    constexpr std::size_t kGraphBase = 1024;
+    constexpr std::size_t kPerBlockCapacity = 256;
+    if (block_count > (std::numeric_limits<std::size_t>::max() - kGraphBase) /
+                          kPerBlockCapacity) {
+        set_error(error, label + ": GPU graph size overflows the ggml limits");
+        return false;
+    }
+    const std::size_t graph_capacity = kGraphBase + block_count * kPerBlockCapacity;
+    const std::size_t tensor_capacity = graph_capacity;
+    if (graph_capacity > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        tensor_capacity > std::numeric_limits<std::size_t>::max() /
+                              ggml_tensor_overhead()) {
+        set_error(error, label + ": GPU graph size overflows the ggml limits");
+        return false;
+    }
+    const double graph_build_begin = profile ? backend_time_now_ms() : 0.0;
+    ggml_init_params params{};
+    params.mem_size = ggml_tensor_overhead() * tensor_capacity +
+                      ggml_graph_overhead_custom(static_cast<int>(graph_capacity), false) +
+                      4096;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        set_error(error, label + ": failed to allocate GPU graph context");
+        return false;
+    }
+
+    ggml_tensor * input_tensor = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, input.channels, static_cast<int64_t>(points));
+    if (!input_tensor) {
+        ggml_free(ctx);
+        set_error(error, label + ": failed to allocate GPU feature input");
+        return false;
+    }
+    ggml_set_name(input_tensor, (label + ".input").c_str());
+    ggml_set_input(input_tensor);
+
+    ggml_tensor * zero_column = nullptr;
+    std::vector<float> zero_values;
+    std::vector<ggml_tensor *> index_tensors;
+    if (block_count > 0) {
+        zero_column = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, feature_channels, 1);
+        if (!zero_column) {
+            ggml_free(ctx);
+            set_error(error, label + ": failed to allocate GPU zero sentinel");
+            return false;
+        }
+        ggml_set_name(zero_column, (label + ".zero_column").c_str());
+        ggml_set_input(zero_column);
+        zero_values.assign(static_cast<std::size_t>(feature_channels), 0.0f);
+
+        index_tensors.reserve(27);
+        for (int kernel = 0; kernel < 27; ++kernel) {
+            ggml_tensor * index_tensor = ggml_new_tensor_1d(
+                ctx, GGML_TYPE_I32, static_cast<int64_t>(points));
+            if (!index_tensor) {
+                ggml_free(ctx);
+                set_error(error, label + ": failed to allocate GPU neighbor index");
+                return false;
+            }
+            ggml_set_name(index_tensor,
+                          (label + ".neighbor_index." + std::to_string(kernel)).c_str());
+            ggml_set_input(index_tensor);
+            index_tensors.push_back(index_tensor);
+        }
+    }
+
+    ggml_tensor * feature = input_tensor;
+    if (has_prefix) {
+        feature = gpu_linear_node(ctx, feature, prefix_weight_tensor,
+                                  prefix_bias_tensor, label + ".prefix");
+        if (!feature) {
+            ggml_free(ctx);
+            set_error(error, label + ": failed to build prefix linear graph");
+            return false;
+        }
+    }
+
+    for (std::size_t index = 0; index < block_count; ++index) {
+        const SLatDecoderBlockWeightsF32 & block = blocks[index];
+        const std::string block_label = label + ".block=" + std::to_string(index);
+        ggml_tensor * norm_weight = lookup_weight(block.norm_weight,
+                                                   block_label + ".norm.weight");
+        ggml_tensor * norm_bias = lookup_weight(block.norm_bias,
+                                                 block_label + ".norm.bias");
+        ggml_tensor * conv_weight = lookup_weight(block.conv1_weight,
+                                                  block_label + ".conv.weight");
+        ggml_tensor * conv_bias = lookup_weight(block.conv1_bias,
+                                                block_label + ".conv.bias");
+        ggml_tensor * mlp0_weight = lookup_weight(block.mlp0_weight,
+                                                  block_label + ".mlp.0.weight");
+        ggml_tensor * mlp0_bias = lookup_weight(block.mlp0_bias,
+                                                block_label + ".mlp.0.bias");
+        ggml_tensor * mlp2_weight = lookup_weight(block.mlp2_weight,
+                                                  block_label + ".mlp.2.weight");
+        ggml_tensor * mlp2_bias = lookup_weight(block.mlp2_bias,
+                                                block_label + ".mlp.2.bias");
+        if (!norm_weight || !norm_bias || !conv_weight || !conv_bias ||
+            !mlp0_weight || !mlp0_bias || !mlp2_weight || !mlp2_bias) {
+            ggml_free(ctx);
+            return false;
+        }
+        if (norm_weight->type != GGML_TYPE_F32 || norm_weight->ne[0] != feature_channels ||
+            norm_bias->type != GGML_TYPE_F32 || norm_bias->ne[0] != feature_channels ||
+            conv_weight->type != GGML_TYPE_F32 || conv_weight->ne[0] != feature_channels ||
+            conv_weight->ne[1] != feature_channels || conv_weight->ne[2] != 27 ||
+            conv_bias->type != GGML_TYPE_F32 || conv_bias->ne[0] != feature_channels ||
+            mlp0_weight->type != GGML_TYPE_F32 || mlp0_weight->ne[0] != feature_channels ||
+            mlp0_weight->ne[1] != block.mlp_hidden ||
+            mlp0_bias->type != GGML_TYPE_F32 || mlp0_bias->ne[0] != block.mlp_hidden ||
+            mlp2_weight->type != GGML_TYPE_F32 || mlp2_weight->ne[0] != block.mlp_hidden ||
+            mlp2_weight->ne[1] != feature_channels ||
+            mlp2_bias->type != GGML_TYPE_F32 || mlp2_bias->ne[0] != feature_channels) {
+            ggml_free(ctx);
+            set_error(error, label + ": ConvNeXt GPU tensor shape mismatch at block " +
+                              std::to_string(index));
+            return false;
+        }
+        feature = gpu_convnext_block_node(
+            ctx, feature, zero_column, index_tensors,
+            norm_weight, norm_bias, conv_weight, conv_bias,
+            mlp0_weight, mlp0_bias, mlp2_weight, mlp2_bias,
+            feature_channels, block.mlp_hidden, norm_eps, block_label);
+        if (!feature) {
+            ggml_free(ctx);
+            set_error(error, label + ": failed to build ConvNeXt GPU graph at block " +
+                              std::to_string(index));
+            return false;
+        }
+    }
+
+    if (final_layer_norm) {
+        feature = gpu_layer_norm_node(ctx, feature,
+                                      k_slat_decoder_final_layer_norm_eps,
+                                      label + ".final_norm");
+        if (!feature) {
+            ggml_free(ctx);
+            set_error(error, label + ": failed to build final LayerNorm graph");
+            return false;
+        }
+    }
+    if (has_output) {
+        feature = gpu_linear_node(ctx, feature, output_weight_tensor,
+                                  output_bias_tensor, label + ".output");
+        if (!feature) {
+            ggml_free(ctx);
+            set_error(error, label + ": failed to build output linear graph");
+            return false;
+        }
+    }
+    ggml_set_output(feature);
+    ggml_cgraph * graph = ggml_new_graph_custom(
+        ctx, static_cast<int>(graph_capacity), false);
+    if (!graph) {
+        ggml_free(ctx);
+        set_error(error, label + ": failed to allocate GPU graph");
+        return false;
+    }
+    ggml_build_forward_expand(graph, feature);
+    decoder_profile_add_phase(profile, &SLatDecoderProfile::graph_build_ms,
+                              graph_build_begin);
+
+    const bool trace = slat_decoder_trace_enabled();
+    const double allocation_begin = profile ? backend_time_now_ms() : 0.0;
+    std::string scheduler_error;
+    BackendScheduler scheduler(*backend_manager, graph_capacity, false, true,
+                               &scheduler_error, label.c_str());
+    if (!scheduler.valid()) {
+        scheduler_error = scheduler_error.empty()
+            ? "failed to initialize GPU scheduler" : scheduler_error;
+    }
+
+    std::size_t cpu_fallback_ops = 0;
+    const auto pin_if_gpu_supported = [&](ggml_tensor * node, bool operation) -> bool {
+        if (!node) {
+            set_error(error, label + ": cannot place a null graph tensor");
+            return false;
+        }
+        std::string support_error;
+        if (backend_manager->primary_supports_op(node, &support_error)) {
+            return scheduler.require_primary(node, error);
+        }
+        if (backend_manager->policy().kind == BackendPolicyKind::gpu) {
+            set_error(error, label + ": forced GPU cannot place " +
+                              (operation ? std::string(ggml_op_name(node->op))
+                                         : std::string("input tensor")) +
+                              " (" + support_error + ")");
+            return false;
+        }
+        ggml_backend_t fallback = backend_manager->backend_for_op(node);
+        if (!fallback) {
+            set_error(error, label + ": no configured backend supports " +
+                              std::string(ggml_op_name(node->op)));
+            return false;
+        }
+        if (operation) {
+            ++cpu_fallback_ops;
+            std::cerr << "pixal3d: GPU-first placement fallback stage=" << label
+                      << " op=" << ggml_op_name(node->op)
+                      << " tensor=" << ggml_get_name(node)
+                      << " backend=" << ggml_backend_name(fallback)
+                      << " reason=" << support_error << std::endl;
+        }
+        return true;
+    };
+
+    bool placement_ok = scheduler.valid();
+    if (placement_ok) placement_ok = pin_if_gpu_supported(input_tensor, false);
+    if (placement_ok && zero_column) {
+        placement_ok = pin_if_gpu_supported(zero_column, false);
+    }
+    for (ggml_tensor * index_tensor : index_tensors) {
+        if (placement_ok) placement_ok = pin_if_gpu_supported(index_tensor, false);
+    }
+    if (placement_ok) {
+        for (int index = 0; index < ggml_graph_n_nodes(graph); ++index) {
+            ggml_tensor * node = ggml_graph_node(graph, index);
+            if (!node || node->op == GGML_OP_NONE) continue;
+            if (!pin_if_gpu_supported(node, true)) {
+                placement_ok = false;
+                break;
+            }
+        }
+    }
+    if (placement_ok && !scheduler.allocate_graph(graph, &scheduler_error)) {
+        placement_ok = false;
+    }
+    decoder_profile_add_phase(profile, &SLatDecoderProfile::scheduler_allocate_ms,
+                              allocation_begin);
+    if (!placement_ok) {
+        scheduler.synchronize();
+        scheduler = BackendScheduler{};
+        ggml_free(ctx);
+        set_error(error, label + ": GPU graph placement/allocation failed" +
+                          (scheduler_error.empty() ? std::string{} : ": " + scheduler_error));
+        return false;
+    }
+
+    const double input_upload_begin = profile ? backend_time_now_ms() : 0.0;
+    ggml_backend_tensor_set(input_tensor, input.feats.data(), 0,
+                            input.feats.size() * sizeof(float));
+    if (zero_column) {
+        ggml_backend_tensor_set(zero_column, zero_values.data(), 0,
+                                zero_values.size() * sizeof(float));
+    }
+    decoder_profile_add_phase(profile, &SLatDecoderProfile::input_upload_ms,
+                              input_upload_begin);
+
+    const double index_upload_begin = profile ? backend_time_now_ms() : 0.0;
+    for (std::size_t index = 0; index < index_tensors.size(); ++index) {
+        const std::int32_t * values = graph_map->gather_indices.data() + index * points;
+        ggml_backend_tensor_set(index_tensors[index], values, 0,
+                                points * sizeof(std::int32_t));
+    }
+    decoder_profile_add_phase(profile, &SLatDecoderProfile::index_upload_ms,
+                              index_upload_begin);
+
+    const double compute_begin = profile ? backend_time_now_ms() : 0.0;
+    const ggml_status status = scheduler.compute(graph, &scheduler_error);
+    decoder_profile_add_phase(profile, &SLatDecoderProfile::gpu_compute_ms, compute_begin);
+    if (status != GGML_STATUS_SUCCESS) {
+        scheduler.synchronize();
+        scheduler = BackendScheduler{};
+        ggml_free(ctx);
+        set_error(error, label + ": GPU graph compute failed" +
+                          (scheduler_error.empty() ? std::string{} : ": " + scheduler_error));
+        return false;
+    }
+
+    const int result_channels = has_output ? output_channels : feature_channels;
+    const std::size_t result_count = points * static_cast<std::size_t>(result_channels);
+    std::vector<float> result_values(result_count, 0.0f);
+    const double output_download_begin = profile ? backend_time_now_ms() : 0.0;
+    ggml_backend_tensor_get(feature, result_values.data(), 0,
+                            result_values.size() * sizeof(float));
+    decoder_profile_add_phase(profile, &SLatDecoderProfile::output_download_ms,
+                              output_download_begin);
+
+    if (trace) {
+        scheduler.log_trace(graph, "gpu-first-computed");
+        std::cerr << "pixal3d: GPU-first level=" << label
+                  << " points=" << points
+                  << " blocks=" << block_count
+                  << " input_channels=" << input.channels
+                  << " output_channels=" << result_channels
+                  << " h2d_inputs=" << (zero_column ? 2 : 1)
+                  << " h2d_indices=" << index_tensors.size()
+                  << " d2h_outputs=1"
+                  << " weight_uploads=0"
+                  << " cpu_fallback_ops=" << cpu_fallback_ops << std::endl;
+    }
+    const bool finished = finish_sparse(input, result_channels, result_values, output, error);
+    scheduler.synchronize();
+    scheduler = BackendScheduler{};
+    ggml_free(ctx);
+    return finished;
+}
+
 struct SLatDecoderInvocation {
     SLatDecoderGpuState & gpu;
     SLatDecoderProfile profile;
@@ -1529,10 +2146,19 @@ struct SLatDecoderModel::Impl {
                     SparseTensorF32 & output,
                     std::vector<SparseTensorF32> * predicted_subdivisions,
                     std::string * error);
+    bool decode_gpu_first(const SparseTensorF32 & input,
+                          const std::vector<SparseTensorF32> * guide_subdivisions,
+                          SparseTensorF32 & output,
+                          std::vector<SparseTensorF32> * predicted_subdivisions,
+                          std::string * error);
     bool upsample_coords_gpu(const SparseTensorF32 & input,
                              int upsample_times,
                              SparseTensorF32 & output,
                              std::string * error);
+    bool upsample_coords_gpu_first(const SparseTensorF32 & input,
+                                   int upsample_times,
+                                   SparseTensorF32 & output,
+                                   std::string * error);
 
     bool init_gpu(std::string * error) {
         if (!has_data) {
@@ -1619,6 +2245,117 @@ bool SLatDecoderModel::Impl::make_weights(SLatDecoderWeightsF32 & weights,
     return true;
 }
 
+bool SLatDecoderModel::Impl::decode_gpu_first(
+    const SparseTensorF32 & input,
+    const std::vector<SparseTensorF32> * guide_subdivisions,
+    SparseTensorF32 & output,
+    std::vector<SparseTensorF32> * predicted_subdivisions,
+    std::string * error) {
+    SLatDecoderInvocation invocation(
+        gpu, slat_decoder_profile_enabled(),
+        slat_decoder_neighbor_cache_enabled(),
+        slat_decoder_neighbor_cache_validation_enabled());
+    SLatDecoderWeightsF32 weights;
+    if (!make_weights(weights, error)) return false;
+
+    SLatDecoderConfig config;
+    config.latent_channels = hp.latent_channels;
+    config.out_channels = hp.out_channels;
+    config.norm_eps = hp.norm_eps;
+    config.pred_subdiv = hp.pred_subdiv;
+    config.model_channels = hp.model_channels;
+    config.num_blocks = hp.num_blocks;
+    const std::size_t levels = config.model_channels.size();
+    if (levels == 0 || config.num_blocks.size() != levels ||
+        (guide_subdivisions && guide_subdivisions->size() != levels - 1) ||
+        (!config.pred_subdiv && !guide_subdivisions)) {
+        set_error(error, "invalid SLat decoder GPU-first configuration");
+        return false;
+    }
+    if (predicted_subdivisions) predicted_subdivisions->clear();
+
+    std::cerr << "pixal3d: " << component
+              << " SLat GPU-first decoder path enabled"
+              << " (features stay on GPU within each level; C2S remains host boundary)"
+              << std::endl;
+
+    SparseTensorF32 hidden;
+    std::size_t block_index = 0;
+    for (std::size_t level = 0; level < levels; ++level) {
+        const std::size_t block_count = static_cast<std::size_t>(config.num_blocks[level]);
+        const bool final_level = level + 1 == levels;
+        SparseTensorF32 level_output;
+        const SLatDecoderBlockWeightsF32 * level_blocks = block_count > 0
+            ? weights.blocks.data() + block_index : nullptr;
+        if (!gpu.run_convnext_level(
+                level == 0 ? input : hidden,
+                level_blocks, block_count, config.norm_eps,
+                level == 0 ? weights.from_latent_weight : nullptr,
+                level == 0 ? weights.from_latent_bias : nullptr,
+                level == 0 ? config.model_channels.front() : 0,
+                final_level,
+                final_level ? weights.output_weight : nullptr,
+                final_level ? weights.output_bias : nullptr,
+                final_level ? config.out_channels : 0,
+                "decode.level=" + std::to_string(level), level_output, error)) {
+            return false;
+        }
+        block_index += block_count;
+        if (final_level) {
+            output = std::move(level_output);
+            break;
+        }
+        hidden = std::move(level_output);
+
+        if (block_index >= weights.blocks.size() ||
+            weights.blocks[block_index].kind != SLatDecoderBlockKind::channel_to_spatial) {
+            set_error(error, "SLat decoder GPU-first expected channel-to-spatial block");
+            return false;
+        }
+        const SLatDecoderBlockWeightsF32 & current = weights.blocks[block_index];
+        const SparseTensorF32 * guide = guide_subdivisions
+            ? &(*guide_subdivisions)[level] : nullptr;
+        SparseTensorF32 predicted;
+        if (config.pred_subdiv &&
+            !run_labeled_sparse_linear(hidden, current.to_subdiv_weight,
+                                       current.to_subdiv_bias, 8, predicted,
+                                       "decode.level=" + std::to_string(level) +
+                                           ".transition.to_subdiv", error)) {
+            return false;
+        }
+        const SparseTensorF32 * selected = config.pred_subdiv ? &predicted : guide;
+        SparseTensorF32 normalized;
+        if (!sparse_layer_norm(hidden, config.norm_eps, current.norm1_weight,
+                               current.norm1_bias, normalized, error)) return false;
+        silu_in_place(normalized);
+        SparseTensorF32 packed;
+        if (!gpu.run_conv(normalized, current.conv1_weight, current.conv1_bias,
+                          current.out_channels * 8, packed, error)) return false;
+        SparseTensorF32 hidden_spatial;
+        if (!sparse_channel_to_spatial(packed, 2, selected, hidden_spatial, error)) return false;
+        SparseTensorF32 skip_spatial;
+        if (!sparse_channel_to_spatial(hidden, 2, selected, skip_spatial, error)) return false;
+        gpu.invalidate_neighbor_map();
+        SparseTensorF32 skip;
+        if (!repeat_channels(skip_spatial, current.out_channels, skip, error)) return false;
+        if (!sparse_layer_norm(hidden_spatial, config.norm_eps, nullptr, nullptr,
+                               normalized, error)) return false;
+        silu_in_place(normalized);
+        if (!gpu.run_conv(normalized, current.conv2_weight, current.conv2_bias,
+                          current.out_channels, hidden, error) ||
+            !add_in_place(hidden, skip, error)) return false;
+        if (config.pred_subdiv && predicted_subdivisions) {
+            predicted_subdivisions->push_back(std::move(predicted));
+        }
+        ++block_index;
+    }
+    if (block_index != weights.blocks.size()) {
+        set_error(error, "SLat decoder GPU-first did not consume all block weights");
+        return false;
+    }
+    return true;
+}
+
 bool SLatDecoderModel::Impl::decode_gpu(
     const SparseTensorF32 & input,
     const std::vector<SparseTensorF32> * guide_subdivisions,
@@ -1628,6 +2365,10 @@ bool SLatDecoderModel::Impl::decode_gpu(
     if (!gpu.ready()) {
         set_error(error, "SLat decoder GPU state is not initialized");
         return false;
+    }
+    if (slat_decoder_gpu_first_enabled()) {
+        return decode_gpu_first(input, guide_subdivisions, output,
+                                predicted_subdivisions, error);
     }
     SLatDecoderInvocation invocation(
         gpu, slat_decoder_profile_enabled(),
@@ -1740,6 +2481,99 @@ bool SLatDecoderModel::Impl::decode_gpu(
     return true;
 }
 
+bool SLatDecoderModel::Impl::upsample_coords_gpu_first(
+    const SparseTensorF32 & input,
+    int upsample_times,
+    SparseTensorF32 & output,
+    std::string * error) {
+    SLatDecoderInvocation invocation(
+        gpu, slat_decoder_profile_enabled(),
+        slat_decoder_neighbor_cache_enabled(),
+        slat_decoder_neighbor_cache_validation_enabled());
+    SLatDecoderWeightsF32 weights;
+    if (!make_weights(weights, error)) return false;
+
+    SLatDecoderConfig config;
+    config.latent_channels = hp.latent_channels;
+    config.out_channels = hp.out_channels;
+    config.norm_eps = hp.norm_eps;
+    config.pred_subdiv = hp.pred_subdiv;
+    config.model_channels = hp.model_channels;
+    config.num_blocks = hp.num_blocks;
+    if (!config.pred_subdiv || upsample_times < 0 ||
+        upsample_times >= static_cast<int>(config.model_channels.size())) {
+        set_error(error, "invalid SLat decoder GPU-first coordinate-upsample request");
+        return false;
+    }
+
+    SparseTensorF32 hidden;
+    std::size_t block_index = 0;
+    for (std::size_t level = 0; level < config.model_channels.size(); ++level) {
+        const std::size_t block_count = static_cast<std::size_t>(config.num_blocks[level]);
+        const SLatDecoderBlockWeightsF32 * level_blocks = block_count > 0
+            ? weights.blocks.data() + block_index : nullptr;
+        SparseTensorF32 level_output;
+        if (!gpu.run_convnext_level(
+                level == 0 ? input : hidden,
+                level_blocks, block_count, config.norm_eps,
+                level == 0 ? weights.from_latent_weight : nullptr,
+                level == 0 ? weights.from_latent_bias : nullptr,
+                level == 0 ? config.model_channels.front() : 0,
+                false, nullptr, nullptr, 0,
+                "upsample.level=" + std::to_string(level), level_output, error)) {
+            return false;
+        }
+        block_index += block_count;
+        hidden = std::move(level_output);
+        if (static_cast<int>(level) == upsample_times) {
+            output = std::move(hidden);
+            return true;
+        }
+        if (level + 1 >= config.model_channels.size() ||
+            block_index >= weights.blocks.size() ||
+            weights.blocks[block_index].kind != SLatDecoderBlockKind::channel_to_spatial) {
+            set_error(error, "SLat decoder GPU-first coordinate upsample expected "
+                              "channel-to-spatial block");
+            return false;
+        }
+        const SLatDecoderBlockWeightsF32 & current = weights.blocks[block_index];
+        SparseTensorF32 predicted;
+        if (!run_labeled_sparse_linear(hidden, current.to_subdiv_weight,
+                                       current.to_subdiv_bias, 8, predicted,
+                                       "upsample.level=" + std::to_string(level) +
+                                           ".transition.to_subdiv", error)) {
+            return false;
+        }
+        SparseTensorF32 normalized;
+        if (!sparse_layer_norm(hidden, config.norm_eps, current.norm1_weight,
+                               current.norm1_bias, normalized, error)) return false;
+        silu_in_place(normalized);
+        SparseTensorF32 packed;
+        if (!gpu.run_conv(normalized, current.conv1_weight, current.conv1_bias,
+                          current.out_channels * 8, packed, error)) return false;
+        SparseTensorF32 hidden_spatial;
+        if (!sparse_channel_to_spatial(packed, 2, &predicted, hidden_spatial, error)) {
+            return false;
+        }
+        SparseTensorF32 skip_spatial;
+        if (!sparse_channel_to_spatial(hidden, 2, &predicted, skip_spatial, error)) {
+            return false;
+        }
+        gpu.invalidate_neighbor_map();
+        SparseTensorF32 skip;
+        if (!repeat_channels(skip_spatial, current.out_channels, skip, error)) return false;
+        if (!sparse_layer_norm(hidden_spatial, config.norm_eps, nullptr, nullptr,
+                               normalized, error)) return false;
+        silu_in_place(normalized);
+        if (!gpu.run_conv(normalized, current.conv2_weight, current.conv2_bias,
+                          current.out_channels, hidden, error) ||
+            !add_in_place(hidden, skip, error)) return false;
+        ++block_index;
+    }
+    set_error(error, "SLat decoder GPU-first coordinate upsample did not reach target level");
+    return false;
+}
+
 bool SLatDecoderModel::Impl::upsample_coords_gpu(
     const SparseTensorF32 & input,
     int upsample_times,
@@ -1749,6 +2583,9 @@ bool SLatDecoderModel::Impl::upsample_coords_gpu(
         upsample_times >= static_cast<int>(hp.model_channels.size())) {
         set_error(error, "invalid SLat decoder GPU coordinate-upsample request");
         return false;
+    }
+    if (slat_decoder_gpu_first_enabled()) {
+        return upsample_coords_gpu_first(input, upsample_times, output, error);
     }
     SLatDecoderInvocation invocation(
         gpu, slat_decoder_profile_enabled(),
