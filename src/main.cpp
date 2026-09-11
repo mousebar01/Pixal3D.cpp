@@ -531,7 +531,7 @@ int main(int argc, char ** argv) {
         pixal3d::Pixal3DInferenceConfig config =
             pixal3d::default_pixal3d_inference_config();
         pixal3d::Pixal3DImageConditionBundleConfig vision_config;
-        int texture_size = 256;
+        int texture_size = 512;
         CameraEstimation camera_estimation;
         std::string error;
         OutputSpec output_spec;
@@ -654,7 +654,7 @@ int main(int argc, char ** argv) {
         }
         pixal3d::Pixal3DInferenceConfig config =
             pixal3d::default_pixal3d_inference_config();
-        int texture_size = 256;
+        int texture_size = 512;
         std::string error;
         OutputSpec output_spec;
         if (!select_output_spec(argc, argv, 5, output_spec, &error) ||

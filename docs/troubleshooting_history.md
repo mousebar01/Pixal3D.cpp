@@ -274,9 +274,10 @@ quality reference; its fragmented preview is an expected consequence of those
 diagnostic settings and must not be used to diagnose the model or texture path.
 
 **Status:** current production geometry path passed. The default atlas is kept
-at `256` as a practical quality/speed compromise; `1024` is available for more
-detail and `4096` remains the explicit upstream-aligned quality setting. Full
-Python numerical parity remains a separate, explicitly unclaimed task.
+at `512` as a practical quality/speed compromise; `256` is available for the
+fastest textured iteration, `1024` for more detail, and `4096` remains the
+explicit upstream-aligned quality setting. Full Python numerical parity remains
+a separate, explicitly unclaimed task.
 
 ## 8. Upstream inference parameters and the C++ compatibility boundary
 
@@ -303,24 +304,25 @@ corresponding model stages and a separate compatibility task.
 The C++ sampler, guidance, normalization, token limit, decimation target, and
 condition resolutions already match the TRELLIS.2-based contract. The remaining parameter difference is intentional: the upstream inference
 script uses `4096`, but the C++ public exporter and CLI commands default to
-`256` because the current mesh postprocess and texture bake are CPU-heavy.
-`1024` and `4096` remain available explicitly for higher-detail and
-upstream-aligned quality validation. A local full run with `texture-size=4096`
-took about `3069` seconds; the phase
+`512` because the current mesh postprocess and texture bake are CPU-heavy.
+`256` remains available for the fastest textured iteration; `1024` and `4096`
+remain available explicitly for higher-detail and upstream-aligned quality
+validation. A local full run with `texture-size=4096` took about `3069` seconds; the phase
 log is cumulative, with approximately `851` seconds spent in QEM decimation
 and `186` seconds in UV bake/rasterization/inpaint. The 4096 atlas itself is
 not the source of the entire wall time.
 
-A fixed decoded cascade dump was exported at `texture-size=256` and rendered
-with Blender. The 256 and 1024 previews retained the major material regions,
-while the 64 preview collapsed more regions into a broad metallic-looking
-surface. The mean baked base-color values across atlas sizes stayed nearly the
-same, so the brighter 4096 preview is not evidence that higher resolution
-changes the whole material to white; it exposes more local variation and PBR
-highlights. The low-resolution result is a different sampling/averaging
-trade-off, not a more correct material.
+A fixed decoded cascade dump was exported at `texture-size=256` and `512` and
+rendered with Blender. Both sizes retained the major material regions without
+the broad metallic-looking collapse seen in the 64 preview; 512 preserved a
+little more local surface detail while remaining visually close to 256. The
+same mesh was produced in both exports (`Fo=981800`), and the mean baked
+base-color values stayed nearly the same. Therefore, the brighter 4096 preview
+is not evidence that higher resolution changes the whole material to white; it
+exposes more local variation and PBR highlights. The low-resolution result is a
+different sampling/averaging trade-off, not a more correct material.
 
-**Prevention rule:** use `256` for normal development, `1024` when more texture
-detail is needed, and explicit `4096` for upstream-aligned quality runs. Never
-use `texture-size=64` as a quality claim; it is only a fast workflow smoke-test
-setting.
+**Prevention rule:** use `512` for normal development, `256` for the fastest
+textured iteration, `1024` when more texture detail is needed, and explicit
+`4096` for upstream-aligned quality runs. Never use `texture-size=64` as a
+quality claim; it is only a fast workflow smoke-test setting.
