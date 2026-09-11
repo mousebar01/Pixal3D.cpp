@@ -327,15 +327,149 @@ textured iteration, `1024` when more texture detail is needed, and explicit
 `4096` for upstream-aligned quality runs. Never use `texture-size=64` as a
 quality claim; it is only a fast workflow smoke-test setting.
 
-## 9. Decoder appears slower while GPU utilization is lower
+## 9. GPU-first SLat decoder rollout and C2S boundary
+
+### Scope
+
+On September 11, 2026, the level-local GPU-first decoder path was committed as
+`d355be9` (`perf: keep SLat decoder levels GPU-first`). It uses the existing
+GGML scheduler and CUDA operations for the fixed-topology level graph, while
+keeping coordinates and topology-changing metadata on the host.
+
+The current working-tree patch extends that path to the channel-to-spatial
+(C2S) transition. The C2S feature arithmetic (LayerNorm, SiLU, both sparse
+convolutions, channel regrouping, skip-channel repeat, and residual add) is
+represented by one scheduler graph. CPU code still builds the child-selection
+index and output coordinates. To make the topology decision observable and
+conservative, `to_subdiv` is currently evaluated with the CPU
+`sparse_linear()` reference, but it consumes the hidden features produced by
+the preceding GPU graph; this is not equivalent to running the whole prefix on
+CPU.
+
+### Regressions found and fixed during implementation
+
+1. The first C2S attempt passed `hidden` as both the const input and output of
+the new helper. The helper cleared `output` at entry, which also cleared the
+input object through the alias and produced `input_channels=0`. The call sites
+now write to a temporary `SparseTensorF32` and move it back into `hidden` only
+after the graph succeeds. This aliasing rule is part of the GPU-helper
+contract.
+2. The original C2S graph used `ggml_concat(ctx, input, zero_column, 1)` to
+append the sentinel row. On CUDA, that maps the row count directly to
+`grid.y`; a real input with more than 65,535 rows failed with
+`CUDA error: invalid configuration argument`. The graph now uses a repeated
+zero tensor followed by `ggml_set()`, which preserves the sentinel semantics
+without the `grid.y` limit.
+
+### Real-input evidence
+
+The real input was
+`/tmp/pixal3d-old-pre-f37-0910/shape_slat_high.bin`, decoded with
+`pixal3d-shared-f16.gguf` in the CUDA Docker image (`CUDA 12.6.3`, ggml
+`0.9.9`, RTX 4090 D). The synthetic CUDA fixture still passes:
+
+```text
+SLat GPU-first fixture: PASS
+subdivision_max_abs=9.54932e-06
+subdivision_max_rel=0.00611262
+max_abs=3.11807e-05
+max_rel=0.0157362
+mean_abs=7.29475e-06
+```
+
+The real probe completed successfully in both GPU-first modes:
+
+| Run | Decoder-reported time | Probe wall time | Result directory |
+| --- | ---: | ---: | --- |
+| GPU-first, GPU `to_subdiv` | 45.2109 s | 83.40 s | `/tmp/pixal3d-gpu-first-real-0911` |
+| GPU-first, CPU `to_subdiv` | 43.0445 s | 81.36 s | `/tmp/pixal3d-gpu-first-real-cpu-topology-0911` |
+| Forced CPU reference | not emitted | 1822.58 s | `/tmp/pixal3d-cpu-reference-0911` |
+| Previous hybrid GPU path | 596.873 s | not recorded in the same probe | `/tmp/pixal3d-slat-full-cache-IfQAGY` |
+
+The CPU probe's wall time includes dump writing and mesh extraction, so it is
+not a decoder-only timing. The GPU rows use the decoder timing emitted by the
+model plus the complete dump-probe wall time; they are retained as evidence of
+the scale of the performance difference, not as a like-for-like microbenchmark.
+
+The active-child topology is not exact on the real input. The observed point
+counts are:
+
+| Path | level 0 | level 1 | level 2 | level 3 | final output |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Previous hybrid GPU path | 9,857 | 46,537 | 206,980 | 909,164 | 4,005,638 |
+| GPU-first, GPU `to_subdiv` | 9,857 | 46,537 | 206,980 | 909,168 | 4,005,677 |
+| GPU-first, CPU `to_subdiv` | 9,857 | 46,537 | 206,980 | 909,164 | 4,005,584 |
+| Forced CPU reference | 9,857 | 46,537 | 206,981 | 909,172 | 4,005,637 |
+
+For the current GPU-first/CPU-`to_subdiv` run compared with the forced CPU
+reference, coordinate-aligned feature diagnostics were:
+
+| Tensor | Common coordinates | CPU-only | GPU-only | Sign differences | Mean absolute error | Max absolute error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `subdiv_0` | 9,857 | 0 | 0 | 0 | 0.00845 | 0.10417 |
+| `subdiv_1` | 46,537 | 0 | 0 | 1 | 0.00935 | 0.07845 |
+| `subdiv_2` | 206,980 | 1 | 0 | 88 | 0.00531 | 13.42216 |
+| `subdiv_3` | 909,124 | 48 | 40 | 1,624 | 0.00515 | 14.62862 |
+| `output` | 4,004,739 | 898 | 845 | 17,763 | 0.00876 | 80.01348 |
+
+Relative error is not used as a gate in this table: it is dominated by values
+near zero and by rows whose downstream topology has already diverged. The
+`subdiv_1` sign difference is enough to alter one child coordinate at the next
+level; after that point, row-wise comparison without coordinate alignment is
+misleading.
+
+### Root cause and interpretation
+
+The CPU reference accumulates each output in the portable loop order
+`out -> in`. The GPU path uses ggml CUDA `mul_mat` and sparse gather/matrix
+products, whose reduction and operation ordering are different. Both paths
+use F32 tensors and the same logical weights, but they need not produce the
+same last bits (or even the same few ulps around zero). The subdivision decision
+is discontinuous because a child is selected when its logit is `> 0`, so a small
+arithmetic difference can change the sparse coordinate set and amplify through
+all later levels.
+
+The forced CPU result also differs from the previous hybrid GPU result at
+levels 2--4 (for example, 206,981 versus 206,980 points at level 2). That is
+consistent with the same CPU/GPU reduction-order sensitivity and means that the
+old hybrid output cannot be treated as an exact CPU oracle for topology.
+
+Using CPU `to_subdiv` reduces one source of topology drift, but it cannot restore
+exact CPU topology after the hidden feature tensor has already been computed by
+the GPU. Therefore the current real-model result demonstrates a large
+performance improvement and finite outputs, but **does not establish exact
+active-child or coordinate parity**.
+
+### Current status and next step
+
+- The `ggml_concat` large-row CUDA failure is fixed and covered by the real
+  smoke run plus the synthetic C2S fixture.
+- The current GPU-first path has `cpu_fallback_ops=0` inside the feature graph,
+  and no custom CUDA kernel, weight relayout, persistent activation tensor,
+  validation redesign, or neighbor-map cache extension was introduced.
+- The synthetic fixture verifies exact coordinates for its deterministic small
+  pack. It does not prove real-weight topology parity.
+- Do not describe the real GPU-first decoder as exact-parity or merge a relaxed
+  real-model tolerance solely to make the point counts pass. The next change
+  should isolate the topology decision and define an explicit CPU/GPU parity
+  policy before formal decoder rollout. If exact topology is required, the
+  options are a CPU/reference topology path with a documented performance cost,
+  or a numerically matched GPU implementation; neither is completed by this
+  patch.
+
+**Status:** performance validation succeeded; real-weight topology parity is
+unresolved. The current working-tree C2S extension remains an investigation
+patch and has not been committed.
+
+## 10. Decoder appears slower while GPU utilization is lower
 
 ### Symptom
 
-A full image-to-3D run can appear to have a slower decoder even though the
-CUDA graph is selected, while a live GPU monitor shows a lower or more
-intermittent GPU utilization peak. This is a misleading symptom of the
-current hybrid decoder path, not evidence that the texture atlas setting made
-the decoder slower.
+A full image-to-3D run could appear to have a slower decoder even though the
+CUDA graph was selected, while a live GPU monitor showed a lower or more
+intermittent GPU utilization peak. This was a symptom of the pre-`d355be9`
+hybrid decoder path, not evidence that the texture atlas setting made the
+decoder slower. The numbers below are retained as historical baseline data.
 
 ### Evidence
 
@@ -388,12 +522,14 @@ cache disabled: 635.113 s, neighbor_map_builds=40, cache_hits=0
 
 ### Root cause
 
-The SLat decoder is only partially GPU-resident. Sparse convolution graph
-nodes run on CUDA, but the surrounding feature operations return to host-side
-C++ vectors. Each decoder block therefore alternates between CPU work and
-short GPU bursts. A GPU monitor can show low average utilization or low peaks
-while the end-to-end decoder remains slow; the observed wall time is real, but
-it is CPU-bound rather than GPU-compute-bound.
+At that point, the SLat decoder was only partially GPU-resident. Sparse
+convolution graph nodes ran on CUDA, but the surrounding feature operations
+returned to host-side C++ vectors. Each decoder block therefore alternated
+between CPU work and short GPU bursts. A GPU monitor could show low average
+utilization or low peaks while the end-to-end decoder remained slow; the
+observed wall time was real, but it was CPU-bound rather than GPU-compute-bound.
+The later GPU-first rollout is documented in section 9, with its separate
+real-weight topology-parity limitation.
 
 The normal backend `memory=` log reports free VRAM/total VRAM, not GPU
 utilization. It must not be interpreted as a compute-usage or throughput

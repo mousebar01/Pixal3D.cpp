@@ -847,10 +847,20 @@ ggml_tensor * gpu_sparse_conv_node(
         index_tensors.size() != 27 || input_channels <= 0 || output_channels <= 0) {
         return nullptr;
     }
-    // Append one explicit zero point on device.  GET_ROWS then uses the same
-    // sentinel convention as the existing sparse-conv implementation without
-    // downloading or rebuilding an intermediate feature matrix.
-    ggml_tensor * padded = ggml_concat(ctx, input, zero_column, 1);
+    // Append one explicit zero point on device.  Do not use ggml_concat here:
+    // the CUDA concat kernel maps dimension 1 directly to grid.y and therefore
+    // rejects sparse tensors with more than 65,535 rows.  Repeat a zero row
+    // across the destination shape and overwrite the first input rows instead;
+    // both ggml operations use CUDA paths that flatten large tensors safely.
+    if (input->ne[1] >= std::numeric_limits<int64_t>::max()) return nullptr;
+    ggml_tensor * padded_shape = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, input->ne[0], input->ne[1] + 1);
+    ggml_tensor * zero_padded = padded_shape
+        ? ggml_repeat(ctx, zero_column, padded_shape) : nullptr;
+    ggml_tensor * padded = zero_padded
+        ? ggml_set(ctx, zero_padded, input,
+                   zero_padded->nb[1], zero_padded->nb[2], zero_padded->nb[3], 0)
+        : nullptr;
     if (!padded) return nullptr;
 
     ggml_tensor * accumulator = nullptr;
@@ -915,6 +925,97 @@ ggml_tensor * gpu_convnext_block_node(
     if (!projected) return nullptr;
     ggml_tensor * residual = ggml_add(ctx, projected, input);
     return name_gpu_tensor(ggml_cont(ctx, residual), name);
+}
+
+struct GpuChannelToSpatialLayout {
+    int output_channels = 0;
+    int spatial_x = 0;
+    int spatial_y = 0;
+    int spatial_z = 0;
+    std::vector<std::int32_t> gather_indices;
+    std::vector<std::int32_t> coords;
+};
+
+bool build_gpu_channel_to_spatial_layout(
+    const SparseTensorF32 & input,
+    int output_channels,
+    const SparseTensorF32 * subdivision,
+    GpuChannelToSpatialLayout & layout,
+    std::string * error) {
+    layout = GpuChannelToSpatialLayout{};
+    constexpr std::size_t child_count = 8;
+    if (input.channels <= 0 || input.channels % static_cast<int>(child_count) != 0 ||
+        output_channels <= 0) {
+        set_error(error, "SLat decoder GPU channel-to-spatial channel layout is invalid");
+        return false;
+    }
+    if (subdivision) {
+        if (!validate_decoder_sparse_tensor(
+                *subdivision, "gpu_channel_to_spatial.subdivision", error) ||
+            subdivision->batch_size != input.batch_size ||
+            subdivision->channels != static_cast<int>(child_count) ||
+            subdivision->coords != input.coords) {
+            set_error(error, "SLat decoder GPU subdivision shape or coordinates do not match input");
+            return false;
+        }
+    }
+    if (input.spatial_x > std::numeric_limits<int>::max() / 2 ||
+        input.spatial_y > std::numeric_limits<int>::max() / 2 ||
+        input.spatial_z > std::numeric_limits<int>::max() / 2) {
+        set_error(error, "SLat decoder GPU channel-to-spatial output shape overflows int");
+        return false;
+    }
+    if (input.points() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) /
+                             child_count) {
+        set_error(error, "SLat decoder GPU channel-to-spatial index count is invalid");
+        return false;
+    }
+
+    std::size_t selected = 0;
+    for (std::size_t point = 0; point < input.points(); ++point) {
+        for (std::size_t child = 0; child < child_count; ++child) {
+            if (!subdivision || subdivision->feats[point * child_count + child] > 0.0f) {
+                ++selected;
+            }
+        }
+    }
+    if (selected == 0) {
+        set_error(error, "SLat decoder GPU channel-to-spatial selected no active children");
+        return false;
+    }
+    if (selected > std::numeric_limits<std::size_t>::max() / 4) {
+        set_error(error, "SLat decoder GPU channel-to-spatial coordinate count overflows size_t");
+        return false;
+    }
+
+    layout.output_channels = output_channels;
+    layout.spatial_x = input.spatial_x * 2;
+    layout.spatial_y = input.spatial_y * 2;
+    layout.spatial_z = input.spatial_z * 2;
+    layout.gather_indices.reserve(selected);
+    layout.coords.resize(selected * 4);
+    std::size_t destination = 0;
+    for (std::size_t point = 0; point < input.points(); ++point) {
+        const int batch = input.coords[point * 4 + 0];
+        const int x = input.coords[point * 4 + 1];
+        const int y = input.coords[point * 4 + 2];
+        const int z = input.coords[point * 4 + 3];
+        for (std::size_t child = 0; child < child_count; ++child) {
+            if (subdivision && subdivision->feats[point * child_count + child] <= 0.0f) {
+                continue;
+            }
+            layout.gather_indices.push_back(static_cast<std::int32_t>(point * child_count + child));
+            const int child_x = static_cast<int>(child & 1u);
+            const int child_y = static_cast<int>((child >> 1u) & 1u);
+            const int child_z = static_cast<int>((child >> 2u) & 1u);
+            layout.coords[destination * 4 + 0] = batch;
+            layout.coords[destination * 4 + 1] = x * 2 + child_x;
+            layout.coords[destination * 4 + 2] = y * 2 + child_y;
+            layout.coords[destination * 4 + 3] = z * 2 + child_z;
+            ++destination;
+        }
+    }
+    return true;
 }
 
 void log_decoder_profile(const SLatDecoderProfile & profile,
@@ -1288,6 +1389,24 @@ struct SLatDecoderGpuState {
         SparseTensorF32 & output,
         std::string * error);
 
+    bool run_linear(
+        const SparseTensorF32 & input,
+        const float * host_weight,
+        const float * host_bias,
+        int out_channels,
+        const std::string & label,
+        SparseTensorF32 & output,
+        std::string * error);
+
+    bool run_c2s_transition(
+        const SparseTensorF32 & input,
+        const SLatDecoderBlockWeightsF32 & block,
+        float norm_eps,
+        const SparseTensorF32 * subdivision,
+        const std::string & label,
+        SparseTensorF32 & output,
+        std::string * error);
+
     bool init(const Pixal3DPackReader & reader,
               const std::string & component,
               const std::unordered_map<std::string, std::vector<float>> & host,
@@ -1653,6 +1772,580 @@ bool SLatDecoderGpuState::prepare_neighbor_map(
     }
     return record_decoder_conv(profile, topology_generation, input,
                                coordinate_fingerprint, cache_hit, error);
+}
+
+bool SLatDecoderGpuState::run_linear(
+    const SparseTensorF32 & input,
+    const float * host_weight,
+    const float * host_bias,
+    int out_channels,
+    const std::string & label,
+    SparseTensorF32 & output,
+    std::string * error) {
+    output = SparseTensorF32{};
+    if (!ready() || !backend_manager || !backend_manager->initialized()) {
+        set_error(error, label + ": GPU state is not initialized");
+        return false;
+    }
+    if (out_channels <= 0) {
+        set_error(error, label + ": output channel count must be positive");
+        return false;
+    }
+
+    const bool trace = slat_decoder_trace_enabled();
+    const double input_validation_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    const bool input_valid = validate_decoder_sparse_tensor(
+        input, (label + ".input").c_str(), error);
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::input_validation_ms,
+                                  input_validation_begin);
+    }
+    if (!input_valid) return false;
+
+    const std::size_t points = input.points();
+    if (points == 0 || points > static_cast<std::size_t>(std::numeric_limits<int64_t>::max())) {
+        set_error(error, label + ": point count is invalid");
+        return false;
+    }
+    ggml_tensor * weight_tensor = weight(host_weight);
+    ggml_tensor * bias_tensor = weight(host_bias);
+    if (!weight_tensor || !bias_tensor) {
+        set_error(error, label + ": linear weights are not resident on GPU");
+        return false;
+    }
+    if (weight_tensor->type != GGML_TYPE_F32 ||
+        weight_tensor->ne[0] != input.channels ||
+        weight_tensor->ne[1] != out_channels ||
+        bias_tensor->type != GGML_TYPE_F32 ||
+        bias_tensor->ne[0] != out_channels) {
+        set_error(error, label + ": GPU linear tensor shape mismatch");
+        return false;
+    }
+
+    constexpr int graph_capacity = 128;
+    const double graph_build_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    ggml_init_params params{};
+    params.mem_size = ggml_tensor_overhead() * graph_capacity +
+                      ggml_graph_overhead_custom(graph_capacity, false) + 4096;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        set_error(error, label + ": failed to allocate GPU linear graph context");
+        return false;
+    }
+    ggml_tensor * input_tensor = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, input.channels, static_cast<int64_t>(points));
+    if (!input_tensor) {
+        ggml_free(ctx);
+        set_error(error, label + ": failed to allocate GPU linear input");
+        return false;
+    }
+    ggml_set_name(input_tensor, (label + ".input").c_str());
+    ggml_set_input(input_tensor);
+    ggml_tensor * result_tensor = gpu_linear_node(
+        ctx, input_tensor, weight_tensor, bias_tensor, label + ".output");
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_capacity, false);
+    if (!result_tensor || !graph) {
+        ggml_free(ctx);
+        set_error(error, label + ": failed to build GPU linear graph");
+        return false;
+    }
+    ggml_set_output(result_tensor);
+    ggml_build_forward_expand(graph, result_tensor);
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::graph_build_ms,
+                                  graph_build_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "graph_build",
+                           backend_time_now_ms() - graph_build_begin);
+    }
+
+    const double allocation_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    std::string scheduler_error;
+    BackendScheduler scheduler(*backend_manager, graph_capacity, false, true,
+                               &scheduler_error, label.c_str());
+    if (!scheduler.valid() ||
+        (backend_manager->requires_primary_backend() &&
+         !scheduler.require_primary_graph(graph, &scheduler_error)) ||
+        !scheduler.allocate_graph(graph, &scheduler_error)) {
+        scheduler.synchronize();
+        scheduler = BackendScheduler{};
+        ggml_free(ctx);
+        set_error(error, scheduler_error.empty()
+            ? label + ": failed to allocate GPU linear graph" : scheduler_error);
+        return false;
+    }
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::scheduler_allocate_ms,
+                                  allocation_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "scheduler_allocate",
+                           backend_time_now_ms() - allocation_begin);
+    }
+
+    const double input_upload_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    ggml_backend_tensor_set(input_tensor, input.feats.data(), 0,
+                            input.feats.size() * sizeof(float));
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::input_upload_ms,
+                                  input_upload_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "input_upload",
+                           backend_time_now_ms() - input_upload_begin);
+    }
+
+    const double compute_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    const ggml_status status = scheduler.compute(graph, &scheduler_error);
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::gpu_compute_ms, compute_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "gpu_compute",
+                           backend_time_now_ms() - compute_begin);
+    }
+    if (status != GGML_STATUS_SUCCESS) {
+        set_error(error, label + ": GPU linear graph compute failed" +
+                          (scheduler_error.empty() ? std::string{} : ": " + scheduler_error));
+        scheduler.synchronize();
+        scheduler = BackendScheduler{};
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<float> result_values(points * static_cast<std::size_t>(out_channels));
+    const double output_download_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    ggml_backend_tensor_get(result_tensor, result_values.data(), 0,
+                            result_values.size() * sizeof(float));
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::output_download_ms,
+                                  output_download_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "output_download",
+                           backend_time_now_ms() - output_download_begin);
+    }
+
+    output = input;
+    output.channels = out_channels;
+    output.feats = std::move(result_values);
+    const double output_validation_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    const bool output_valid = validate_decoder_sparse_tensor(
+        output, (label + ".output").c_str(), error);
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::output_validation_ms,
+                                  output_validation_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "output_validation",
+                           backend_time_now_ms() - output_validation_begin);
+    }
+    scheduler.synchronize();
+    scheduler = BackendScheduler{};
+    ggml_free(ctx);
+    return output_valid;
+}
+
+bool SLatDecoderGpuState::run_c2s_transition(
+    const SparseTensorF32 & input,
+    const SLatDecoderBlockWeightsF32 & block,
+    float norm_eps,
+    const SparseTensorF32 * subdivision,
+    const std::string & label,
+    SparseTensorF32 & output,
+    std::string * error) {
+    output = SparseTensorF32{};
+    if (!ready() || !backend_manager || !backend_manager->initialized()) {
+        set_error(error, label + ": GPU state is not initialized");
+        return false;
+    }
+    if (!valid_eps(norm_eps, error) ||
+        block.kind != SLatDecoderBlockKind::channel_to_spatial ||
+        block.channels != input.channels || block.out_channels <= 0) {
+        set_error(error, label + ": invalid channel-to-spatial block configuration"
+            " (kind=" + std::to_string(static_cast<int>(block.kind)) +
+            " block_channels=" + std::to_string(block.channels) +
+            " input_channels=" + std::to_string(input.channels) +
+            " out_channels=" + std::to_string(block.out_channels) +
+            " norm_eps=" + std::to_string(norm_eps) + ")");
+        return false;
+    }
+
+    const bool trace = slat_decoder_trace_enabled();
+    const double input_validation_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    const bool input_valid = validate_decoder_sparse_tensor(
+        input, (label + ".input").c_str(), error);
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::input_validation_ms,
+                                  input_validation_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "input_validation",
+                           backend_time_now_ms() - input_validation_begin);
+    }
+    if (!input_valid) return false;
+
+    if (!block.norm1_weight || !block.norm1_bias || !block.conv1_weight ||
+        !block.conv1_bias || !block.conv2_weight || !block.conv2_bias) {
+        set_error(error, label + ": channel-to-spatial weights are missing");
+        return false;
+    }
+    if (input.points() == 0 ||
+        input.points() > static_cast<std::size_t>(std::numeric_limits<int32_t>::max()) / 8) {
+        set_error(error, label + ": point count is invalid for GPU channel-to-spatial");
+        return false;
+    }
+
+    GpuChannelToSpatialLayout layout;
+    if (!build_gpu_channel_to_spatial_layout(input, block.out_channels, subdivision,
+                                             layout, error)) {
+        return false;
+    }
+    const std::size_t points = input.points();
+    const std::size_t output_points = layout.gather_indices.size();
+    const int output_channels = layout.output_channels;
+    if (output_points == 0 || output_channels <= 0 ||
+        output_points > std::numeric_limits<std::size_t>::max() /
+                            static_cast<std::size_t>(output_channels)) {
+        set_error(error, label + ": invalid GPU channel-to-spatial output size");
+        return false;
+    }
+    const int skip_channels = input.channels / 8;
+    if (skip_channels <= 0 || block.out_channels % skip_channels != 0) {
+        set_error(error, label + ": skip channels are not repeatable on GPU");
+        return false;
+    }
+    if (output_channels != block.out_channels) {
+        set_error(error, label + ": channel-to-spatial output channels do not match block");
+        return false;
+    }
+    const int repeats = block.out_channels / skip_channels;
+    const std::size_t packed_points = points * 8;
+
+    auto lookup_weight = [this, &label, error](const float * host,
+                                                const std::string & name) -> ggml_tensor * {
+        if (!host) {
+            set_error(error, label + ": missing weight " + name);
+            return nullptr;
+        }
+        ggml_tensor * tensor = weight(host);
+        if (!tensor) {
+            set_error(error, label + ": weight is not resident on GPU: " + name);
+            return nullptr;
+        }
+        return tensor;
+    };
+    ggml_tensor * norm1_weight = lookup_weight(block.norm1_weight, "norm1.weight");
+    ggml_tensor * norm1_bias = lookup_weight(block.norm1_bias, "norm1.bias");
+    ggml_tensor * conv1_weight = lookup_weight(block.conv1_weight, "conv1.weight");
+    ggml_tensor * conv1_bias = lookup_weight(block.conv1_bias, "conv1.bias");
+    ggml_tensor * conv2_weight = lookup_weight(block.conv2_weight, "conv2.weight");
+    ggml_tensor * conv2_bias = lookup_weight(block.conv2_bias, "conv2.bias");
+    if (!norm1_weight || !norm1_bias || !conv1_weight || !conv1_bias ||
+        !conv2_weight || !conv2_bias) {
+        return false;
+    }
+    if (norm1_weight->type != GGML_TYPE_F32 || norm1_weight->ne[0] != input.channels ||
+        norm1_bias->type != GGML_TYPE_F32 || norm1_bias->ne[0] != input.channels ||
+        conv1_weight->type != GGML_TYPE_F32 || conv1_weight->ne[0] != input.channels ||
+        conv1_weight->ne[1] != block.out_channels * 8 || conv1_weight->ne[2] != 27 ||
+        conv1_bias->type != GGML_TYPE_F32 || conv1_bias->ne[0] != block.out_channels * 8 ||
+        conv2_weight->type != GGML_TYPE_F32 || conv2_weight->ne[0] != block.out_channels ||
+        conv2_weight->ne[1] != block.out_channels || conv2_weight->ne[2] != 27 ||
+        conv2_bias->type != GGML_TYPE_F32 || conv2_bias->ne[0] != block.out_channels) {
+        set_error(error, label + ": channel-to-spatial GPU tensor shape mismatch");
+        return false;
+    }
+
+    NeighborGatherMap input_local_map;
+    NeighborGatherMap * input_map = nullptr;
+    bool input_cache_hit = false;
+    std::uint64_t input_fingerprint = 0;
+    if (!prepare_neighbor_map(input, input_local_map, input_map, input_cache_hit,
+                              input_fingerprint, error)) {
+        return false;
+    }
+
+    SparseTensorF32 output_meta;
+    output_meta.batch_size = input.batch_size;
+    output_meta.channels = output_channels;
+    output_meta.spatial_x = layout.spatial_x;
+    output_meta.spatial_y = layout.spatial_y;
+    output_meta.spatial_z = layout.spatial_z;
+    output_meta.coords = std::move(layout.coords);
+
+    // C2S changes the coordinate topology.  Keep the new topology on the host,
+    // but prepare its neighbor map before building the GPU graph so conv2 can
+    // consume the same sentinel-index convention as the reference path.  Do
+    // not invalidate the input cache yet: input_map may point at
+    // current_neighbor_map, and the graph still needs it for conv1.
+    NeighborGatherMap output_local_map;
+    NeighborGatherMap * output_map = &output_local_map;
+    const bool output_cache_hit = false;
+    const std::uint64_t output_fingerprint = profile
+        ? decoder_coords_fingerprint(output_meta.coords) : 0;
+    if (!build_neighbor_gather_map(output_meta, output_fingerprint, output_local_map,
+                                   profile, error)) {
+        return false;
+    }
+    if (!input_map || input_map->gather_indices.size() != points * 27 ||
+        output_map->gather_indices.size() != output_points * 27) {
+        set_error(error, label + ": invalid GPU channel-to-spatial neighbor maps");
+        return false;
+    }
+
+    constexpr int graph_capacity = 4096;
+    const double graph_build_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    ggml_init_params params{};
+    params.mem_size = ggml_tensor_overhead() * graph_capacity +
+                      ggml_graph_overhead_custom(graph_capacity, false) + 8192;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        set_error(error, label + ": failed to allocate GPU channel-to-spatial graph context");
+        return false;
+    }
+
+    ggml_tensor * input_tensor = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, input.channels, static_cast<int64_t>(points));
+    ggml_tensor * zero_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input.channels, 1);
+    ggml_tensor * zero_output = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, output_channels, 1);
+    if (!input_tensor || !zero_input || !zero_output) {
+        ggml_free(ctx);
+        set_error(error, label + ": failed to allocate GPU channel-to-spatial inputs");
+        return false;
+    }
+    ggml_set_name(input_tensor, (label + ".input").c_str());
+    ggml_set_name(zero_input, (label + ".zero_input").c_str());
+    ggml_set_name(zero_output, (label + ".zero_output").c_str());
+    ggml_set_input(input_tensor);
+    ggml_set_input(zero_input);
+    ggml_set_input(zero_output);
+
+    std::vector<ggml_tensor *> input_index_tensors;
+    std::vector<ggml_tensor *> output_index_tensors;
+    input_index_tensors.reserve(27);
+    output_index_tensors.reserve(27);
+    for (int kernel = 0; kernel < 27; ++kernel) {
+        ggml_tensor * input_index = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I32, static_cast<int64_t>(points));
+        ggml_tensor * output_index = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I32, static_cast<int64_t>(output_points));
+        if (!input_index || !output_index) {
+            ggml_free(ctx);
+            set_error(error, label + ": failed to allocate GPU neighbor indices");
+            return false;
+        }
+        ggml_set_name(input_index,
+                      (label + ".input_neighbor." + std::to_string(kernel)).c_str());
+        ggml_set_name(output_index,
+                      (label + ".output_neighbor." + std::to_string(kernel)).c_str());
+        ggml_set_input(input_index);
+        ggml_set_input(output_index);
+        input_index_tensors.push_back(input_index);
+        output_index_tensors.push_back(output_index);
+    }
+    ggml_tensor * c2s_index = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_I32, static_cast<int64_t>(output_points));
+    if (!c2s_index) {
+        ggml_free(ctx);
+        set_error(error, label + ": failed to allocate GPU channel-to-spatial indices");
+        return false;
+    }
+    ggml_set_name(c2s_index, (label + ".channel_to_spatial_index").c_str());
+    ggml_set_input(c2s_index);
+
+    ggml_tensor * normalized = gpu_layer_norm_affine_node(
+        ctx, input_tensor, norm1_weight, norm1_bias, norm_eps, label + ".norm1");
+    normalized = normalized ? name_gpu_tensor(
+        ggml_silu(ctx, normalized), label + ".norm1.silu") : nullptr;
+    ggml_tensor * packed = normalized ? gpu_sparse_conv_node(
+        ctx, normalized, zero_input, conv1_weight, conv1_bias,
+        input_index_tensors, input.channels, block.out_channels * 8,
+        label + ".conv1") : nullptr;
+    ggml_tensor * packed_rows = packed ? ggml_reshape_2d(
+        ctx, packed, block.out_channels, static_cast<int64_t>(packed_points)) : nullptr;
+    ggml_tensor * hidden_spatial = packed_rows ? ggml_get_rows(ctx, packed_rows, c2s_index)
+                                                : nullptr;
+    hidden_spatial = hidden_spatial ? name_gpu_tensor(
+        ggml_cont(ctx, hidden_spatial), label + ".channel_to_spatial") : nullptr;
+    ggml_tensor * normalized2 = hidden_spatial ? gpu_layer_norm_node(
+        ctx, hidden_spatial, norm_eps, label + ".norm2") : nullptr;
+    normalized2 = normalized2 ? name_gpu_tensor(
+        ggml_silu(ctx, normalized2), label + ".norm2.silu") : nullptr;
+    ggml_tensor * convolved = normalized2 ? gpu_sparse_conv_node(
+        ctx, normalized2, zero_output, conv2_weight, conv2_bias,
+        output_index_tensors, output_channels, output_channels,
+        label + ".conv2") : nullptr;
+
+    ggml_tensor * skip_rows = input_tensor ? ggml_reshape_2d(
+        ctx, input_tensor, skip_channels, static_cast<int64_t>(packed_points)) : nullptr;
+    ggml_tensor * skip_selected = skip_rows ? ggml_get_rows(ctx, skip_rows, c2s_index) : nullptr;
+    ggml_tensor * skip_3d = skip_selected ? ggml_reshape_3d(
+        ctx, skip_selected, 1, skip_channels, static_cast<int64_t>(output_points)) : nullptr;
+    ggml_tensor * repeat_target = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, repeats, skip_channels, static_cast<int64_t>(output_points));
+    ggml_tensor * repeated = skip_3d && repeat_target
+        ? ggml_repeat(ctx, skip_3d, repeat_target) : nullptr;
+    ggml_tensor * skip_output = repeated ? ggml_reshape_2d(
+        ctx, repeated, output_channels, static_cast<int64_t>(output_points)) : nullptr;
+    ggml_tensor * result = convolved && skip_output
+        ? ggml_add(ctx, convolved, skip_output) : nullptr;
+    result = result ? name_gpu_tensor(ggml_cont(ctx, result), label + ".output") : nullptr;
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_capacity, false);
+    if (!result || !graph) {
+        ggml_free(ctx);
+        set_error(error, label + ": failed to build GPU channel-to-spatial graph");
+        return false;
+    }
+    ggml_set_output(result);
+    ggml_build_forward_expand(graph, result);
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::graph_build_ms,
+                                  graph_build_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "graph_build",
+                           backend_time_now_ms() - graph_build_begin);
+    }
+
+    const double allocation_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    std::string scheduler_error;
+    BackendScheduler scheduler(*backend_manager, graph_capacity, false, true,
+                               &scheduler_error, label.c_str());
+    if (!scheduler.valid() ||
+        (backend_manager->requires_primary_backend() &&
+         !scheduler.require_primary_graph(graph, &scheduler_error)) ||
+        !scheduler.allocate_graph(graph, &scheduler_error)) {
+        scheduler.synchronize();
+        scheduler = BackendScheduler{};
+        ggml_free(ctx);
+        set_error(error, scheduler_error.empty()
+            ? label + ": failed to allocate GPU channel-to-spatial graph" : scheduler_error);
+        return false;
+    }
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::scheduler_allocate_ms,
+                                  allocation_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "scheduler_allocate",
+                           backend_time_now_ms() - allocation_begin);
+    }
+
+    std::vector<float> zero_input_values(static_cast<std::size_t>(input.channels), 0.0f);
+    std::vector<float> zero_output_values(static_cast<std::size_t>(output_channels), 0.0f);
+    const double input_upload_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    ggml_backend_tensor_set(input_tensor, input.feats.data(), 0,
+                            input.feats.size() * sizeof(float));
+    ggml_backend_tensor_set(zero_input, zero_input_values.data(), 0,
+                            zero_input_values.size() * sizeof(float));
+    ggml_backend_tensor_set(zero_output, zero_output_values.data(), 0,
+                            zero_output_values.size() * sizeof(float));
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::input_upload_ms,
+                                  input_upload_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "input_upload",
+                           backend_time_now_ms() - input_upload_begin);
+    }
+
+    const double index_upload_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    for (int kernel = 0; kernel < 27; ++kernel) {
+        const std::size_t offset = static_cast<std::size_t>(kernel) * points;
+        ggml_backend_tensor_set(input_index_tensors[static_cast<std::size_t>(kernel)],
+                                input_map->gather_indices.data() + offset, 0,
+                                points * sizeof(std::int32_t));
+        const std::size_t output_offset = static_cast<std::size_t>(kernel) * output_points;
+        ggml_backend_tensor_set(output_index_tensors[static_cast<std::size_t>(kernel)],
+                                output_map->gather_indices.data() + output_offset, 0,
+                                output_points * sizeof(std::int32_t));
+    }
+    ggml_backend_tensor_set(c2s_index, layout.gather_indices.data(), 0,
+                            layout.gather_indices.size() * sizeof(std::int32_t));
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::index_upload_ms,
+                                  index_upload_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "index_upload",
+                           backend_time_now_ms() - index_upload_begin);
+    }
+
+    const double compute_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    const ggml_status status = scheduler.compute(graph, &scheduler_error);
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::gpu_compute_ms, compute_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "gpu_compute",
+                           backend_time_now_ms() - compute_begin);
+    }
+    if (status != GGML_STATUS_SUCCESS) {
+        set_error(error, label + ": GPU channel-to-spatial graph compute failed" +
+                          (scheduler_error.empty() ? std::string{} : ": " + scheduler_error));
+        scheduler.synchronize();
+        scheduler = BackendScheduler{};
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<float> result_values(output_points * static_cast<std::size_t>(output_channels));
+    const double output_download_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    ggml_backend_tensor_get(result, result_values.data(), 0,
+                            result_values.size() * sizeof(float));
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::output_download_ms,
+                                  output_download_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "output_download",
+                           backend_time_now_ms() - output_download_begin);
+    }
+
+    output = std::move(output_meta);
+    output.feats = std::move(result_values);
+    const double output_validation_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
+    bool output_valid = validate_decoder_sparse_tensor(
+        output, (label + ".output").c_str(), error);
+    if (profile) {
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::output_validation_ms,
+                                  output_validation_begin);
+    }
+    if (trace) {
+        backend_log_timing(label.c_str(), "output_validation",
+                           backend_time_now_ms() - output_validation_begin);
+    }
+    if (output_valid) {
+        // Publish the new topology only after the graph has completed and the
+        // output passed the same structural validation as the CPU reference.
+        // This preserves the input map while conv1 is executing and makes the
+        // output map available as a cache hit for the next decoder level.
+        invalidate_neighbor_map();
+        if (neighbor_cache_enabled) {
+            current_neighbor_map = std::move(output_local_map);
+            has_neighbor_map = true;
+        }
+        output_valid = record_decoder_conv(
+            profile, topology_generation, output, output_fingerprint, false, error);
+    }
+    if (trace) {
+        std::cerr << "pixal3d: GPU-first C2S label=" << label
+                  << " input_points=" << points
+                  << " output_points=" << output_points
+                  << " input_cache=" << (input_cache_hit ? "hit" : "miss")
+                  << " output_cache=" << (output_cache_hit ? "hit" : "miss")
+                  << " h2d_indices=" << 55
+                  << " weight_uploads=0"
+                  << " cpu_fallback_ops=0" << std::endl;
+    }
+    scheduler.synchronize();
+    scheduler = BackendScheduler{};
+    ggml_free(ctx);
+    return output_valid;
 }
 
 bool SLatDecoderGpuState::run_convnext_level(
@@ -2276,7 +2969,7 @@ bool SLatDecoderModel::Impl::decode_gpu_first(
 
     std::cerr << "pixal3d: " << component
               << " SLat GPU-first decoder path enabled"
-              << " (features stay on GPU within each level; C2S remains host boundary)"
+              << " (feature math stays on GPU; C2S topology remains host boundary)"
               << std::endl;
 
     SparseTensorF32 hidden;
@@ -2317,33 +3010,24 @@ bool SLatDecoderModel::Impl::decode_gpu_first(
             ? &(*guide_subdivisions)[level] : nullptr;
         SparseTensorF32 predicted;
         if (config.pred_subdiv &&
-            !run_labeled_sparse_linear(hidden, current.to_subdiv_weight,
-                                       current.to_subdiv_bias, 8, predicted,
-                                       "decode.level=" + std::to_string(level) +
-                                           ".transition.to_subdiv", error)) {
+            // Child signs are a topology decision.  Keep this tiny boundary
+            // on the CPU reference path so GPU reduction-order differences
+            // cannot change the active-child mask or output coordinates.
+            !run_labeled_sparse_linear(
+                hidden, current.to_subdiv_weight, current.to_subdiv_bias, 8,
+                predicted, "decode.level=" + std::to_string(level) +
+                               ".transition.to_subdiv", error)) {
             return false;
         }
         const SparseTensorF32 * selected = config.pred_subdiv ? &predicted : guide;
-        SparseTensorF32 normalized;
-        if (!sparse_layer_norm(hidden, config.norm_eps, current.norm1_weight,
-                               current.norm1_bias, normalized, error)) return false;
-        silu_in_place(normalized);
-        SparseTensorF32 packed;
-        if (!gpu.run_conv(normalized, current.conv1_weight, current.conv1_bias,
-                          current.out_channels * 8, packed, error)) return false;
-        SparseTensorF32 hidden_spatial;
-        if (!sparse_channel_to_spatial(packed, 2, selected, hidden_spatial, error)) return false;
-        SparseTensorF32 skip_spatial;
-        if (!sparse_channel_to_spatial(hidden, 2, selected, skip_spatial, error)) return false;
-        gpu.invalidate_neighbor_map();
-        SparseTensorF32 skip;
-        if (!repeat_channels(skip_spatial, current.out_channels, skip, error)) return false;
-        if (!sparse_layer_norm(hidden_spatial, config.norm_eps, nullptr, nullptr,
-                               normalized, error)) return false;
-        silu_in_place(normalized);
-        if (!gpu.run_conv(normalized, current.conv2_weight, current.conv2_bias,
-                          current.out_channels, hidden, error) ||
-            !add_in_place(hidden, skip, error)) return false;
+        SparseTensorF32 transitioned;
+        if (!gpu.run_c2s_transition(
+                hidden, current, config.norm_eps, selected,
+                "decode.level=" + std::to_string(level) + ".transition",
+                transitioned, error)) {
+            return false;
+        }
+        hidden = std::move(transitioned);
         if (config.pred_subdiv && predicted_subdivisions) {
             predicted_subdivisions->push_back(std::move(predicted));
         }
@@ -2538,36 +3222,22 @@ bool SLatDecoderModel::Impl::upsample_coords_gpu_first(
         }
         const SLatDecoderBlockWeightsF32 & current = weights.blocks[block_index];
         SparseTensorF32 predicted;
-        if (!run_labeled_sparse_linear(hidden, current.to_subdiv_weight,
-                                       current.to_subdiv_bias, 8, predicted,
-                                       "upsample.level=" + std::to_string(level) +
-                                           ".transition.to_subdiv", error)) {
+        // Keep subdivision logits on the CPU reference path for the same
+        // topology determinism guarantee as decode_gpu_first().
+        if (!run_labeled_sparse_linear(
+                hidden, current.to_subdiv_weight, current.to_subdiv_bias, 8,
+                predicted, "upsample.level=" + std::to_string(level) +
+                               ".transition.to_subdiv", error)) {
             return false;
         }
-        SparseTensorF32 normalized;
-        if (!sparse_layer_norm(hidden, config.norm_eps, current.norm1_weight,
-                               current.norm1_bias, normalized, error)) return false;
-        silu_in_place(normalized);
-        SparseTensorF32 packed;
-        if (!gpu.run_conv(normalized, current.conv1_weight, current.conv1_bias,
-                          current.out_channels * 8, packed, error)) return false;
-        SparseTensorF32 hidden_spatial;
-        if (!sparse_channel_to_spatial(packed, 2, &predicted, hidden_spatial, error)) {
+        SparseTensorF32 transitioned;
+        if (!gpu.run_c2s_transition(
+                hidden, current, config.norm_eps, &predicted,
+                "upsample.level=" + std::to_string(level) + ".transition",
+                transitioned, error)) {
             return false;
         }
-        SparseTensorF32 skip_spatial;
-        if (!sparse_channel_to_spatial(hidden, 2, &predicted, skip_spatial, error)) {
-            return false;
-        }
-        gpu.invalidate_neighbor_map();
-        SparseTensorF32 skip;
-        if (!repeat_channels(skip_spatial, current.out_channels, skip, error)) return false;
-        if (!sparse_layer_norm(hidden_spatial, config.norm_eps, nullptr, nullptr,
-                               normalized, error)) return false;
-        silu_in_place(normalized);
-        if (!gpu.run_conv(normalized, current.conv2_weight, current.conv2_bias,
-                          current.out_channels, hidden, error) ||
-            !add_in_place(hidden, skip, error)) return false;
+        hidden = std::move(transitioned);
         ++block_index;
     }
     set_error(error, "SLat decoder GPU-first coordinate upsample did not reach target level");

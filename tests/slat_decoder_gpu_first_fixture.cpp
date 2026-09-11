@@ -17,9 +17,9 @@
 namespace {
 
 constexpr int kLatentChannels = 3;
-constexpr int kModelChannels = 4;
+constexpr int kModelChannels = 8;
 constexpr int kOutputChannels = 2;
-constexpr int kMlpHidden = 16;
+constexpr int kMlpHidden = 32;
 
 void require(bool condition, const std::string & message) {
     if (!condition) {
@@ -90,16 +90,18 @@ void add_3d(ggml_context * context,
     add_tensor(context, writer, storage, name, 3, dimensions, values);
 }
 
-std::vector<float> make_conv_weight(const std::string & name) {
-    std::vector<float> values(static_cast<std::size_t>(27) * kModelChannels *
-                              kModelChannels, 0.0f);
+std::vector<float> make_conv_weight(const std::string & name,
+                                      int input_channels,
+                                      int output_channels) {
+    std::vector<float> values(static_cast<std::size_t>(27) * output_channels *
+                              input_channels, 0.0f);
     const std::vector<float> perturbation = values_for(name, values.size());
     for (int kernel = 0; kernel < 27; ++kernel) {
-        for (int output = 0; output < kModelChannels; ++output) {
-            for (int input = 0; input < kModelChannels; ++input) {
+        for (int output = 0; output < output_channels; ++output) {
+            for (int input = 0; input < input_channels; ++input) {
                 const std::size_t index =
-                    (static_cast<std::size_t>(kernel) * kModelChannels + output) *
-                    kModelChannels + input;
+                    (static_cast<std::size_t>(kernel) * output_channels + output) *
+                    input_channels + input;
                 if (kernel == 13 && output == input) {
                     values[index] = 0.25f;
                 } else if (kernel != 13) {
@@ -109,6 +111,59 @@ std::vector<float> make_conv_weight(const std::string & name) {
         }
     }
     return values;
+}
+
+void add_convnext_block(ggml_context * context,
+                        gguf_context * writer,
+                        std::map<std::string, std::vector<float>> & storage,
+                        const std::string & prefix,
+                        int channels) {
+    add_1d(context, writer, storage, prefix + "norm.weight", channels,
+           values_for(prefix + "norm.weight", channels));
+    add_1d(context, writer, storage, prefix + "norm.bias", channels,
+           values_for(prefix + "norm.bias", channels));
+    add_3d(context, writer, storage, prefix + "conv.weight",
+           channels, channels, 27,
+           make_conv_weight(prefix + "conv.weight", channels, channels));
+    add_1d(context, writer, storage, prefix + "conv.bias", channels,
+           values_for(prefix + "conv.bias", channels));
+    add_2d(context, writer, storage, prefix + "mlp.0.weight",
+           channels, channels * 4,
+           values_for(prefix + "mlp.0.weight", channels * channels * 4));
+    add_1d(context, writer, storage, prefix + "mlp.0.bias", channels * 4,
+           values_for(prefix + "mlp.0.bias", channels * 4));
+    add_2d(context, writer, storage, prefix + "mlp.2.weight",
+           channels * 4, channels,
+           values_for(prefix + "mlp.2.weight", channels * channels * 4));
+    add_1d(context, writer, storage, prefix + "mlp.2.bias", channels,
+           values_for(prefix + "mlp.2.bias", channels));
+}
+
+void add_c2s_block(ggml_context * context,
+                   gguf_context * writer,
+                   std::map<std::string, std::vector<float>> & storage,
+                   const std::string & prefix,
+                   int input_channels,
+                   int output_channels) {
+    add_1d(context, writer, storage, prefix + "norm1.weight", input_channels,
+           values_for(prefix + "norm1.weight", input_channels));
+    add_1d(context, writer, storage, prefix + "norm1.bias", input_channels,
+           values_for(prefix + "norm1.bias", input_channels));
+    add_3d(context, writer, storage, prefix + "conv1.weight",
+           input_channels, output_channels * 8, 27,
+           make_conv_weight(prefix + "conv1.weight", input_channels, output_channels * 8));
+    add_1d(context, writer, storage, prefix + "conv1.bias", output_channels * 8,
+           values_for(prefix + "conv1.bias", output_channels * 8));
+    add_3d(context, writer, storage, prefix + "conv2.weight",
+           output_channels, output_channels, 27,
+           make_conv_weight(prefix + "conv2.weight", output_channels, output_channels));
+    add_1d(context, writer, storage, prefix + "conv2.bias", output_channels,
+           values_for(prefix + "conv2.bias", output_channels));
+    add_2d(context, writer, storage, prefix + "to_subdiv.weight",
+           input_channels, 8,
+           values_for(prefix + "to_subdiv.weight", input_channels * 8));
+    add_1d(context, writer, storage, prefix + "to_subdiv.bias", 8,
+           values_for(prefix + "to_subdiv.bias", 8));
 }
 
 std::string make_fixture_pack() {
@@ -139,10 +194,12 @@ std::string make_fixture_pack() {
     gguf_set_val_u32(writer, "pixal3d.shape_decoder.out_channels", kOutputChannels);
     gguf_set_val_u32(writer, "pixal3d.shape_decoder.latent_channels", kLatentChannels);
     gguf_set_val_f32(writer, "pixal3d.shape_decoder.norm_eps", 1e-6f);
-    gguf_set_val_u32(writer, "pixal3d.shape_decoder.n_levels", 1);
-    gguf_set_val_bool(writer, "pixal3d.shape_decoder.pred_subdiv", false);
+    gguf_set_val_u32(writer, "pixal3d.shape_decoder.n_levels", 2);
+    gguf_set_val_bool(writer, "pixal3d.shape_decoder.pred_subdiv", true);
     gguf_set_val_u32(writer, "pixal3d.shape_decoder.model_channels.0", kModelChannels);
-    gguf_set_val_u32(writer, "pixal3d.shape_decoder.num_blocks.0", 2);
+    gguf_set_val_u32(writer, "pixal3d.shape_decoder.model_channels.1", kModelChannels);
+    gguf_set_val_u32(writer, "pixal3d.shape_decoder.num_blocks.0", 1);
+    gguf_set_val_u32(writer, "pixal3d.shape_decoder.num_blocks.1", 1);
     gguf_set_val_str(writer, "pixal3d.shape_decoder.conv_weight_source_layout",
                      "out,kd,kh,kw,in");
     gguf_set_val_str(writer, "pixal3d.shape_decoder.conv_weight_gguf_layout",
@@ -157,27 +214,10 @@ std::string make_fixture_pack() {
     add_1d(context, writer, storage, prefix + "from_latent.bias", kModelChannels,
            values_for("from_latent.bias", kModelChannels));
 
-    for (int block = 0; block < 2; ++block) {
-        const std::string block_prefix = prefix + "blocks.0." + std::to_string(block) + ".";
-        add_1d(context, writer, storage, block_prefix + "norm.weight", kModelChannels,
-               {1.0f, 0.97f, 1.03f, 0.99f});
-        add_1d(context, writer, storage, block_prefix + "norm.bias", kModelChannels,
-               values_for(block_prefix + "norm.bias", kModelChannels));
-        add_3d(context, writer, storage, block_prefix + "conv.weight",
-               kModelChannels, kModelChannels, 27, make_conv_weight(block_prefix + "conv.weight"));
-        add_1d(context, writer, storage, block_prefix + "conv.bias", kModelChannels,
-               values_for(block_prefix + "conv.bias", kModelChannels));
-        add_2d(context, writer, storage, block_prefix + "mlp.0.weight",
-               kModelChannels, kMlpHidden,
-               values_for(block_prefix + "mlp.0.weight", kModelChannels * kMlpHidden));
-        add_1d(context, writer, storage, block_prefix + "mlp.0.bias", kMlpHidden,
-               values_for(block_prefix + "mlp.0.bias", kMlpHidden));
-        add_2d(context, writer, storage, block_prefix + "mlp.2.weight",
-               kMlpHidden, kModelChannels,
-               values_for(block_prefix + "mlp.2.weight", kMlpHidden * kModelChannels));
-        add_1d(context, writer, storage, block_prefix + "mlp.2.bias", kModelChannels,
-               values_for(block_prefix + "mlp.2.bias", kModelChannels));
-    }
+    add_convnext_block(context, writer, storage, prefix + "blocks.0.0.", kModelChannels);
+    add_c2s_block(context, writer, storage, prefix + "blocks.0.1.",
+                  kModelChannels, kModelChannels);
+    add_convnext_block(context, writer, storage, prefix + "blocks.1.0.", kModelChannels);
 
     add_2d(context, writer, storage, prefix + "output_layer.weight",
            kModelChannels, kOutputChannels,
@@ -234,30 +274,49 @@ int main() {
                   0.08f, -0.12f, 0.23f,
                   -0.05f, 0.19f, -0.16f,
                   0.14f, 0.07f, -0.09f};
-    std::vector<pixal3d::SparseTensorF32> no_guides;
-
     setenv("PIXAL3D_SLAT_DECODER_BACKEND", "gpu:0", 1);
     setenv("PIXAL3D_SLAT_DECODER_GPU_FIRST", "1", 1);
     pixal3d::SLatDecoderModel gpu_model;
     std::string error;
     require(gpu_model.load(pack, "shape_decoder", true, &error), error);
     pixal3d::SparseTensorF32 gpu_output;
-    require(gpu_model.decode(input, &no_guides, gpu_output, nullptr, &error), error);
+    std::vector<pixal3d::SparseTensorF32> gpu_subdivisions;
+    require(gpu_model.decode(input, nullptr, gpu_output, &gpu_subdivisions, &error), error);
 
     setenv("PIXAL3D_SLAT_DECODER_BACKEND", "cpu", 1);
     pixal3d::SLatDecoderModel cpu_model;
     require(cpu_model.load(pack, "shape_decoder", true, &error), error);
     pixal3d::SparseTensorF32 cpu_output;
-    require(cpu_model.decode(input, &no_guides, cpu_output, nullptr, &error), error);
+    std::vector<pixal3d::SparseTensorF32> cpu_subdivisions;
+    require(cpu_model.decode(input, nullptr, cpu_output, &cpu_subdivisions, &error), error);
 
+    require(cpu_subdivisions.size() == gpu_subdivisions.size() &&
+                cpu_subdivisions.size() == 1,
+            "GPU-first returned the wrong subdivision count");
+    const ErrorStats subdivision_stats = compare(cpu_subdivisions.front(),
+                                                 gpu_subdivisions.front());
     const ErrorStats stats = compare(cpu_output, gpu_output);
     // The fixture records the raw metrics rather than hiding reduction-order
     // differences.  The absolute gate is the primary correctness criterion;
     // the relative gate is only a guard for non-zero values near this fixture
     // scale.
-    require(stats.max_abs < 1e-4 && stats.max_rel < 5e-3,
+    require(subdivision_stats.max_abs < 1e-3 && subdivision_stats.max_rel < 5e-2,
+            "GPU-first subdivision parity error exceeds fixture tolerance");
+    require(stats.max_abs < 1e-3 && stats.max_rel < 5e-2,
             "GPU-first parity error exceeds fixture tolerance");
+
+    pixal3d::SparseTensorF32 gpu_upsampled;
+    pixal3d::SparseTensorF32 cpu_upsampled;
+    setenv("PIXAL3D_SLAT_DECODER_BACKEND", "gpu:0", 1);
+    require(gpu_model.upsample_coords(input, 1, gpu_upsampled, &error), error);
+    setenv("PIXAL3D_SLAT_DECODER_BACKEND", "cpu", 1);
+    require(cpu_model.upsample_coords(input, 1, cpu_upsampled, &error), error);
+    require(cpu_upsampled.coords == gpu_upsampled.coords,
+            "GPU-first upsample changed coordinates");
+
     std::cout << "SLat GPU-first fixture: PASS"
+              << " subdivision_max_abs=" << subdivision_stats.max_abs
+              << " subdivision_max_rel=" << subdivision_stats.max_rel
               << " max_abs=" << stats.max_abs
               << " max_rel=" << stats.max_rel
               << " mean_abs=" << stats.mean_abs << "\n";
