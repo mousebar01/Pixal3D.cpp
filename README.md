@@ -63,18 +63,20 @@ The SLat components are `shape_decoder|texture_decoder` and
 ./build/bin/pixal3d inspect-pack build/weights/pixal3d-shared-f16.gguf
 ./build/bin/pixal3d estimate-model build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-base-flow-f32.gguf
 # Recommended: omit the output path to create ./output.glb with PBR textures.
-./build/bin/pixal3d run-cascade build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-base-flow-f32.gguf conditions.p3dcond --resolution 1024 --texture-size 1024 --seed 42 --max-model-gib 32
+./build/bin/pixal3d run-cascade build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-base-flow-f32.gguf conditions.p3dcond --resolution 1024 --texture-size 256 --seed 42 --max-model-gib 32
 # The same textured output with an explicit path.
-./build/bin/pixal3d run-cascade build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-base-flow-f32.gguf conditions.p3dcond output.glb --resolution 1024 --texture-size 1024 --seed 42 --max-model-gib 32
+./build/bin/pixal3d run-cascade build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-base-flow-f32.gguf conditions.p3dcond output.glb --resolution 1024 --texture-size 256 --seed 42 --max-model-gib 32
 # Compatibility output: explicit OBJ is geometry-only.
 ./build/bin/pixal3d run-cascade build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-base-flow-f32.gguf conditions.p3dcond output.obj --resolution 1024 --seed 42 --max-model-gib 32
-./build/bin/pixal3d run-cascade-mv build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-mv-flow-f32.gguf views.p3dmvcon output.glb --resolution 1024 --texture-size 1024 --max-model-gib 32
+./build/bin/pixal3d run-cascade-mv build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-mv-flow-f32.gguf views.p3dmvcon output.glb --resolution 1024 --texture-size 256 --max-model-gib 32
 ```
 
 Run options are `--seed`, `--resolution 1024`, `--max-tokens`, `--steps` (>0),
 `--occupancy-threshold`, `--max-structure-points` (>0), `--fov` (0..pi radians),
 `--distance` (>0), `--mesh-scale` (>0), `--max-model-gib`, and
-`--texture-size` (1..4096 for `.glb` output). `--fov` and `--distance` apply to
+`--texture-size` (1..4096 for `.glb` output; default `256`). Use `1024`
+for a higher-detail export or `4096` for an upstream-aligned quality export;
+larger atlases are substantially slower with the current CPU mesh postprocess path. `--fov` and `--distance` apply to
 explicit-condition cascade commands; `run-image` always estimates its camera
 with MoGe. The native exporter bakes a
 chart-unwrapped atlas through the mesh postprocess chain in

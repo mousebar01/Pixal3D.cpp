@@ -13,7 +13,7 @@ namespace pixal3d {
 // GLB positions and normals use the final Python textured-GLB frame
 // (x, y, z) -> (-x, +y, -z).
 struct Pixal3DGlbOptions {
-    int texture_size = 1024;
+    int texture_size = 256;
     // Face-count target for the export decimation pass (quadric simplification
     // via the vendored meshoptimizer), matching the reference to_glb
     // decimation_target.  Simplification runs before UV unwrapping because

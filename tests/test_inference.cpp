@@ -1,4 +1,5 @@
 #include "pixal3d/inference.h"
+#include "pixal3d/texture_export.h"
 
 #include <cstdio>
 #include <fstream>
@@ -11,6 +12,7 @@ int main() {
         pixal3d::default_pixal3d_inference_config();
     if (config.cascade.requested_resolution != 1024 ||
         config.cascade.max_num_tokens != 49152 ||
+        pixal3d::Pixal3DGlbOptions{}.texture_size != 256 ||
         config.cascade.shape_normalization.mean.size() != 32 ||
         config.cascade.texture_normalization.std.size() != 32 ||
         config.cascade.shape_sampler.steps != 12 ||

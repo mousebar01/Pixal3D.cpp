@@ -215,12 +215,12 @@ weights/Pixal3D/test_inputs/armor_knight.png
 SHA-256: d4e48ed407101749dc7bfe0bcafcdadd27278fbe563038a9c49ad9e5ff58bc19
 ```
 
-The production-quality validation used the current CUDA Docker image and
-current `build-cuda-docker/bin/pixal3d` binary. It kept `resolution=1024`, the
+The diagnostic validation used the current CUDA Docker image and current
+`build-cuda-docker/bin/pixal3d` binary. It kept `resolution=1024`, the
 production `steps=12`, occupancy threshold `0`, and no structure-point cap.
-Only `texture-size=64` was used to keep this validation from spending additional
-time on a 1024x1024 atlas; the decoded geometry and texture channels still ran
-through the normal four-stage cascade.
+It explicitly used `texture-size=64` only to check the end-to-end path quickly;
+the decoded geometry and texture channels still ran through the normal
+four-stage cascade, but this atlas size is not a visual quality reference.
 
 The command was:
 
@@ -264,10 +264,63 @@ validated independently:
   successfully.
 
 This confirms the current code can perform a real image-to-3D run and emit a
-structurally valid, renderable textured asset. The earlier bounded smoke output
+structurally valid, renderable textured asset. The 64x64 result is a workflow
+smoke test only. A separate upstream-aligned `texture-size=4096` run also
+completed successfully; its output was structurally valid and rendered in
+Blender, but it took about 3069 seconds on the local RTX 4090 D because the
+current C++ mesh postprocess is CPU-heavy. The earlier bounded smoke output
 (`steps=2`, threshold `-100`, and a `4096`-point cap) is intentionally not a
 quality reference; its fragmented preview is an expected consequence of those
 diagnostic settings and must not be used to diagnose the model or texture path.
 
-**Status:** current production geometry path passed; 1024x1024 atlas quality and
-full Python numerical parity remain separate, explicitly unclaimed tasks.
+**Status:** current production geometry path passed. The default atlas is kept
+at `256` as a practical quality/speed compromise; `1024` is available for more
+detail and `4096` remains the explicit upstream-aligned quality setting. Full
+Python numerical parity remains a separate, explicitly unclaimed task.
+
+## 8. Upstream inference parameters and the C++ compatibility boundary
+
+The official `TencentARC/Pixal3D` repository exposes two different contracts:
+
+- the `paper` branch is the original Direct3D-S2-based implementation used for
+  the paper results; its CLI uses a dense stage (`50` steps), sparse `512`
+  (`30` steps), sparse `1024` (`15` steps), fixed camera FOV `0.2`,
+  `mesh_scale=0.9`, and dense/MC thresholds `0.1`/`0.2`;
+- the default branch is the later TRELLIS.2-based release used by the current
+  `ref/Pixal3D` checkout. Its image inference uses 12 steps for all three
+  samplers, `max_num_tokens=49152`, `decimation_target=1000000`, and
+  `texture_size=4096`. The released condition inputs are `512/512/1024/1024`
+  pixels with NAF targets `0/512/512/1024` for `ss/shape_512/shape_1024/tex_1024`.
+  Standard inference defaults to `1536`; the low-VRAM path uses `1024`.
+
+The C++ model packs and four-stage cascade are ported from the latter contract,
+not from the paper branch. Applying the paper-branch step schedule or fixed
+camera to this binary would mix incompatible model/checkpoint contracts rather
+than reproduce the paper. The C++ pipeline currently supports the upstream
+low-VRAM-equivalent `1024` final cascade only; adding `1536` would require the
+corresponding model stages and a separate compatibility task.
+
+The C++ sampler, guidance, normalization, token limit, decimation target, and
+condition resolutions already match the TRELLIS.2-based contract. The remaining parameter difference is intentional: the upstream inference
+script uses `4096`, but the C++ public exporter and CLI commands default to
+`256` because the current mesh postprocess and texture bake are CPU-heavy.
+`1024` and `4096` remain available explicitly for higher-detail and
+upstream-aligned quality validation. A local full run with `texture-size=4096`
+took about `3069` seconds; the phase
+log is cumulative, with approximately `851` seconds spent in QEM decimation
+and `186` seconds in UV bake/rasterization/inpaint. The 4096 atlas itself is
+not the source of the entire wall time.
+
+A fixed decoded cascade dump was exported at `texture-size=256` and rendered
+with Blender. The 256 and 1024 previews retained the major material regions,
+while the 64 preview collapsed more regions into a broad metallic-looking
+surface. The mean baked base-color values across atlas sizes stayed nearly the
+same, so the brighter 4096 preview is not evidence that higher resolution
+changes the whole material to white; it exposes more local variation and PBR
+highlights. The low-resolution result is a different sampling/averaging
+trade-off, not a more correct material.
+
+**Prevention rule:** use `256` for normal development, `1024` when more texture
+detail is needed, and explicit `4096` for upstream-aligned quality runs. Never
+use `texture-size=64` as a quality claim; it is only a fast workflow smoke-test
+setting.
