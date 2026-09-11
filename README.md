@@ -309,6 +309,41 @@ neighborhood attention remain CPU-resident. SLat decoder sparse coordinate,
 subdivision, and packing work likewise remain CPU-side; its GPU path is
 partial, not a claim of whole-stage GPU execution.
 
+For the partial GPU SLat decoder, `PIXAL3D_SLAT_DECODER_PROFILE=1` emits
+per-convolution topology fingerprints, cache hit/miss counts, timing for
+validation, gather-map construction/upload, graph allocation, GPU compute,
+output handling, and the CPU sparse operators that remain in the path.
+`PIXAL3D_SLAT_DECODER_TRACE=1` additionally emits the existing detailed
+per-convolution records (and `PIXAL3D_BACKEND_TRACE=1` enables backend timing
+records). The decoder now reuses the CPU neighbor gather map for the current
+coordinate topology by default; set
+`PIXAL3D_SLAT_DECODER_NEIGHBOR_CACHE=0` to force the uncached comparison path.
+Set `PIXAL3D_VALIDATE_SPARSE_MAP_CACHE=1` to rebuild the reference map on every
+cache hit and perform an exact 27-offset comparison. This validation mode is
+for debugging and benchmarking only: it intentionally adds CPU work and does
+not create persistent GPU index tensors.
+
+When decoder profiling is enabled, the report also includes
+`sparse_linear_breakdown`, one `sparse_linear_call` record per invocation, and
+`sparse_linear_shape` aggregates sorted by cumulative wall time. The breakdown
+fields are sequential/exclusive segments inside each `sparse_linear()` call:
+`input_validation`, `copy_shape`, `output_allocation`, `bias`, and
+`actual_compute`; `other` is the residual to the call timer. The
+`input_validation` segment includes the call to `SparseTensorF32::valid()`, so
+that validation cost is not added again when reading the separate `sparse_valid`
+summary. `sparse_linear()` does not validate its output, which is reported as
+`output_validation_in_linear=0`; decoder GPU convolution output validation is
+reported separately.
+
+The profiling-only decomposition runs bias initialization and the
+multiply/add pass separately to measure them independently. It preserves the
+per-output accumulation order and is used for diagnosis only; its wall time is
+not a production benchmark. The report also records OpenMP max/observed thread
+counts and build feature flags. `valid_group` records classify validation calls
+as stage-boundary, topology-changing, pointwise hot-path, sparse-convolution,
+or other/debug paths for planning an explicit trusted validation path without
+silently removing release checks.
+
 ## Release packages
 
 Release archives contain the CLI and documentation only. Model weights, GGUF

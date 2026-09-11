@@ -1,10 +1,16 @@
 #include "pixal3d/sparse.h"
 
+#include "sparse_profile.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
 #include <unordered_map>
+
+#if defined(_OPENMP)
+    #include <omp.h>
+#endif
 
 namespace pixal3d {
 namespace {
@@ -63,7 +69,137 @@ bool check_weights(const SparseTensorF32 & input, int out_channels,
     return true;
 }
 
+double sparse_profile_elapsed_ms(
+    const std::chrono::steady_clock::time_point begin) noexcept {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+}
+
+class SparseValidationProfileRecordScope {
+public:
+    SparseValidationProfileRecordScope(const SparseTensorF32 & input,
+                                       detail::SparseProfileStats * stats)
+        : input_(input), stats_(stats), begin_(stats ? clock::now() : clock::time_point{}) {
+        if (stats_) {
+            const char * label = detail::sparse_validation_profile_label();
+            label_ = label && *label ? label : "unlabelled";
+        }
+    }
+
+    ~SparseValidationProfileRecordScope() {
+        if (!stats_) return;
+        detail::SparseValidationProfileRecord record;
+        record.label = label_;
+        record.points = input_.points();
+        record.channels = input_.channels;
+        record.elapsed_ms = sparse_profile_elapsed_ms(begin_);
+        record.coord_hashmap_ms = coord_hashmap_ms_;
+        record.feature_scan_ms = feature_scan_ms_;
+        record.success = success_;
+        stats_->validation_records.push_back(std::move(record));
+    }
+
+    void set_coord_hashmap_ms(double elapsed_ms) noexcept {
+        coord_hashmap_ms_ = elapsed_ms;
+    }
+
+    void set_feature_scan_ms(double elapsed_ms) noexcept {
+        feature_scan_ms_ = elapsed_ms;
+    }
+
+    void mark_success() noexcept { success_ = true; }
+
+    SparseValidationProfileRecordScope(const SparseValidationProfileRecordScope &) = delete;
+    SparseValidationProfileRecordScope & operator=(
+        const SparseValidationProfileRecordScope &) = delete;
+
+private:
+    using clock = std::chrono::steady_clock;
+
+    const SparseTensorF32 & input_;
+    detail::SparseProfileStats * stats_ = nullptr;
+    clock::time_point begin_{};
+    std::string label_;
+    double coord_hashmap_ms_ = 0.0;
+    double feature_scan_ms_ = 0.0;
+    bool success_ = false;
+};
+
+class SparseLinearProfileRecordScope {
+public:
+    SparseLinearProfileRecordScope(const SparseTensorF32 & input,
+                                   int output_channels,
+                                   detail::SparseProfileStats * stats)
+        : stats_(stats), begin_(stats ? clock::now() : clock::time_point{}) {
+        record_.points = input.points();
+        record_.input_channels = input.channels;
+        record_.output_channels = output_channels;
+        if (stats_) {
+            const char * label = detail::sparse_linear_profile_label();
+            record_.label = label && *label ? label : "unlabelled";
+#if defined(_OPENMP)
+            record_.omp_max_threads = omp_get_max_threads();
+#endif
+        }
+    }
+
+    ~SparseLinearProfileRecordScope() {
+        if (!stats_) return;
+        record_.total_ms = sparse_profile_elapsed_ms(begin_);
+        const double accounted = record_.input_validation_ms + record_.copy_shape_ms +
+                                 record_.output_allocation_ms + record_.actual_compute_ms +
+                                 record_.bias_ms + record_.output_validation_ms;
+        record_.other_ms = std::max(0.0, record_.total_ms - accounted);
+        stats_->sparse_linear_input_validation_ms += record_.input_validation_ms;
+        stats_->sparse_linear_copy_shape_ms += record_.copy_shape_ms;
+        stats_->sparse_linear_output_allocation_ms += record_.output_allocation_ms;
+        stats_->sparse_linear_actual_compute_ms += record_.actual_compute_ms;
+        stats_->sparse_linear_bias_ms += record_.bias_ms;
+        stats_->sparse_linear_output_validation_ms += record_.output_validation_ms;
+        stats_->sparse_linear_other_ms += record_.other_ms;
+        stats_->sparse_linear_records.push_back(std::move(record_));
+    }
+
+    detail::SparseLinearProfileRecord & record() noexcept { return record_; }
+
+    void mark_success() noexcept { record_.success = true; }
+
+    SparseLinearProfileRecordScope(const SparseLinearProfileRecordScope &) = delete;
+    SparseLinearProfileRecordScope & operator=(const SparseLinearProfileRecordScope &) = delete;
+
+private:
+    using clock = std::chrono::steady_clock;
+
+    detail::SparseProfileStats * stats_ = nullptr;
+    clock::time_point begin_{};
+    detail::SparseLinearProfileRecord record_;
+};
+
+bool validate_sparse_tensor(const SparseTensorF32 & input,
+                            const char * operation,
+                            std::string * error) {
+    detail::SparseProfileStats * stats = detail::sparse_profile_current();
+    if (!stats) return input.valid(error);
+
+    std::string label = operation && *operation ? operation : "unlabelled";
+    if (const char * linear_label = detail::sparse_linear_profile_label();
+        linear_label && *linear_label) {
+        label += "[";
+        label += linear_label;
+        label += "]";
+    }
+    detail::SparseValidationProfileLabelScope label_scope(label.c_str());
+    return input.valid(error);
+}
+
 void copy_shape(const SparseTensorF32 & input, int channels, SparseTensorF32 & output) {
+    auto timer = detail::make_sparse_profile_timer(
+        &detail::SparseProfileStats::copy_shape_calls,
+        &detail::SparseProfileStats::copy_shape_ms);
+    if (detail::SparseProfileStats * stats = detail::sparse_profile_current()) {
+        stats->copy_shape_bytes += static_cast<std::uint64_t>(
+            input.coords.size() * sizeof(std::int32_t));
+    }
     output.batch_size = input.batch_size;
     output.channels = channels;
     output.spatial_x = input.spatial_x;
@@ -102,6 +238,11 @@ bool VarLenTensorF32::valid(std::string * error) const {
 }
 
 bool SparseTensorF32::valid(std::string * error) const {
+    auto timer = detail::make_sparse_profile_timer(
+        &detail::SparseProfileStats::valid_calls,
+        &detail::SparseProfileStats::valid_ms);
+    detail::SparseProfileStats * stats = detail::sparse_profile_current();
+    SparseValidationProfileRecordScope profile_record(*this, stats);
     if (batch_size <= 0 || channels <= 0 || spatial_x <= 0 ||
         spatial_y <= 0 || spatial_z <= 0) {
         set_error(error, "invalid sparse tensor shape");
@@ -117,6 +258,51 @@ bool SparseTensorF32::valid(std::string * error) const {
         set_error(error, "sparse feature count does not match coordinates");
         return false;
     }
+
+    if (stats) {
+        // In profiling mode use two coarse timers rather than one clock read
+        // per point.  The normal path below keeps the original validation
+        // order and has no profiling branches in its hot loop.
+        const auto coord_begin = std::chrono::steady_clock::now();
+        std::unordered_map<Coord, std::size_t, CoordHash> seen;
+        seen.reserve(points());
+        for (std::size_t point = 0; point < points(); ++point) {
+            const Coord coord{coords[point * 4 + 0], coords[point * 4 + 1],
+                              coords[point * 4 + 2], coords[point * 4 + 3]};
+            if (coord.batch < 0 || coord.batch >= batch_size || coord.x < 0 ||
+                coord.x >= spatial_x || coord.y < 0 || coord.y >= spatial_y ||
+                coord.z < 0 || coord.z >= spatial_z) {
+                set_error(error, "sparse coordinate is outside its shape");
+                return false;
+            }
+            if (!seen.emplace(coord, point).second) {
+                set_error(error, "sparse coordinates contain a duplicate point");
+                return false;
+            }
+            if (point > 0 && coords[(point - 1) * 4] > coord.batch) {
+                set_error(error, "sparse coordinates must be contiguous by batch");
+                return false;
+            }
+        }
+        const double coord_elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - coord_begin).count();
+        stats->valid_coord_hashmap_ms += coord_elapsed;
+        profile_record.set_coord_hashmap_ms(coord_elapsed);
+        const auto feature_begin = std::chrono::steady_clock::now();
+        for (float value : feats) {
+            if (!std::isfinite(value)) {
+                set_error(error, "sparse features contain a non-finite value");
+                return false;
+            }
+        }
+        const double feature_elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - feature_begin).count();
+        stats->valid_feature_scan_ms += feature_elapsed;
+        profile_record.set_feature_scan_ms(feature_elapsed);
+        profile_record.mark_success();
+        return true;
+    }
+
     std::unordered_map<Coord, std::size_t, CoordHash> seen;
     seen.reserve(points());
     for (std::size_t point = 0; point < points(); ++point) {
@@ -153,28 +339,113 @@ bool sparse_linear(const SparseTensorF32 & input,
                   int out_channels,
                   SparseTensorF32 & output,
                   std::string * error) {
-    if (!check_weights(input, out_channels, weight, bias, error)) return false;
+    auto timer = detail::make_sparse_profile_timer(
+        &detail::SparseProfileStats::sparse_linear_calls,
+        &detail::SparseProfileStats::sparse_linear_ms);
+
+    detail::SparseProfileStats * stats = detail::sparse_profile_current();
+    SparseLinearProfileRecordScope profile_record(input, out_channels, stats);
+
+    const auto input_validation_begin = stats
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool input_valid = validate_sparse_tensor(input, "sparse_linear.input", error);
+    if (stats) {
+        profile_record.record().input_validation_ms = sparse_profile_elapsed_ms(
+            input_validation_begin);
+    }
+    if (!input_valid) return false;
+    if (!check_output_channels(out_channels, error)) return false;
+    if (!weight) {
+        set_error(error, "sparse weight pointer is null");
+        return false;
+    }
+    if (!bias) {
+        set_error(error, "sparse bias pointer is null");
+        return false;
+    }
+
+    const auto copy_shape_begin = stats
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     copy_shape(input, out_channels, output);
+    if (stats) {
+        profile_record.record().copy_shape_ms = sparse_profile_elapsed_ms(copy_shape_begin);
+    }
+
+    const auto output_allocation_begin = stats
+        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::size_t count = 0;
     if (!checked_product(input.points(), static_cast<std::size_t>(out_channels), count)) {
         set_error(error, "sparse linear output size overflows size_t");
         return false;
     }
     output.feats.assign(count, 0.0f);
- #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
- #endif
-    for (std::size_t point = 0; point < input.points(); ++point) {
-        const float * source = input.feats.data() + point * static_cast<std::size_t>(input.channels);
-        float * destination = output.feats.data() + point * static_cast<std::size_t>(out_channels);
-        for (int out = 0; out < out_channels; ++out) {
-            float value = bias[out];
-            for (int in = 0; in < input.channels; ++in) {
-                value += weight[static_cast<std::size_t>(out) * input.channels + in] * source[in];
+    if (stats) {
+        profile_record.record().output_allocation_ms = sparse_profile_elapsed_ms(
+            output_allocation_begin);
+
+        // Profiling-only decomposition: keep the release path's fused
+        // bias-plus-dot-product loop below, but split the same arithmetic into
+        // two passes here so bias initialization and multiply/add work can be
+        // measured independently.  The operation order is unchanged for each
+        // output value: bias, then input channels in ascending order.
+        int actual_threads = 1;
+        const auto bias_begin = std::chrono::steady_clock::now();
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
+        for (std::size_t point = 0; point < input.points(); ++point) {
+#if defined(_OPENMP)
+            if (point == 0) actual_threads = omp_get_num_threads();
+#endif
+            float * destination = output.feats.data() +
+                point * static_cast<std::size_t>(out_channels);
+            for (int out = 0; out < out_channels; ++out) {
+                destination[out] = bias[out];
             }
-            destination[out] = value;
+        }
+        profile_record.record().bias_ms = sparse_profile_elapsed_ms(bias_begin);
+
+        const auto compute_begin = std::chrono::steady_clock::now();
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
+        for (std::size_t point = 0; point < input.points(); ++point) {
+            const float * source = input.feats.data() +
+                point * static_cast<std::size_t>(input.channels);
+            float * destination = output.feats.data() +
+                point * static_cast<std::size_t>(out_channels);
+            for (int out = 0; out < out_channels; ++out) {
+                float value = destination[out];
+                for (int in = 0; in < input.channels; ++in) {
+                    value += weight[static_cast<std::size_t>(out) * input.channels + in] *
+                             source[in];
+                }
+                destination[out] = value;
+            }
+        }
+        profile_record.record().actual_compute_ms = sparse_profile_elapsed_ms(compute_begin);
+        profile_record.record().omp_actual_threads = actual_threads;
+        profile_record.record().profile_split_bias = true;
+    } else {
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
+        for (std::size_t point = 0; point < input.points(); ++point) {
+            const float * source = input.feats.data() +
+                point * static_cast<std::size_t>(input.channels);
+            float * destination = output.feats.data() +
+                point * static_cast<std::size_t>(out_channels);
+            for (int out = 0; out < out_channels; ++out) {
+                float value = bias[out];
+                for (int in = 0; in < input.channels; ++in) {
+                    value += weight[static_cast<std::size_t>(out) * input.channels + in] *
+                             source[in];
+                }
+                destination[out] = value;
+            }
         }
     }
+    profile_record.mark_success();
     return true;
 }
 
@@ -221,7 +492,10 @@ bool sparse_layer_norm(const SparseTensorF32 & input,
                        const float * beta,
                        SparseTensorF32 & output,
                        std::string * error) {
-    if (!input.valid(error)) return false;
+    auto timer = detail::make_sparse_profile_timer(
+        &detail::SparseProfileStats::sparse_layer_norm_calls,
+        &detail::SparseProfileStats::sparse_layer_norm_ms);
+    if (!validate_sparse_tensor(input, "sparse_layer_norm.input", error)) return false;
     if (!(epsilon > 0.0f) || !std::isfinite(epsilon)) {
         set_error(error, "sparse layer norm epsilon must be finite and positive");
         return false;
@@ -262,7 +536,7 @@ bool sparse_downsample_mean(const SparseTensorF32 & input,
                             int factor,
                             SparseTensorF32 & output,
                             std::string * error) {
-    if (!input.valid(error)) return false;
+    if (!validate_sparse_tensor(input, "sparse_downsample_mean.input", error)) return false;
     if (factor <= 0) {
         set_error(error, "sparse downsample factor must be positive");
         return false;
@@ -331,7 +605,10 @@ bool sparse_channel_to_spatial(const SparseTensorF32 & input,
                                const SparseTensorF32 * subdivision,
                                SparseTensorF32 & output,
                                std::string * error) {
-    if (!input.valid(error)) return false;
+    auto timer = detail::make_sparse_profile_timer(
+        &detail::SparseProfileStats::sparse_channel_to_spatial_calls,
+        &detail::SparseProfileStats::sparse_channel_to_spatial_ms);
+    if (!validate_sparse_tensor(input, "sparse_channel_to_spatial.input", error)) return false;
     if (factor <= 0) {
         set_error(error, "sparse channel-to-spatial factor must be positive");
         return false;
@@ -350,7 +627,8 @@ bool sparse_channel_to_spatial(const SparseTensorF32 & input,
         return false;
     }
     if (subdivision) {
-        if (!subdivision->valid(error) || subdivision->batch_size != input.batch_size ||
+        if (!validate_sparse_tensor(*subdivision, "sparse_channel_to_spatial.subdivision", error) ||
+            subdivision->batch_size != input.batch_size ||
             subdivision->channels != static_cast<int>(child_count) ||
             subdivision->coords != input.coords) {
             set_error(error, "sparse subdivision shape or coordinates do not match input");
@@ -419,7 +697,7 @@ bool sparse_channel_to_spatial(const SparseTensorF32 & input,
             ++destination_point;
         }
     }
-    return output.valid(error);
+    return validate_sparse_tensor(output, "sparse_channel_to_spatial.output", error);
 }
 
 bool sparse_scaled_dot_product_attention(const SparseTensorF32 & query,
@@ -723,6 +1001,9 @@ bool sparse_submanifold_conv3d(const SparseTensorF32 & input,
                                int out_channels,
                                SparseTensorF32 & output,
                                std::string * error) {
+    auto timer = detail::make_sparse_profile_timer(
+        &detail::SparseProfileStats::sparse_submanifold_conv3d_calls,
+        &detail::SparseProfileStats::sparse_submanifold_conv3d_ms);
     if (!check_weights(input, out_channels, weight, bias, error)) return false;
     copy_shape(input, out_channels, output);
     std::size_t count = 0;

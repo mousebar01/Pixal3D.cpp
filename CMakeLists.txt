@@ -209,6 +209,14 @@ if(BUILD_TESTING AND PIXAL3D_BUILD_CLI)
                  COMMAND pixal3d_backend_cuda_matmul_test)
         set_tests_properties(pixal3d_backend_cuda_matmul
             PROPERTIES LABELS "backend;cuda;parity;f16")
+        add_executable(pixal3d_sparse_linear_cuda_benchmark
+            tests/sparse_linear_cuda_benchmark.cpp)
+        target_compile_features(pixal3d_sparse_linear_cuda_benchmark PRIVATE cxx_std_17)
+        target_link_libraries(pixal3d_sparse_linear_cuda_benchmark PRIVATE pixal3d_core)
+        add_test(NAME pixal3d_sparse_linear_cuda_fixture
+                 COMMAND pixal3d_sparse_linear_cuda_benchmark --fixture)
+        set_tests_properties(pixal3d_sparse_linear_cuda_fixture
+            PROPERTIES LABELS "backend;cuda;parity")
     endif()
     add_executable(pixal3d_dino_vit_numeric_fixture
         tests/dino_vit_numeric_fixture.cpp)

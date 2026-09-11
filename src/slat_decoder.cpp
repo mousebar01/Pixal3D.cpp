@@ -3,6 +3,8 @@
 #include "pixal3d/backend.h"
 #include "pixal3d/pack.h"
 
+#include "sparse_profile.h"
+
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -16,6 +18,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <map>
 #include <iostream>
 #include <string>
 #include <unordered_map>
@@ -29,6 +32,10 @@ void set_error(std::string * error, const std::string & message) {
     if (error) *error = message;
 }
 
+bool validate_decoder_sparse_tensor(const SparseTensorF32 & input,
+                                    const char * label,
+                                    std::string * error);
+
 bool require_pointer(const float * pointer, const char * name, std::string * error) {
     if (pointer) return true;
     set_error(error, std::string("missing SLat decoder tensor: ") + name);
@@ -37,6 +44,9 @@ bool require_pointer(const float * pointer, const char * name, std::string * err
 
 bool add_in_place(SparseTensorF32 & destination, const SparseTensorF32 & source,
                   std::string * error) {
+    auto timer = detail::make_sparse_profile_timer(
+        &detail::SparseProfileStats::add_residual_calls,
+        &detail::SparseProfileStats::add_residual_ms);
     if (destination.batch_size != source.batch_size ||
         destination.channels != source.channels ||
         destination.spatial_x != source.spatial_x ||
@@ -56,6 +66,9 @@ bool add_in_place(SparseTensorF32 & destination, const SparseTensorF32 & source,
 }
 
 void silu_in_place(SparseTensorF32 & input) {
+    auto timer = detail::make_sparse_profile_timer(
+        &detail::SparseProfileStats::silu_calls,
+        &detail::SparseProfileStats::silu_ms);
 #if defined(_OPENMP)
     #pragma omp parallel for schedule(static)
 #endif
@@ -66,7 +79,11 @@ void silu_in_place(SparseTensorF32 & input) {
 
 bool repeat_channels(const SparseTensorF32 & input, int output_channels,
                      SparseTensorF32 & output, std::string * error) {
-    if (!input.valid(error) || output_channels <= 0 ||
+    auto timer = detail::make_sparse_profile_timer(
+        &detail::SparseProfileStats::repeat_channels_calls,
+        &detail::SparseProfileStats::repeat_channels_ms);
+    if (!validate_decoder_sparse_tensor(input, "repeat_channels.input", error) ||
+        output_channels <= 0 ||
         output_channels % input.channels != 0) {
         set_error(error, "SLat decoder skip channels are not repeatable");
         return false;
@@ -97,9 +114,47 @@ bool valid_eps(float epsilon, std::string * error) {
     return false;
 }
 
+bool validate_decoder_sparse_tensor(const SparseTensorF32 & input,
+                                    const char * label,
+                                    std::string * error) {
+    detail::SparseValidationProfileLabelScope label_scope(label);
+    return input.valid(error);
+}
+
+bool run_labeled_sparse_linear(const SparseTensorF32 & input,
+                               const float * weight,
+                               const float * bias,
+                               int out_channels,
+                               SparseTensorF32 & output,
+                               const std::string & label,
+                               std::string * error) {
+    detail::SparseLinearProfileLabelScope label_scope(label.c_str());
+    return sparse_linear(input, weight, bias, out_channels, output, error);
+}
+
+bool environment_flag(const char * name, bool default_value = false) noexcept {
+    const char * value = std::getenv(name);
+    if (!value || !*value) return default_value;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "off") != 0;
+}
+
 bool slat_decoder_trace_enabled() noexcept {
-    const char * value = std::getenv("PIXAL3D_SLAT_DECODER_TRACE");
-    return value && *value && std::strcmp(value, "0") != 0;
+    return environment_flag("PIXAL3D_SLAT_DECODER_TRACE");
+}
+
+bool slat_decoder_profile_enabled() noexcept {
+    return slat_decoder_trace_enabled() ||
+           environment_flag("PIXAL3D_SLAT_DECODER_PROFILE") ||
+           environment_flag("PIXAL3D_VALIDATE_SPARSE_MAP_CACHE");
+}
+
+bool slat_decoder_neighbor_cache_enabled() noexcept {
+    return environment_flag("PIXAL3D_SLAT_DECODER_NEIGHBOR_CACHE", true);
+}
+
+bool slat_decoder_neighbor_cache_validation_enabled() noexcept {
+    return environment_flag("PIXAL3D_VALIDATE_SPARSE_MAP_CACHE");
 }
 
 } // namespace
@@ -441,6 +496,559 @@ struct DecoderCoordHash {
     }
 };
 
+std::uint64_t decoder_coords_fingerprint(
+    const std::vector<std::int32_t> & coords) noexcept {
+    constexpr std::uint64_t kOffsetBasis = 1469598103934665603ULL;
+    constexpr std::uint64_t kPrime = 1099511628211ULL;
+    std::uint64_t hash = kOffsetBasis;
+    const auto * bytes = reinterpret_cast<const std::uint8_t *>(coords.data());
+    const std::size_t byte_count = coords.size() * sizeof(std::int32_t);
+    for (std::size_t index = 0; index < byte_count; ++index) {
+        hash ^= bytes[index];
+        hash *= kPrime;
+    }
+    return hash;
+}
+
+struct NeighborGatherMap {
+    std::size_t points = 0;
+    int batch_size = 0;
+    int spatial_x = 0;
+    int spatial_y = 0;
+    int spatial_z = 0;
+    std::uint64_t coordinate_fingerprint = 0;
+
+    // Layout is [offset * points + output_point].  Each value is an input
+    // point row, or points for the explicit zero row appended to the input.
+    std::vector<std::int32_t> gather_indices;
+};
+
+struct SLatDecoderTopologyProfile {
+    std::uint64_t generation = 0;
+    std::size_t points = 0;
+    int batch_size = 0;
+    int spatial_x = 0;
+    int spatial_y = 0;
+    int spatial_z = 0;
+    std::uint64_t coordinate_fingerprint = 0;
+    std::size_t conv_calls = 0;
+    std::size_t cache_hits = 0;
+    std::size_t cache_misses = 0;
+};
+
+struct SLatDecoderProfile {
+    bool neighbor_cache_enabled = true;
+    bool validate_neighbor_cache = false;
+    std::size_t total_sparse_conv_calls = 0;
+    std::size_t neighbor_map_builds = 0;
+    std::size_t cache_hits = 0;
+    std::size_t cache_misses = 0;
+    std::size_t cache_validation_calls = 0;
+
+    double input_validation_ms = 0.0;
+    double padded_input_build_ms = 0.0;
+    double coordinate_fingerprint_ms = 0.0;
+    double coord_hashmap_build_ms = 0.0;
+    double neighbor_index_build_ms = 0.0;
+    double cache_validation_ms = 0.0;
+    double index_upload_ms = 0.0;
+    double graph_build_ms = 0.0;
+    double scheduler_allocate_ms = 0.0;
+    double input_upload_ms = 0.0;
+    double gpu_compute_ms = 0.0;
+    double output_download_ms = 0.0;
+    double finish_sparse_ms = 0.0;
+    double output_validation_ms = 0.0;
+
+    std::vector<SLatDecoderTopologyProfile> topologies;
+};
+
+void decoder_profile_add_phase(SLatDecoderProfile * profile,
+                               double SLatDecoderProfile::* phase,
+                               double start_ms) noexcept {
+    if (!profile) return;
+    profile->*phase += backend_time_now_ms() - start_ms;
+}
+
+bool neighbor_map_shape_matches(const NeighborGatherMap & map,
+                                const SparseTensorF32 & input,
+                                bool compare_fingerprint,
+                                std::uint64_t coordinate_fingerprint) noexcept {
+    return map.points == input.points() && map.batch_size == input.batch_size &&
+           map.spatial_x == input.spatial_x && map.spatial_y == input.spatial_y &&
+           map.spatial_z == input.spatial_z &&
+           (!compare_fingerprint || map.coordinate_fingerprint == coordinate_fingerprint);
+}
+
+bool build_neighbor_gather_map(const SparseTensorF32 & input,
+                               std::uint64_t coordinate_fingerprint,
+                               NeighborGatherMap & map,
+                               SLatDecoderProfile * profile,
+                               std::string * error) {
+    const std::size_t points = input.points();
+    if (points == 0 || points > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
+        points > std::numeric_limits<std::size_t>::max() / 27) {
+        set_error(error, "SLat decoder neighbor map point count is invalid");
+        return false;
+    }
+
+    map = NeighborGatherMap{};
+    map.points = points;
+    map.batch_size = input.batch_size;
+    map.spatial_x = input.spatial_x;
+    map.spatial_y = input.spatial_y;
+    map.spatial_z = input.spatial_z;
+    map.coordinate_fingerprint = coordinate_fingerprint;
+
+    const double coord_hashmap_begin = profile ? backend_time_now_ms() : 0.0;
+    std::unordered_map<DecoderCoord, std::size_t, DecoderCoordHash> indices;
+    indices.reserve(points);
+    for (std::size_t point = 0; point < points; ++point) {
+        indices.emplace(DecoderCoord{input.coords[point * 4 + 0], input.coords[point * 4 + 1],
+                                     input.coords[point * 4 + 2], input.coords[point * 4 + 3]}, point);
+    }
+    if (profile) {
+        profile->coord_hashmap_build_ms +=
+            backend_time_now_ms() - coord_hashmap_begin;
+    }
+
+    const double neighbor_index_begin = profile ? backend_time_now_ms() : 0.0;
+    map.gather_indices.assign(points * 27, static_cast<std::int32_t>(points));
+    for (int kd = 0; kd < 3; ++kd) {
+        for (int kh = 0; kh < 3; ++kh) {
+            for (int kw = 0; kw < 3; ++kw) {
+                const std::size_t offset = static_cast<std::size_t>(kd * 9 + kh * 3 + kw);
+                std::int32_t * destination = map.gather_indices.data() + offset * points;
+                for (std::size_t point = 0; point < points; ++point) {
+                    const DecoderCoord center{
+                        input.coords[point * 4 + 0], input.coords[point * 4 + 1],
+                        input.coords[point * 4 + 2], input.coords[point * 4 + 3]};
+                    const DecoderCoord neighbor{center.batch, center.x + kd - 1,
+                                                 center.y + kh - 1, center.z + kw - 1};
+                    const auto found = indices.find(neighbor);
+                    if (found != indices.end()) {
+                        destination[point] = static_cast<std::int32_t>(found->second);
+                    }
+                }
+            }
+        }
+    }
+    if (profile) {
+        profile->neighbor_index_build_ms +=
+            backend_time_now_ms() - neighbor_index_begin;
+        ++profile->neighbor_map_builds;
+    }
+    return true;
+}
+
+bool build_reference_neighbor_gather_map(const SparseTensorF32 & input,
+                                           NeighborGatherMap & map,
+                                           std::string * error) {
+    const std::size_t points = input.points();
+    if (points == 0 || points > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
+        points > std::numeric_limits<std::size_t>::max() / 27) {
+        set_error(error, "SLat decoder reference neighbor map point count is invalid");
+        return false;
+    }
+    map = NeighborGatherMap{};
+    map.points = points;
+    map.batch_size = input.batch_size;
+    map.spatial_x = input.spatial_x;
+    map.spatial_y = input.spatial_y;
+    map.spatial_z = input.spatial_z;
+    map.gather_indices.resize(points * 27);
+
+    std::unordered_map<DecoderCoord, std::size_t, DecoderCoordHash> indices;
+    indices.reserve(points);
+    for (std::size_t point = 0; point < points; ++point) {
+        indices.emplace(DecoderCoord{input.coords[point * 4 + 0], input.coords[point * 4 + 1],
+                                     input.coords[point * 4 + 2], input.coords[point * 4 + 3]}, point);
+    }
+    for (std::size_t index = 0; index < 27; ++index) {
+        std::vector<std::int32_t> index_values(points, 0);
+        const int kd = static_cast<int>(index / 9);
+        const int kh = static_cast<int>((index / 3) % 3);
+        const int kw = static_cast<int>(index % 3);
+        for (std::size_t point = 0; point < points; ++point) {
+            const DecoderCoord center{input.coords[point * 4 + 0], input.coords[point * 4 + 1],
+                                      input.coords[point * 4 + 2], input.coords[point * 4 + 3]};
+            const DecoderCoord neighbor{center.batch, center.x + kd - 1,
+                                        center.y + kh - 1, center.z + kw - 1};
+            const auto found = indices.find(neighbor);
+            if (found != indices.end()) {
+                index_values[point] = static_cast<std::int32_t>(found->second);
+            } else {
+                index_values[point] = static_cast<std::int32_t>(points);
+            }
+        }
+        std::copy(index_values.begin(), index_values.end(),
+                  map.gather_indices.begin() + index * points);
+    }
+    return true;
+}
+
+bool validate_neighbor_gather_map(const SparseTensorF32 & input,
+                                  const NeighborGatherMap & cached,
+                                  std::string * error) {
+    NeighborGatherMap reference;
+    if (!build_reference_neighbor_gather_map(input, reference, error)) return false;
+    if (cached.points != reference.points || cached.batch_size != reference.batch_size ||
+        cached.spatial_x != reference.spatial_x || cached.spatial_y != reference.spatial_y ||
+        cached.spatial_z != reference.spatial_z ||
+        cached.gather_indices.size() != reference.gather_indices.size()) {
+        set_error(error, "SLat decoder neighbor map cache metadata mismatch");
+        return false;
+    }
+    for (std::size_t index = 0; index < cached.gather_indices.size(); ++index) {
+        if (cached.gather_indices[index] == reference.gather_indices[index]) continue;
+        const std::size_t offset = index / cached.points;
+        const std::size_t point = index % cached.points;
+        const int kd = static_cast<int>(offset / 9);
+        const int kh = static_cast<int>((offset / 3) % 3);
+        const int kw = static_cast<int>(offset % 3);
+        const DecoderCoord center{
+            input.coords[point * 4 + 0], input.coords[point * 4 + 1],
+            input.coords[point * 4 + 2], input.coords[point * 4 + 3]};
+        const DecoderCoord neighbor{center.batch, center.x + kd - 1,
+                                    center.y + kh - 1, center.z + kw - 1};
+        set_error(error,
+                  "SLat decoder neighbor map cache mismatch: offset=" +
+                  std::to_string(offset) + " output_point=" + std::to_string(point) +
+                  " cached_input_row=" + std::to_string(cached.gather_indices[index]) +
+                  " reference_input_row=" + std::to_string(reference.gather_indices[index]) +
+                  " center=(" + std::to_string(center.batch) + "," +
+                  std::to_string(center.x) + "," + std::to_string(center.y) + "," +
+                  std::to_string(center.z) + ") expected_neighbor=(" +
+                  std::to_string(neighbor.batch) + "," + std::to_string(neighbor.x) + "," +
+                  std::to_string(neighbor.y) + "," + std::to_string(neighbor.z) + ")");
+        return false;
+    }
+    return true;
+}
+
+bool record_decoder_conv(SLatDecoderProfile * profile,
+                         std::uint64_t generation,
+                         const SparseTensorF32 & input,
+                         std::uint64_t coordinate_fingerprint,
+                         bool cache_hit,
+                         std::string * error) {
+    if (!profile) return true;
+    SLatDecoderTopologyProfile * topology = nullptr;
+    for (SLatDecoderTopologyProfile & candidate : profile->topologies) {
+        if (candidate.generation == generation) {
+            topology = &candidate;
+            break;
+        }
+    }
+    if (!topology) {
+        profile->topologies.push_back(SLatDecoderTopologyProfile{});
+        topology = &profile->topologies.back();
+        topology->generation = generation;
+        topology->points = input.points();
+        topology->batch_size = input.batch_size;
+        topology->spatial_x = input.spatial_x;
+        topology->spatial_y = input.spatial_y;
+        topology->spatial_z = input.spatial_z;
+        topology->coordinate_fingerprint = coordinate_fingerprint;
+    } else if (topology->coordinate_fingerprint != coordinate_fingerprint) {
+        set_error(error, "SLat decoder coordinates changed without topology invalidation");
+        return false;
+    }
+    ++profile->total_sparse_conv_calls;
+    ++topology->conv_calls;
+    if (cache_hit) {
+        ++profile->cache_hits;
+        ++topology->cache_hits;
+    } else {
+        ++profile->cache_misses;
+        ++topology->cache_misses;
+    }
+    std::cerr << "pixal3d: SLat-decoder-conv conv_index="
+              << profile->total_sparse_conv_calls
+              << " points=" << input.points()
+              << " batch_size=" << input.batch_size
+              << " spatial=" << input.spatial_x << 'x' << input.spatial_y << 'x'
+              << input.spatial_z
+              << " coords=0x" << std::hex << coordinate_fingerprint << std::dec
+              << " topology_generation=" << generation
+              << " cache=" << (cache_hit ? "hit" : "miss") << std::endl;
+    return true;
+}
+
+void log_decoder_profile(const SLatDecoderProfile & profile,
+                         const detail::SparseProfileStats & sparse) {
+    std::cerr << "pixal3d: SLat-decoder-profile cache_enabled="
+              << (profile.neighbor_cache_enabled ? 1 : 0)
+              << " validate_cache=" << (profile.validate_neighbor_cache ? 1 : 0)
+              << " total_sparse_conv_calls=" << profile.total_sparse_conv_calls
+              << " unique_topologies=" << profile.topologies.size()
+              << " neighbor_map_builds=" << profile.neighbor_map_builds
+              << " cache_hits=" << profile.cache_hits
+              << " cache_misses=" << profile.cache_misses
+              << " cache_validation_calls=" << profile.cache_validation_calls << std::endl;
+    const auto phase = [&profile](const char * name,
+                                  double SLatDecoderProfile::* value) {
+        std::cerr << "pixal3d: SLat-decoder-profile phase=" << name
+                  << " elapsed_ms=" << profile.*value << std::endl;
+    };
+    phase("input_validation", &SLatDecoderProfile::input_validation_ms);
+    phase("padded_input_build", &SLatDecoderProfile::padded_input_build_ms);
+    phase("coordinate_fingerprint", &SLatDecoderProfile::coordinate_fingerprint_ms);
+    phase("coord_hashmap_build", &SLatDecoderProfile::coord_hashmap_build_ms);
+    phase("neighbor_index_build", &SLatDecoderProfile::neighbor_index_build_ms);
+    phase("cache_validation", &SLatDecoderProfile::cache_validation_ms);
+    phase("index_upload", &SLatDecoderProfile::index_upload_ms);
+    phase("graph_build", &SLatDecoderProfile::graph_build_ms);
+    phase("scheduler_allocate", &SLatDecoderProfile::scheduler_allocate_ms);
+    phase("input_upload", &SLatDecoderProfile::input_upload_ms);
+    phase("gpu_compute", &SLatDecoderProfile::gpu_compute_ms);
+    phase("output_download", &SLatDecoderProfile::output_download_ms);
+    phase("finish_sparse", &SLatDecoderProfile::finish_sparse_ms);
+    phase("output_validation", &SLatDecoderProfile::output_validation_ms);
+
+    std::cerr << "pixal3d: SLat-decoder-profile sparse_valid calls=" << sparse.valid_calls
+              << " elapsed_ms=" << sparse.valid_ms
+              << " coord_hashmap_ms=" << sparse.valid_coord_hashmap_ms
+              << " feature_scan_ms=" << sparse.valid_feature_scan_ms
+              << " recorded_calls=" << sparse.validation_records.size() << std::endl;
+    std::cerr << "pixal3d: SLat-decoder-profile copy_shape calls=" << sparse.copy_shape_calls
+              << " bytes=" << sparse.copy_shape_bytes
+              << " elapsed_ms=" << sparse.copy_shape_ms << std::endl;
+    const auto sparse_op = [&sparse](const char * name, std::uint64_t calls,
+                                     double elapsed_ms) {
+        std::cerr << "pixal3d: SLat-decoder-profile sparse_op=" << name
+                  << " calls=" << calls << " elapsed_ms=" << elapsed_ms << std::endl;
+    };
+    sparse_op("sparse_linear", sparse.sparse_linear_calls, sparse.sparse_linear_ms);
+    sparse_op("sparse_layer_norm", sparse.sparse_layer_norm_calls,
+              sparse.sparse_layer_norm_ms);
+    sparse_op("sparse_channel_to_spatial", sparse.sparse_channel_to_spatial_calls,
+              sparse.sparse_channel_to_spatial_ms);
+    sparse_op("sparse_submanifold_conv3d", sparse.sparse_submanifold_conv3d_calls,
+              sparse.sparse_submanifold_conv3d_ms);
+    sparse_op("add_residual", sparse.add_residual_calls, sparse.add_residual_ms);
+    sparse_op("SiLU", sparse.silu_calls, sparse.silu_ms);
+    sparse_op("repeat_channels", sparse.repeat_channels_calls, sparse.repeat_channels_ms);
+
+    std::cerr << "pixal3d: SLat-decoder-profile sparse_linear_breakdown"
+              << " inclusive_ms=" << sparse.sparse_linear_ms
+              << " input_validation_ms=" << sparse.sparse_linear_input_validation_ms
+              << " copy_shape_ms=" << sparse.sparse_linear_copy_shape_ms
+              << " output_allocation_ms=" << sparse.sparse_linear_output_allocation_ms
+              << " actual_compute_ms=" << sparse.sparse_linear_actual_compute_ms
+              << " bias_ms=" << sparse.sparse_linear_bias_ms
+              << " output_validation_ms=" << sparse.sparse_linear_output_validation_ms
+              << " other_ms=" << sparse.sparse_linear_other_ms
+              << " output_validation_in_linear=0" << std::endl;
+
+#if defined(NDEBUG)
+    constexpr int build_release = 1;
+#else
+    constexpr int build_release = 0;
+#endif
+#if defined(__OPTIMIZE__)
+    constexpr int compiler_optimized = 1;
+#else
+    constexpr int compiler_optimized = 0;
+#endif
+#if defined(_OPENMP)
+    constexpr int openmp_compiled = 1;
+#else
+    constexpr int openmp_compiled = 0;
+#endif
+#if defined(__AVX512F__)
+    constexpr int avx512f = 1;
+#else
+    constexpr int avx512f = 0;
+#endif
+#if defined(__AVX2__)
+    constexpr int avx2 = 1;
+#else
+    constexpr int avx2 = 0;
+#endif
+    std::cerr << "pixal3d: SLat-decoder-profile sparse_linear_environment"
+              << " build_release=" << build_release
+              << " compiler_optimized=" << compiler_optimized
+              << " openmp_compiled=" << openmp_compiled
+              << " omp_schedule=static"
+              << " avx2=" << avx2
+              << " avx512f=" << avx512f
+              << " OMP_NUM_THREADS="
+              << (std::getenv("OMP_NUM_THREADS") ? std::getenv("OMP_NUM_THREADS") : "unset")
+              << " OMP_DYNAMIC="
+              << (std::getenv("OMP_DYNAMIC") ? std::getenv("OMP_DYNAMIC") : "unset")
+              << std::endl;
+
+    std::vector<std::size_t> linear_order(sparse.sparse_linear_records.size());
+    for (std::size_t index = 0; index < linear_order.size(); ++index) {
+        linear_order[index] = index;
+    }
+    std::sort(linear_order.begin(), linear_order.end(), [&sparse](std::size_t left,
+                                                                    std::size_t right) {
+        return sparse.sparse_linear_records[left].total_ms >
+               sparse.sparse_linear_records[right].total_ms;
+    });
+    for (std::size_t rank = 0; rank < linear_order.size(); ++rank) {
+        const detail::SparseLinearProfileRecord & record =
+            sparse.sparse_linear_records[linear_order[rank]];
+        std::cerr << "pixal3d: SLat-decoder-profile sparse_linear_call rank=" << (rank + 1)
+                  << " label=" << record.label
+                  << " points=" << record.points
+                  << " cin=" << record.input_channels
+                  << " cout=" << record.output_channels
+                  << " total_ms=" << record.total_ms
+                  << " input_validation_ms=" << record.input_validation_ms
+                  << " copy_shape_ms=" << record.copy_shape_ms
+                  << " output_allocation_ms=" << record.output_allocation_ms
+                  << " compute_ms=" << record.actual_compute_ms
+                  << " bias_ms=" << record.bias_ms
+                  << " output_validation_ms=" << record.output_validation_ms
+                  << " other_ms=" << record.other_ms
+                  << " omp_max_threads=" << record.omp_max_threads
+                  << " omp_actual_threads=" << record.omp_actual_threads
+                  << " profile_split_bias=" << (record.profile_split_bias ? 1 : 0)
+                  << " success=" << (record.success ? 1 : 0) << std::endl;
+    }
+
+    struct LinearShapeKey {
+        std::size_t points = 0;
+        int input_channels = 0;
+        int output_channels = 0;
+
+        bool operator<(const LinearShapeKey & other) const noexcept {
+            if (points != other.points) return points < other.points;
+            if (input_channels != other.input_channels) {
+                return input_channels < other.input_channels;
+            }
+            return output_channels < other.output_channels;
+        }
+    };
+    struct LinearShapeAggregate {
+        std::size_t calls = 0;
+        std::size_t successful_calls = 0;
+        double total_ms = 0.0;
+        double compute_ms = 0.0;
+        double bias_ms = 0.0;
+        double input_validation_ms = 0.0;
+        double copy_shape_ms = 0.0;
+        double output_allocation_ms = 0.0;
+        double output_validation_ms = 0.0;
+        double other_ms = 0.0;
+    };
+    std::map<LinearShapeKey, LinearShapeAggregate> linear_shapes;
+    for (const detail::SparseLinearProfileRecord & record : sparse.sparse_linear_records) {
+        LinearShapeAggregate & aggregate = linear_shapes[
+            LinearShapeKey{record.points, record.input_channels, record.output_channels}];
+        ++aggregate.calls;
+        if (record.success) ++aggregate.successful_calls;
+        aggregate.total_ms += record.total_ms;
+        aggregate.compute_ms += record.actual_compute_ms;
+        aggregate.bias_ms += record.bias_ms;
+        aggregate.input_validation_ms += record.input_validation_ms;
+        aggregate.copy_shape_ms += record.copy_shape_ms;
+        aggregate.output_allocation_ms += record.output_allocation_ms;
+        aggregate.output_validation_ms += record.output_validation_ms;
+        aggregate.other_ms += record.other_ms;
+    }
+    std::vector<std::pair<LinearShapeKey, LinearShapeAggregate>> linear_shape_order(
+        linear_shapes.begin(), linear_shapes.end());
+    std::sort(linear_shape_order.begin(), linear_shape_order.end(),
+              [](const auto & left, const auto & right) {
+                  return left.second.total_ms > right.second.total_ms;
+              });
+    for (const auto & entry : linear_shape_order) {
+        const LinearShapeKey & key = entry.first;
+        const LinearShapeAggregate & aggregate = entry.second;
+        std::cerr << "pixal3d: SLat-decoder-profile sparse_linear_shape"
+                  << " points=" << key.points
+                  << " cin=" << key.input_channels
+                  << " cout=" << key.output_channels
+                  << " calls=" << aggregate.calls
+                  << " successful_calls=" << aggregate.successful_calls
+                  << " total_ms=" << aggregate.total_ms
+                  << " compute_ms=" << aggregate.compute_ms
+                  << " bias_ms=" << aggregate.bias_ms
+                  << " input_validation_ms=" << aggregate.input_validation_ms
+                  << " copy_shape_ms=" << aggregate.copy_shape_ms
+                  << " output_allocation_ms=" << aggregate.output_allocation_ms
+                  << " output_validation_ms=" << aggregate.output_validation_ms
+                  << " other_ms=" << aggregate.other_ms << std::endl;
+    }
+
+    const auto validation_category = [](const std::string & label) {
+        if (label.find("decoder.") == 0) return "A_stage_boundary";
+        if (label.find("sparse_channel_to_spatial") != std::string::npos) {
+            return "B_topology_change";
+        }
+        if (label.find("sparse_conv_gpu") != std::string::npos ||
+            label.find("sparse_submanifold_conv3d") != std::string::npos) {
+            return "D_sparse_conv";
+        }
+        if (label.find("sparse_linear") != std::string::npos ||
+            label.find("sparse_layer_norm") != std::string::npos ||
+            label.find("repeat_channels") != std::string::npos) {
+            return "C_pointwise_hot_path";
+        }
+        if (label.find("test") != std::string::npos ||
+            label.find("debug") != std::string::npos) {
+            return "E_debug_or_test";
+        }
+        return "other";
+    };
+    struct ValidationAggregate {
+        std::size_t calls = 0;
+        std::size_t failures = 0;
+        std::size_t max_points = 0;
+        int max_channels = 0;
+        double total_ms = 0.0;
+        double coord_hashmap_ms = 0.0;
+        double feature_scan_ms = 0.0;
+    };
+    std::map<std::string, ValidationAggregate> validations;
+    for (const detail::SparseValidationProfileRecord & record : sparse.validation_records) {
+        ValidationAggregate & aggregate = validations[record.label];
+        ++aggregate.calls;
+        if (!record.success) ++aggregate.failures;
+        aggregate.max_points = std::max(aggregate.max_points, record.points);
+        aggregate.max_channels = std::max(aggregate.max_channels, record.channels);
+        aggregate.total_ms += record.elapsed_ms;
+        aggregate.coord_hashmap_ms += record.coord_hashmap_ms;
+        aggregate.feature_scan_ms += record.feature_scan_ms;
+    }
+    std::vector<std::pair<std::string, ValidationAggregate>> validation_order(
+        validations.begin(), validations.end());
+    std::sort(validation_order.begin(), validation_order.end(),
+              [](const auto & left, const auto & right) {
+                  return left.second.total_ms > right.second.total_ms;
+              });
+    for (const auto & entry : validation_order) {
+        const ValidationAggregate & aggregate = entry.second;
+        std::cerr << "pixal3d: SLat-decoder-profile valid_group"
+                  << " category=" << validation_category(entry.first)
+                  << " label=" << entry.first
+                  << " calls=" << aggregate.calls
+                  << " failures=" << aggregate.failures
+                  << " max_points=" << aggregate.max_points
+                  << " max_channels=" << aggregate.max_channels
+                  << " total_ms=" << aggregate.total_ms
+                  << " coord_hashmap_ms=" << aggregate.coord_hashmap_ms
+                  << " feature_scan_ms=" << aggregate.feature_scan_ms << std::endl;
+    }
+    for (const SLatDecoderTopologyProfile & topology : profile.topologies) {
+        std::cerr << "pixal3d: SLat-decoder-profile topology generation="
+                  << topology.generation << " points=" << topology.points
+                  << " batch_size=" << topology.batch_size
+                  << " spatial=" << topology.spatial_x << 'x' << topology.spatial_y << 'x'
+                  << topology.spatial_z
+                  << " coords=0x" << std::hex << topology.coordinate_fingerprint << std::dec
+                  << " conv_calls=" << topology.conv_calls
+                  << " reused_by_convs=" << (topology.conv_calls > 0
+                      ? topology.conv_calls - 1 : 0)
+                  << " cache_hits=" << topology.cache_hits
+                  << " cache_misses=" << topology.cache_misses << std::endl;
+    }
+}
+
 struct SLatDecoderGpuState {
     ggml_context * weights_ctx = nullptr;
     ggml_backend_t backend = nullptr;
@@ -451,9 +1059,23 @@ struct SLatDecoderGpuState {
     BackendManager * backend_manager = nullptr;
     bool attempted = false;
 
+    // The map is deliberately invocation-scoped.  It is invalidated only at
+    // the explicit channel-to-spatial topology boundary; no global hash cache
+    // or model-parameter-based guess is involved.
+    NeighborGatherMap current_neighbor_map;
+    bool has_neighbor_map = false;
+    std::uint64_t topology_generation = 0;
+    bool neighbor_cache_enabled = true;
+    bool validate_neighbor_cache = false;
+    SLatDecoderProfile * profile = nullptr;
+
     ~SLatDecoderGpuState() { close(); }
 
     void close() noexcept {
+        profile = nullptr;
+        has_neighbor_map = false;
+        current_neighbor_map = NeighborGatherMap{};
+        topology_generation = 0;
         host_tensors.clear();
         tensors.clear();
         if (weights_buffer) {
@@ -467,6 +1089,31 @@ struct SLatDecoderGpuState {
             weights_ctx = nullptr;
         }
         backend_name.clear();
+    }
+
+    void begin_invocation(SLatDecoderProfile * active_profile,
+                          bool cache_enabled,
+                          bool validate_cache) {
+        profile = active_profile;
+        neighbor_cache_enabled = cache_enabled;
+        validate_neighbor_cache = validate_cache;
+        has_neighbor_map = false;
+        current_neighbor_map = NeighborGatherMap{};
+        topology_generation = 0;
+    }
+
+    void end_invocation(const detail::SparseProfileStats & sparse) noexcept {
+        if (profile) log_decoder_profile(*profile, sparse);
+        profile = nullptr;
+        has_neighbor_map = false;
+        current_neighbor_map = NeighborGatherMap{};
+        topology_generation = 0;
+    }
+
+    void invalidate_neighbor_map() {
+        has_neighbor_map = false;
+        current_neighbor_map = NeighborGatherMap{};
+        ++topology_generation;
     }
 
     bool ready() const noexcept { return backend != nullptr && weights_buffer != nullptr; }
@@ -561,11 +1208,12 @@ struct SLatDecoderGpuState {
         return true;
     }
 
-    static bool finish_sparse(const SparseTensorF32 & input,
-                              int channels,
-                              const std::vector<float> & channel_values,
-                              SparseTensorF32 & output,
-                              std::string * error) {
+    bool finish_sparse(const SparseTensorF32 & input,
+                       int channels,
+                       const std::vector<float> & channel_values,
+                       SparseTensorF32 & output,
+                       std::string * error) {
+        const double finish_begin = profile ? backend_time_now_ms() : 0.0;
         const std::size_t points = input.points();
         if (channel_values.size() != points * static_cast<std::size_t>(channels)) {
             set_error(error, "SLat decoder GPU output size mismatch");
@@ -582,7 +1230,14 @@ struct SLatDecoderGpuState {
                                    static_cast<std::size_t>(channel)];
             }
         }
-        return output.valid(error);
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::finish_sparse_ms,
+                                  finish_begin);
+        const double validation_begin = profile ? backend_time_now_ms() : 0.0;
+        const bool valid = validate_decoder_sparse_tensor(
+            output, "sparse_conv_gpu.output", error);
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::output_validation_ms,
+                                  validation_begin);
+        return valid;
     }
 
     bool run_conv(const SparseTensorF32 & input,
@@ -590,8 +1245,17 @@ struct SLatDecoderGpuState {
                   const float * host_bias,
                   int out_channels,
                   SparseTensorF32 & output,
-                  std::string * error) const {
-        if (!ready() || !input.valid(error) || out_channels <= 0) return false;
+                  std::string * error) {
+        if (!ready()) {
+            set_error(error, "SLat decoder GPU state is not initialized");
+            return false;
+        }
+        const double input_validation_begin = profile ? backend_time_now_ms() : 0.0;
+        const bool input_valid = validate_decoder_sparse_tensor(
+            input, "sparse_conv_gpu.input", error);
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::input_validation_ms,
+                                  input_validation_begin);
+        if (!input_valid || out_channels <= 0) return false;
         ggml_tensor * weight_tensor = weight(host_weight);
         ggml_tensor * bias_tensor = weight(host_bias);
         if (!weight_tensor || !bias_tensor || weight_tensor->ne[0] != input.channels ||
@@ -605,21 +1269,65 @@ struct SLatDecoderGpuState {
             set_error(error, "SLat decoder GPU convolution point count is invalid");
             return false;
         }
-        // Append one explicit zero column so missing sparse neighbours can be
-        // gathered without a backend-dependent broadcast mask operation.  The
-        // public feature rows already have ggml's contiguous [channel, point]
-        // byte order, so write them directly and avoid an intermediate copy.
+
+        // The public feature rows use ggml's contiguous [channel, point] byte
+        // order, so append the explicit zero column without a transpose.
+        const double padded_input_begin = profile ? backend_time_now_ms() : 0.0;
         const std::size_t input_columns = points + 1;
         std::vector<float> padded_values(
             static_cast<std::size_t>(input.channels) * input_columns, 0.0f);
         std::copy(input.feats.begin(), input.feats.end(), padded_values.begin());
-        std::unordered_map<DecoderCoord, std::size_t, DecoderCoordHash> indices;
-        indices.reserve(points);
-        for (std::size_t point = 0; point < points; ++point) {
-            indices.emplace(DecoderCoord{input.coords[point * 4 + 0], input.coords[point * 4 + 1],
-                                  input.coords[point * 4 + 2], input.coords[point * 4 + 3]}, point);
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::padded_input_build_ms,
+                                  padded_input_begin);
+
+        std::uint64_t coordinate_fingerprint = 0;
+        if (profile) {
+            const double fingerprint_begin = backend_time_now_ms();
+            coordinate_fingerprint = decoder_coords_fingerprint(input.coords);
+            profile->coordinate_fingerprint_ms +=
+                backend_time_now_ms() - fingerprint_begin;
         }
 
+        NeighborGatherMap local_map;
+        NeighborGatherMap * gather_map = nullptr;
+        bool cache_hit = false;
+        if (neighbor_cache_enabled && has_neighbor_map) {
+            if (!neighbor_map_shape_matches(current_neighbor_map, input, profile != nullptr,
+                                            coordinate_fingerprint)) {
+                set_error(error,
+                          "SLat decoder neighbor map topology changed without invalidation "
+                          "(generation=" + std::to_string(topology_generation) + ")");
+                return false;
+            }
+            cache_hit = true;
+            if (validate_neighbor_cache) {
+                if (profile) ++profile->cache_validation_calls;
+                const double validation_begin = profile ? backend_time_now_ms() : 0.0;
+                const bool valid = validate_neighbor_gather_map(input, current_neighbor_map, error);
+                decoder_profile_add_phase(profile, &SLatDecoderProfile::cache_validation_ms,
+                                          validation_begin);
+                if (!valid) return false;
+            }
+            gather_map = &current_neighbor_map;
+        } else {
+            if (!build_neighbor_gather_map(input, coordinate_fingerprint, local_map, profile,
+                                           error)) {
+                return false;
+            }
+            if (neighbor_cache_enabled) {
+                current_neighbor_map = std::move(local_map);
+                has_neighbor_map = true;
+                gather_map = &current_neighbor_map;
+            } else {
+                gather_map = &local_map;
+            }
+        }
+        if (!record_decoder_conv(profile, topology_generation, input,
+                                 coordinate_fingerprint, cache_hit, error)) {
+            return false;
+        }
+
+        const double graph_build_begin = profile ? backend_time_now_ms() : 0.0;
         const std::size_t graph_memory = ggml_tensor_overhead() * 4096 +
                                          ggml_graph_overhead_custom(4096, false);
         ggml_init_params params{};
@@ -683,8 +1391,11 @@ struct SLatDecoderGpuState {
         accumulator = ggml_cont(ctx, accumulator);
         ggml_set_output(accumulator);
         ggml_build_forward_expand(graph, accumulator);
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::graph_build_ms,
+                                  graph_build_begin);
+
         const bool trace = slat_decoder_trace_enabled();
-        const double allocation_begin = trace ? backend_time_now_ms() : 0.0;
+        const double allocation_begin = profile ? backend_time_now_ms() : 0.0;
         std::string scheduler_error;
         BackendScheduler scheduler(*backend_manager, 4096, false, true,
                                    &scheduler_error, "SLat decoder");
@@ -699,57 +1410,49 @@ struct SLatDecoderGpuState {
                 ? "failed to allocate SLat decoder GPU convolution graph" : scheduler_error);
             return false;
         }
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::scheduler_allocate_ms,
+                                  allocation_begin);
         if (trace) {
             backend_log_timing("SLat-decoder-conv", "scheduler_allocate",
                                backend_time_now_ms() - allocation_begin);
         }
-        const double input_upload_begin = trace ? backend_time_now_ms() : 0.0;
+        const double input_upload_begin = profile ? backend_time_now_ms() : 0.0;
         ggml_backend_tensor_set(input_tensor, padded_values.data(), 0,
                                 padded_values.size() * sizeof(float));
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::input_upload_ms,
+                                  input_upload_begin);
         if (trace) {
             backend_log_timing("SLat-decoder-conv", "input_upload",
                                backend_time_now_ms() - input_upload_begin);
         }
-        const double index_upload_begin = trace ? backend_time_now_ms() : 0.0;
+        const double index_upload_begin = profile ? backend_time_now_ms() : 0.0;
         for (std::size_t index = 0; index < index_tensors.size(); ++index) {
-            // Reconstructing the small gather arrays here keeps their lifetime
-            // independent from the graph descriptors and avoids host-side
-            // pointers being retained by a backend.
-            std::vector<std::int32_t> index_values(points, 0);
-            const int kd = static_cast<int>(index / 9);
-            const int kh = static_cast<int>((index / 3) % 3);
-            const int kw = static_cast<int>(index % 3);
-            for (std::size_t point = 0; point < points; ++point) {
-                const DecoderCoord center{input.coords[point * 4 + 0], input.coords[point * 4 + 1],
-                                   input.coords[point * 4 + 2], input.coords[point * 4 + 3]};
-                const DecoderCoord neighbor{center.batch, center.x + kd - 1,
-                                     center.y + kh - 1, center.z + kw - 1};
-                const auto found = indices.find(neighbor);
-                if (found != indices.end()) {
-                    index_values[point] = static_cast<std::int32_t>(found->second);
-                } else {
-                    index_values[point] = static_cast<std::int32_t>(points);
-                }
-            }
-            ggml_backend_tensor_set(index_tensors[index], index_values.data(), 0,
-                                    index_values.size() * sizeof(std::int32_t));
+            const std::int32_t * index_values =
+                gather_map->gather_indices.data() + index * points;
+            ggml_backend_tensor_set(index_tensors[index], index_values, 0,
+                                    points * sizeof(std::int32_t));
         }
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::index_upload_ms,
+                                  index_upload_begin);
         if (trace) {
             backend_log_timing("SLat-decoder-conv", "index_upload",
                                backend_time_now_ms() - index_upload_begin);
         }
-        const double compute_begin = trace ? backend_time_now_ms() : 0.0;
+        const double compute_begin = profile ? backend_time_now_ms() : 0.0;
         const ggml_status status = scheduler.compute(graph, &scheduler_error);
+        decoder_profile_add_phase(profile, &SLatDecoderProfile::gpu_compute_ms, compute_begin);
         if (trace) {
-            backend_log_timing("SLat-decoder-conv", "scheduler_compute",
+            backend_log_timing("SLat-decoder-conv", "gpu_compute",
                                backend_time_now_ms() - compute_begin);
         }
         bool ok = status == GGML_STATUS_SUCCESS;
         std::vector<float> result_values(points * static_cast<std::size_t>(out_channels));
         if (ok) {
-            const double output_download_begin = trace ? backend_time_now_ms() : 0.0;
+            const double output_download_begin = profile ? backend_time_now_ms() : 0.0;
             ggml_backend_tensor_get(accumulator, result_values.data(), 0,
                                     result_values.size() * sizeof(float));
+            decoder_profile_add_phase(profile, &SLatDecoderProfile::output_download_ms,
+                                      output_download_begin);
             if (trace) {
                 backend_log_timing("SLat-decoder-conv", "output_download",
                                    backend_time_now_ms() - output_download_begin);
@@ -771,6 +1474,33 @@ struct SLatDecoderGpuState {
         ggml_free(ctx);
         return ok;
     }
+};
+
+struct SLatDecoderInvocation {
+    SLatDecoderGpuState & gpu;
+    SLatDecoderProfile profile;
+    detail::SparseProfileStats sparse;
+    detail::SparseProfileScope sparse_scope;
+
+    SLatDecoderInvocation(SLatDecoderGpuState & state,
+                          bool profiling,
+                          bool cache_enabled,
+                          bool validate_cache)
+        : gpu(state),
+          sparse_scope(profiling ? &sparse : nullptr) {
+        profile.neighbor_cache_enabled = cache_enabled;
+        profile.validate_neighbor_cache = validate_cache;
+        profile.topologies.reserve(8);
+        gpu.begin_invocation(profiling ? &profile : nullptr,
+                             cache_enabled, validate_cache);
+    }
+
+    ~SLatDecoderInvocation() {
+        gpu.end_invocation(sparse);
+    }
+
+    SLatDecoderInvocation(const SLatDecoderInvocation &) = delete;
+    SLatDecoderInvocation & operator=(const SLatDecoderInvocation &) = delete;
 };
 
 } // namespace
@@ -899,6 +1629,10 @@ bool SLatDecoderModel::Impl::decode_gpu(
         set_error(error, "SLat decoder GPU state is not initialized");
         return false;
     }
+    SLatDecoderInvocation invocation(
+        gpu, slat_decoder_profile_enabled(),
+        slat_decoder_neighbor_cache_enabled(),
+        slat_decoder_neighbor_cache_validation_enabled());
     SLatDecoderWeightsF32 weights;
     if (!make_weights(weights, error)) return false;
     SLatDecoderConfig config;
@@ -908,7 +1642,12 @@ bool SLatDecoderModel::Impl::decode_gpu(
     config.pred_subdiv = hp.pred_subdiv;
     config.model_channels = hp.model_channels;
     config.num_blocks = hp.num_blocks;
-    if (!input.valid(error) || input.channels != config.latent_channels ||
+    const double input_validation_begin = gpu.profile ? backend_time_now_ms() : 0.0;
+    const bool input_valid = validate_decoder_sparse_tensor(
+        input, "decoder.decode.input", error);
+    decoder_profile_add_phase(gpu.profile, &SLatDecoderProfile::input_validation_ms,
+                              input_validation_begin);
+    if (!input_valid || input.channels != config.latent_channels ||
         config.model_channels.empty() || config.model_channels.size() != config.num_blocks.size()) {
         set_error(error, "invalid SLat decoder GPU input or configuration");
         return false;
@@ -922,13 +1661,17 @@ bool SLatDecoderModel::Impl::decode_gpu(
         return false;
     }
     SparseTensorF32 hidden;
-    if (!sparse_linear(input, weights.from_latent_weight, weights.from_latent_bias,
-                       config.model_channels.front(), hidden, error)) return false;
+    if (!run_labeled_sparse_linear(input, weights.from_latent_weight,
+                                   weights.from_latent_bias,
+                                   config.model_channels.front(), hidden,
+                                   "decode.from_latent", error)) return false;
     if (predicted_subdivisions) predicted_subdivisions->clear();
     std::size_t block_index = 0;
     for (std::size_t level = 0; level < config.model_channels.size(); ++level) {
         for (int block = 0; block < config.num_blocks[level]; ++block) {
             const SLatDecoderBlockWeightsF32 & current = weights.blocks[block_index];
+            const std::string block_label = "decode.level=" + std::to_string(level) +
+                                            ".block=" + std::to_string(block);
             SparseTensorF32 convolved;
             if (!gpu.run_conv(hidden, current.conv1_weight, current.conv1_bias,
                               hidden.channels, convolved, error)) return false;
@@ -936,12 +1679,14 @@ bool SLatDecoderModel::Impl::decode_gpu(
             if (!sparse_layer_norm(convolved, config.norm_eps, current.norm_weight,
                                    current.norm_bias, normalized, error)) return false;
             SparseTensorF32 mlp_hidden;
-            if (!sparse_linear(normalized, current.mlp0_weight, current.mlp0_bias,
-                               current.mlp_hidden, mlp_hidden, error)) return false;
+            if (!run_labeled_sparse_linear(normalized, current.mlp0_weight,
+                                           current.mlp0_bias, current.mlp_hidden, mlp_hidden,
+                                           block_label + ".mlp0", error)) return false;
             silu_in_place(mlp_hidden);
             SparseTensorF32 result;
-            if (!sparse_linear(mlp_hidden, current.mlp2_weight, current.mlp2_bias,
-                               hidden.channels, result, error) ||
+            if (!run_labeled_sparse_linear(mlp_hidden, current.mlp2_weight,
+                                           current.mlp2_bias, hidden.channels, result,
+                                           block_label + ".mlp2", error) ||
                 !add_in_place(result, hidden, error)) return false;
             hidden = std::move(result);
             ++block_index;
@@ -952,8 +1697,10 @@ bool SLatDecoderModel::Impl::decode_gpu(
             ? &(*guide_subdivisions)[level] : nullptr;
         SparseTensorF32 predicted;
         if (config.pred_subdiv &&
-            !sparse_linear(hidden, current.to_subdiv_weight, current.to_subdiv_bias,
-                           8, predicted, error)) return false;
+            !run_labeled_sparse_linear(hidden, current.to_subdiv_weight,
+                                       current.to_subdiv_bias, 8, predicted,
+                                       "decode.level=" + std::to_string(level) +
+                                           ".transition.to_subdiv", error)) return false;
         const SparseTensorF32 * selected = config.pred_subdiv ? &predicted : guide;
         SparseTensorF32 normalized;
         if (!sparse_layer_norm(hidden, config.norm_eps, current.norm1_weight,
@@ -966,6 +1713,7 @@ bool SLatDecoderModel::Impl::decode_gpu(
         if (!sparse_channel_to_spatial(packed, 2, selected, hidden_spatial, error)) return false;
         SparseTensorF32 skip_spatial;
         if (!sparse_channel_to_spatial(hidden, 2, selected, skip_spatial, error)) return false;
+        gpu.invalidate_neighbor_map();
         SparseTensorF32 skip;
         if (!repeat_channels(skip_spatial, current.out_channels, skip, error)) return false;
         if (!sparse_layer_norm(hidden_spatial, config.norm_eps, nullptr, nullptr,
@@ -987,8 +1735,8 @@ bool SLatDecoderModel::Impl::decode_gpu(
     if (!sparse_layer_norm(hidden, k_slat_decoder_final_layer_norm_eps,
                            nullptr, nullptr,
                            normalized, error) ||
-        !sparse_linear(normalized, weights.output_weight, weights.output_bias,
-                       config.out_channels, output, error)) return false;
+        !run_labeled_sparse_linear(normalized, weights.output_weight, weights.output_bias,
+                                   config.out_channels, output, "decode.output", error)) return false;
     return true;
 }
 
@@ -1002,6 +1750,10 @@ bool SLatDecoderModel::Impl::upsample_coords_gpu(
         set_error(error, "invalid SLat decoder GPU coordinate-upsample request");
         return false;
     }
+    SLatDecoderInvocation invocation(
+        gpu, slat_decoder_profile_enabled(),
+        slat_decoder_neighbor_cache_enabled(),
+        slat_decoder_neighbor_cache_validation_enabled());
     SLatDecoderWeightsF32 weights;
     if (!make_weights(weights, error)) return false;
     SLatDecoderConfig config;
@@ -1011,13 +1763,20 @@ bool SLatDecoderModel::Impl::upsample_coords_gpu(
     config.pred_subdiv = hp.pred_subdiv;
     config.model_channels = hp.model_channels;
     config.num_blocks = hp.num_blocks;
-    if (!config.pred_subdiv || !input.valid(error) || input.channels != config.latent_channels) {
+    const double input_validation_begin = gpu.profile ? backend_time_now_ms() : 0.0;
+    const bool input_valid = validate_decoder_sparse_tensor(
+        input, "decoder.upsample.input", error);
+    decoder_profile_add_phase(gpu.profile, &SLatDecoderProfile::input_validation_ms,
+                              input_validation_begin);
+    if (!config.pred_subdiv || !input_valid || input.channels != config.latent_channels) {
         set_error(error, "invalid SLat decoder GPU coordinate-upsample input");
         return false;
     }
     SparseTensorF32 hidden;
-    if (!sparse_linear(input, weights.from_latent_weight, weights.from_latent_bias,
-                       config.model_channels.front(), hidden, error)) return false;
+    if (!run_labeled_sparse_linear(input, weights.from_latent_weight,
+                                   weights.from_latent_bias,
+                                   config.model_channels.front(), hidden,
+                                   "upsample.from_latent", error)) return false;
     std::size_t block_index = 0;
     for (std::size_t level = 0; level < config.model_channels.size(); ++level) {
         if (static_cast<int>(level) == upsample_times) {
@@ -1026,6 +1785,8 @@ bool SLatDecoderModel::Impl::upsample_coords_gpu(
         }
         for (int block = 0; block < config.num_blocks[level]; ++block) {
             const SLatDecoderBlockWeightsF32 & current = weights.blocks[block_index++];
+            const std::string block_label = "upsample.level=" + std::to_string(level) +
+                                            ".block=" + std::to_string(block);
             SparseTensorF32 convolved;
             if (!gpu.run_conv(hidden, current.conv1_weight, current.conv1_bias,
                               hidden.channels, convolved, error)) return false;
@@ -1033,20 +1794,24 @@ bool SLatDecoderModel::Impl::upsample_coords_gpu(
             if (!sparse_layer_norm(convolved, config.norm_eps, current.norm_weight,
                                    current.norm_bias, normalized, error)) return false;
             SparseTensorF32 mlp_hidden;
-            if (!sparse_linear(normalized, current.mlp0_weight, current.mlp0_bias,
-                               current.mlp_hidden, mlp_hidden, error)) return false;
+            if (!run_labeled_sparse_linear(normalized, current.mlp0_weight,
+                                           current.mlp0_bias, current.mlp_hidden, mlp_hidden,
+                                           block_label + ".mlp0", error)) return false;
             silu_in_place(mlp_hidden);
             SparseTensorF32 result;
-            if (!sparse_linear(mlp_hidden, current.mlp2_weight, current.mlp2_bias,
-                               hidden.channels, result, error) ||
+            if (!run_labeled_sparse_linear(mlp_hidden, current.mlp2_weight,
+                                           current.mlp2_bias, hidden.channels, result,
+                                           block_label + ".mlp2", error) ||
                 !add_in_place(result, hidden, error)) return false;
             hidden = std::move(result);
         }
         if (level + 1 >= config.model_channels.size()) break;
         const SLatDecoderBlockWeightsF32 & current = weights.blocks[block_index++];
         SparseTensorF32 predicted;
-        if (!sparse_linear(hidden, current.to_subdiv_weight, current.to_subdiv_bias,
-                           8, predicted, error)) return false;
+        if (!run_labeled_sparse_linear(hidden, current.to_subdiv_weight,
+                                       current.to_subdiv_bias, 8, predicted,
+                                       "upsample.level=" + std::to_string(level) +
+                                           ".transition.to_subdiv", error)) return false;
         SparseTensorF32 normalized;
         if (!sparse_layer_norm(hidden, config.norm_eps, current.norm1_weight,
                                current.norm1_bias, normalized, error)) return false;
@@ -1058,6 +1823,7 @@ bool SLatDecoderModel::Impl::upsample_coords_gpu(
         if (!sparse_channel_to_spatial(packed, 2, &predicted, hidden_spatial, error)) return false;
         SparseTensorF32 skip_spatial;
         if (!sparse_channel_to_spatial(hidden, 2, &predicted, skip_spatial, error)) return false;
+        gpu.invalidate_neighbor_map();
         SparseTensorF32 skip;
         if (!repeat_channels(skip_spatial, current.out_channels, skip, error)) return false;
         if (!sparse_layer_norm(hidden_spatial, config.norm_eps, nullptr, nullptr,
