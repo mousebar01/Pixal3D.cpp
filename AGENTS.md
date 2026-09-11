@@ -122,6 +122,48 @@ pinned official ggml commit; an option whose macro or API is absent upstream
 must be removed, marked unsupported, or covered by an explicit downstream
 patch and test.
 
+### GPU-first execution invariant
+
+For every stage declared GPU-capable, use `GPU > CPU` as the placement priority
+for every validated GPU-capable numerical operation. Backend selection alone is
+not sufficient: a stage is GPU-first only when its eligible feature operations
+and intermediate activation residency satisfy this invariant.
+
+- GPU-capable numerical operations include, where the selected backend
+  supports them, linear/matrix multiplication, convolution, normalization,
+  activation, bias, residual arithmetic, and feature gather/scatter or
+  reshape/permute operations. Once a GPU implementation has passed the
+  required correctness checks, do not call an equivalent CPU helper in the
+  GPU stage.
+- Keep eligible weights and intermediate feature activations on the selected
+  GPU for the duration of a GPU stage. H2D/D2H transfers are allowed at stage
+  boundaries or at an explicitly documented topology transition, but must not
+  be introduced implicitly inside a hot loop. Every transfer must be counted
+  and profiled.
+- CPU execution is allowed only for an explicit host-only allowlist, such as
+  coordinate/topology construction, metadata and serialization, validation
+  required by the current policy, or a mesh/export algorithm that has no
+  validated GPU implementation yet. Such work must be named and logged as
+  host-only; it must not make the enclosing stage appear fully GPU-resident.
+- `gpu:<index>` is strict for GPU-capable stages: an unavailable required GPU
+  operation or an unapproved CPU fallback is an error, not a silent downgrade.
+  `auto` may choose a CPU fallback only after logging the stage, operation,
+  tensor, backend, and reason. If a partial GPU plan would cause repeated
+  activation transfers, prefer a complete CPU plan or an explicitly declared
+  migration/probe plan rather than silently alternating between devices.
+- A stage must not be described as GPU-first while it contains an untracked
+  partial GPU path. Diagnostics must report GPU operations, host-only
+  operations, CPU fallbacks, and H2D/D2H counts and bytes.
+- Forced-GPU tests must assert placement for all eligible operations and must
+  fail when an eligible operation executes on the CPU. CPU-only host work and
+  explicit migration probes must be tested separately.
+
+This is a placement and residency rule, not a requirement to immediately
+rewrite every CPU-only postprocess algorithm. QEM, xatlas charting, UV baking,
+and other export operations may remain CPU-only until they have validated GPU
+implementations, but they must be explicitly classified as host-side work and
+must not be presented as GPU-accelerated stages.
+
 ### Precision policy
 
 Keep these two decisions separate:
@@ -293,7 +335,18 @@ but must not commit, push, publish, or open external issues/PRs unless the
 user explicitly asks for that action.
 
 Before editing, state the intended scope when the change is more than a small
-local fix. After editing, report:
+local fix.
+
+Troubleshooting findings must be captured in `docs/` before handoff. For every
+completed investigation that identifies a reproducible bug, regression, failure,
+or misleading symptom, create or update a focused document with the symptom,
+fixture/environment, reproduction or evidence, root cause or ruled-out causes,
+and the concrete fix, workaround, or prevention rule. If the issue remains
+unresolved, record that status and the next diagnostic step instead of claiming
+resolution. Mention the document path in the handoff, and keep generated logs,
+weights, meshes, and build artifacts outside `docs/` and version control.
+
+After editing, report:
 
 - files changed and why;
 - tests or validation commands run;

@@ -326,3 +326,94 @@ different sampling/averaging trade-off, not a more correct material.
 textured iteration, `1024` when more texture detail is needed, and explicit
 `4096` for upstream-aligned quality runs. Never use `texture-size=64` as a
 quality claim; it is only a fast workflow smoke-test setting.
+
+## 9. Decoder appears slower while GPU utilization is lower
+
+### Symptom
+
+A full image-to-3D run can appear to have a slower decoder even though the
+CUDA graph is selected, while a live GPU monitor shows a lower or more
+intermittent GPU utilization peak. This is a misleading symptom of the
+current hybrid decoder path, not evidence that the texture atlas setting made
+the decoder slower.
+
+### Evidence
+
+The comparable full runs used the fixed
+`weights/Pixal3D/test_inputs/armor_knight.png` input and the CUDA Docker
+runtime with an RTX 4090 D:
+
+| Run | Shape decoder | Texture decoder | Sum |
+| --- | ---: | ---: | ---: |
+| `/tmp/pixal3d-armor-knight-current-quality.log` | 581.635 s | 583.526 s | 1165.161 s |
+| `/tmp/pixal3d-armor-knight-upstream-aligned-4096.log` | 579.086 s | 588.874 s | 1167.960 s |
+| `/tmp/pixal3d-final-0910/run.log` | 602.989 s | 607.868 s | 1210.857 s |
+
+The latest 4096 run therefore differs from the immediately preceding full run
+by only `+2.799 s` for the two decoders, while it is about `42.897 s` faster
+than the older comparable run. The output sizes and cascade point counts are
+unchanged in the two latest logs. `texture_size` is passed to `uv_bake()` only
+after both decoders have completed, so changing the atlas from 64/256/512/1024
+to 4096 cannot change decoder arithmetic.
+
+The full decoder profile in
+`/tmp/pixal3d-slat-full-cache-IfQAGY/full.log` gives the more important
+breakdown:
+
+```text
+shape decoder wall time:       596.873 s
+GPU sparse-conv compute:         4.29051 s
+sparse_linear total:           432.953 s
+SparseTensorF32::valid():       74.3051 s
+sparse_layer_norm:              24.8565 s
+sparse_channel_to_spatial:      15.2814 s
+finish_sparse:                  18.3754 s
+output_validation:              11.8979 s
+```
+
+The measured GPU graph compute occupies only about `0.72%` of that decoder
+wall time. The dominant work is still CPU-side sparse linear, validation, and
+sparse layout handling. The detailed linear profile also reports
+`omp_max_threads=32` and `omp_actual_threads=32`; the separate
+`cpu_threads=4` backend log is the ggml CPU backend threadpool setting and does
+not mean that the OpenMP sparse-linear hot loop is limited to four threads.
+
+The neighbor-map cache is not the cause of a slowdown. In the same profiling
+setup, cache enabled versus disabled measured:
+
+```text
+cache enabled:  596.873 s, neighbor_map_builds=5,  cache_hits=35
+cache disabled: 635.113 s, neighbor_map_builds=40, cache_hits=0
+```
+
+### Root cause
+
+The SLat decoder is only partially GPU-resident. Sparse convolution graph
+nodes run on CUDA, but the surrounding feature operations return to host-side
+C++ vectors. Each decoder block therefore alternates between CPU work and
+short GPU bursts. A GPU monitor can show low average utilization or low peaks
+while the end-to-end decoder remains slow; the observed wall time is real, but
+it is CPU-bound rather than GPU-compute-bound.
+
+The normal backend `memory=` log reports free VRAM/total VRAM, not GPU
+utilization. It must not be interpreted as a compute-usage or throughput
+measurement. The normal image-run logs also do not record a reliable
+utilization peak; point-in-time `nvidia-smi` samples can miss short sparse
+kernels.
+
+### Prevention and next diagnostic
+
+For decoder comparisons:
+
+- compare the explicit `shape_decoder` and `texture_decoder` stage timings,
+  not only the total run time, because QEM and UV bake are cumulative export
+  costs;
+- disable `PIXAL3D_SLAT_DECODER_PROFILE`, `PIXAL3D_SLAT_DECODER_TRACE`, and
+  `PIXAL3D_VALIDATE_SPARSE_MAP_CACHE` for production timing;
+- use Nsight or a continuous `nvidia-smi dmon` sample if GPU utilization is
+  needed; do not infer it from the backend free-memory snapshot;
+- prioritize the already confirmed CPU `sparse_linear` path before judging
+  CUDA kernel peak utilization.
+
+**Status:** decoder regression not reproduced. The lower GPU utilization is
+consistent with the known CPU-dominated partial GPU decoder path.
