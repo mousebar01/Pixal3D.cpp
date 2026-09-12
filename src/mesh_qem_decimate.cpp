@@ -20,19 +20,9 @@ namespace pixal3d {
 
 // Self-contained CUDA/HIP port (src/decimate_qem.cu). Guarded prototype: only present when
 // a GPU backend was compiled in; falls through to the CPU path below on false / failure.
-#ifdef TRELLIS_HAVE_GPU_DECIMATE
+#ifdef PIXAL3D_HAVE_GPU_DECIMATE
 bool decimate_qem_gpu(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
                       int target_faces, std::vector<float>& ov, std::vector<int32_t>& of);
-#endif
-
-// Self-contained Vulkan compute port (src/decimate_qem_vk.cpp). Runs the same four per-round
-// kernels (qem/cost/propagate/collapse) on a headless Vulkan device; the host builds CSR
-// adjacency/edges/boundary and does the stream compaction between rounds. Only present when a
-// Vulkan backend was compiled in; requires 64-bit shader atomics and falls through to the CPU
-// path below on false / failure (no device, missing atomics, alloc/submit error).
-#ifdef TRELLIS_HAVE_VK_DECIMATE
-bool decimate_qem_vk(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
-                     int target_faces, std::vector<float>& ov, std::vector<int32_t>& of);
 #endif
 
 namespace {
@@ -200,28 +190,12 @@ void simplify_round(std::vector<float>& verts, int& V, std::vector<int32_t>& fac
 
 } // namespace
 
-void decimate_qem(const std::vector<float>& in_verts, int V0, const std::vector<int32_t>& in_faces, int F0,
-                  int target_faces, std::vector<float>& ov, std::vector<int32_t>& of) {
+void decimate_qem_cpu(const std::vector<float>& in_verts, int V0, const std::vector<int32_t>& in_faces, int F0,
+                      int target_faces, std::vector<float>& ov, std::vector<int32_t>& of) {
     std::vector<float> verts = in_verts;
     std::vector<int32_t> faces = in_faces;
     int V = V0, F = F0;
     if (F <= target_faces) { ov = verts; of = faces; return; }
-
-#ifdef TRELLIS_HAVE_GPU_DECIMATE
-    // Run the whole simplification on the GPU when a CUDA/HIP backend is built in; on any
-    // failure (no device, alloc/kernel error) fall through to the validated CPU path.
-    if (decimate_qem_gpu(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
-    // Any message above (e.g. "device kernel image is invalid" when the kernel was
-    // built for a different GPU arch — issue #14) is non-fatal: the mesh is still
-    // decimated correctly on the CPU below, just slower.
-    fprintf(stderr, "[decimate] GPU decimation unavailable; falling back to the CPU path (output is unaffected)\n");
-#endif
-
-#ifdef TRELLIS_HAVE_VK_DECIMATE
-    // Same, on a headless Vulkan compute device (used in Vulkan-only builds with no CUDA/HIP
-    // kernel). Falls through to the CPU path on any failure or when the device lacks 64-bit atomics.
-    if (decimate_qem_vk(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
-#endif
 
     float thresh = 1e-8f;
     const float lam_len = 1e-2f, lam_skinny = 1e-3f;
@@ -245,6 +219,23 @@ void decimate_qem(const std::vector<float>& in_verts, int V0, const std::vector<
     for (int f = 0; f < F; ++f) for (int k = 0; k < 3; ++k) of[3*f+k] = used[faces[3*f+k]];
     printf("  decimate_qem(target=%d): V %d->%d, F %d->%d (thresh=%.1e)\n", target_faces, V0, nV, F0, F, (double)thresh);
     fflush(stdout);
+}
+
+
+void decimate_qem(const std::vector<float>& in_verts, int V0,
+                  const std::vector<int32_t>& in_faces, int F0,
+                  int target_faces, std::vector<float>& ov,
+                  std::vector<int32_t>& of) {
+#ifdef PIXAL3D_HAVE_GPU_DECIMATE
+    // CUDA is the preferred postprocess backend in a CUDA build. The GPU
+    // implementation returns false without modifying outputs on any device,
+    // allocation, or kernel failure, so the fallback remains deterministic and
+    // visible rather than silently changing the mesh semantics.
+    if (decimate_qem_gpu(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
+    std::fprintf(stderr,
+                 "pixal3d: QEM GPU path unavailable; using explicit CPU fallback\n");
+#endif
+    decimate_qem_cpu(in_verts, V0, in_faces, F0, target_faces, ov, of);
 }
 
 } // namespace pixal3d

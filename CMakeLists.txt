@@ -19,8 +19,12 @@ option(PIXAL3D_USE_BUNDLED_GGML
        "Use the top-level ggml submodule" ON)
 option(PIXAL3D_ENABLE_CUDA
        "Enable the ggml CUDA backend (requires a CUDA toolchain)" OFF)
+set(PIXAL3D_CUDA_ARCHITECTURES "" CACHE STRING
+    "CUDA architectures for the custom postprocess kernels (empty uses the compiler default)")
 option(PIXAL3D_CUDA_TF32
        "Allow CUDA TF32 tensor operations (faster, but not F32-exact)" OFF)
+option(PIXAL3D_XATLAS_PROFILE
+       "Enable xatlas internal CPU phase profiling" OFF)
 option(PIXAL3D_GGML_NATIVE
        "Tune ggml for the build host (reduces binary portability)" OFF)
 option(PIXAL3D_BUILD_CLI "Build the pixal3d diagnostic CLI" ON)
@@ -105,6 +109,9 @@ add_library(pixal3d_xatlas STATIC third_party/xatlas/xatlas.cpp)
 target_compile_features(pixal3d_xatlas PUBLIC cxx_std_17)
 target_include_directories(pixal3d_xatlas PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/xatlas>")
+if(PIXAL3D_XATLAS_PROFILE)
+    target_compile_definitions(pixal3d_xatlas PRIVATE XA_PROFILE=1)
+endif()
 target_link_libraries(pixal3d_core PUBLIC pixal3d_xatlas)
 
 # Vendored mesh postprocess chain for the GLB export path
@@ -155,7 +162,22 @@ target_link_libraries(pixal3d_core PUBLIC ${ONNXRUNTIME_LIBRARY})
 message(STATUS "MoGe camera estimation enabled (required; onnxruntime: ${ONNXRUNTIME_LIBRARY})")
 
 if(PIXAL3D_ENABLE_CUDA)
-    target_compile_definitions(pixal3d_core PUBLIC PIXAL3D_ENABLE_CUDA=1)
+    # The ggml CUDA target already supplies the runtime for model graphs.  The
+    # QEM edge-collapse prototype is a separate, narrowly-scoped CUDA source
+    # because it is not expressible as a ggml graph operation.
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_sources(pixal3d_core PRIVATE src/decimate_qem.cu)
+    target_compile_definitions(pixal3d_core
+        PUBLIC PIXAL3D_ENABLE_CUDA=1 PIXAL3D_HAVE_GPU_DECIMATE=1)
+    set_target_properties(pixal3d_core PROPERTIES CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
+    if(PIXAL3D_CUDA_ARCHITECTURES)
+        set_property(TARGET pixal3d_core PROPERTY CUDA_ARCHITECTURES
+                     "${PIXAL3D_CUDA_ARCHITECTURES}")
+    endif()
+    target_link_libraries(pixal3d_core PUBLIC CUDA::cudart)
+    message(STATUS "Pixal3D: CUDA QEM postprocess enabled")
 endif()
 
 if(PIXAL3D_BUILD_CLI)
@@ -225,6 +247,15 @@ if(BUILD_TESTING AND PIXAL3D_BUILD_CLI)
                  COMMAND pixal3d_slat_decoder_gpu_first_fixture)
         set_tests_properties(pixal3d_slat_decoder_gpu_first_fixture
             PROPERTIES LABELS "backend;cuda;parity;unit"
+                       SKIP_RETURN_CODE 77)
+        add_executable(pixal3d_mesh_qem_cuda_test
+            tests/mesh_qem_cuda_test.cpp)
+        target_compile_features(pixal3d_mesh_qem_cuda_test PRIVATE cxx_std_17)
+        target_link_libraries(pixal3d_mesh_qem_cuda_test PRIVATE pixal3d_core)
+        add_test(NAME pixal3d_mesh_qem_cuda
+                 COMMAND pixal3d_mesh_qem_cuda_test)
+        set_tests_properties(pixal3d_mesh_qem_cuda
+            PROPERTIES LABELS "backend;cuda;parity"
                        SKIP_RETURN_CODE 77)
     endif()
     add_executable(pixal3d_dino_vit_numeric_fixture

@@ -498,6 +498,16 @@ int fill_small_holes(std::vector<int32_t>& faces, int max_loop) {
 BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
                   const std::vector<float>& pbr6, int texsize, const VoxelPbr* vox) {
     BakedMesh out;
+    const auto bake_start = std::chrono::steady_clock::now();
+    auto phase_start = bake_start;
+    const auto phase_log = [&bake_start, &phase_start](const char * label) {
+        const auto now = std::chrono::steady_clock::now();
+        const double exclusive = std::chrono::duration<double>(now - phase_start).count();
+        const double cumulative = std::chrono::duration<double>(now - bake_start).count();
+        std::fprintf(stderr, "pixal3d: uv_bake phase=%s exclusive=%.6f s cumulative=%.6f s\n",
+                     label, exclusive, cumulative);
+        phase_start = now;
+    };
     std::unique_ptr<VoxSampler> vs;
     if (vox && vox->ok()) vs.reset(new VoxSampler(*vox));
     const int res = (vox && vox->ok()) ? vox->res : 1024;
@@ -598,6 +608,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
            (int)tiny_faces.size(), S, n_dup);
     (void)n_sliver;
     fflush(stdout);
+    phase_log("component_triage");
 
     // --- coarse pre-clustering of the big faces, a CPU port of cumesh
     // compute_charts (atlas.cu:1071-1210; spec 27 §6.2): bottom-up chart
@@ -740,6 +751,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
         clusters.resize((size_t)C);
         for (int i = 0; i < NB; ++i) clusters[remap[chart[i]]].push_back(big_faces[i]);
     }
+    phase_log("precluster");
 
     struct ClusterMesh {
         std::vector<float> v;
@@ -769,6 +781,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     }
     printf("  uv_bake: %zu merge clusters\n", clusters.size());
     fflush(stdout);
+    phase_log("build_cluster_meshes");
 
     // Reference add_mesh passes positions only — no normals, no custom epsilon
     // (cumesh.py:453-458).
@@ -786,6 +799,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
             return out;
         }
     }
+    phase_log("xatlas_add_mesh");
     xatlas::ChartOptions co;            // defaults
     // Hard wall-clock timeout in a worker thread: chart computation can wedge
     // without ever invoking its progress callback, so cooperative cancellation
@@ -807,6 +821,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     }
     worker.join();
     delete done;
+    phase_log("xatlas_compute_charts");
 
     // Reference packing (spec 27 §6.3): stock PackOptions — padding 0,
     // resolution 0 (xatlas grows a single ~1024² atlas at its own density
@@ -819,6 +834,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     xatlas::PackOptions po;
     xatlas::PackCharts(atlas, po);
     if (atlas->meshCount == 0 || atlas->width == 0) { xatlas::Destroy(atlas); return out; }
+    phase_log("xatlas_pack_charts");
 
     const int W = (int)atlas->width, H = (int)atlas->height;
     const int T = texsize;
@@ -993,6 +1009,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
         }
     }
     const int FoAll = (int)out.faces.size() / 3;
+    phase_log("atlas_reindex");
 
     // --- rasterize into the atlas ---
     out.T = T;
@@ -1035,9 +1052,11 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
             }
         }
     }
+    phase_log("rasterize");
     xatlas::Destroy(atlas);
 
     telea_inpaint(out.base, out.mr, mask, T, 3, 1);
+    phase_log("inpaint");
     printf("  uv_bake: atlas %dx%d (xatlas %dx%d), Vo=%zu Fo=%d\n", T, T, W, H, out.verts.size()/3, FoAll);
     fflush(stdout);
     return out;

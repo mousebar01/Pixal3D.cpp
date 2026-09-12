@@ -240,11 +240,15 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
     std::vector<float> verts(mesh.vertices.begin(), mesh.vertices.end());
     std::vector<std::int32_t> faces(mesh.faces.begin(), mesh.faces.end());
     const auto export_start = std::chrono::steady_clock::now();
-    const auto phase_log = [&export_start](const std::string & label) {
-        std::cerr << "pixal3d: export " << label << " took "
-                  << std::chrono::duration<double>(
-                         std::chrono::steady_clock::now() - export_start).count()
-                  << " s" << std::endl;
+    auto phase_start = export_start;
+    const auto phase_log = [&export_start, &phase_start](const std::string & label) {
+        const auto now = std::chrono::steady_clock::now();
+        const double exclusive = std::chrono::duration<double>(now - phase_start).count();
+        const double cumulative = std::chrono::duration<double>(now - export_start).count();
+        std::cerr << "pixal3d: export phase=" << label
+                  << " exclusive=" << exclusive
+                  << " s cumulative=" << cumulative << " s" << std::endl;
+        phase_start = now;
     };
     weld_vertices(verts, faces, nullptr, 1.0f / 8192.0f);
     clean_mesh(static_cast<int>(verts.size() / 3), faces);
@@ -284,6 +288,7 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
     std::vector<std::uint8_t> mr_png;
     if (!encode_png(baked.base, baked.T, baked.T, 4, base_png, error) ||
         !encode_png(baked.mr, baked.T, baked.T, 4, mr_png, error)) return false;
+    phase_log("encode_png");
 
     const std::size_t vertex_count = baked.verts.size() / 3;
     const std::size_t index_count = baked.faces.size();
@@ -386,7 +391,10 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
          << "{\"buffer\":0,\"byteOffset\":" << mr_png_offset << ",\"byteLength\":" << mr_png_length << "}],"
          << "\"buffers\":[{\"byteLength\":" << ((binary.size() + 3u) & ~std::size_t(3u)) << "}]"
          << "}";
-    return write_glb(path, json.str(), binary, error);
+    phase_log("build_glb");
+    const bool written = write_glb(path, json.str(), binary, error);
+    phase_log("write_glb");
+    return written;
 }
 
 } // namespace pixal3d

@@ -42,6 +42,19 @@ struct VoxelPbr {
 // Garland-Heckbert quadrics + a skinny-triangle shape penalty + flip rejection + boundary
 // weighting, driven by the reference threshold ladder. Produces the reference's adaptive,
 // low-sliver triangulation from a dense dual-contour mesh, unlike the meshopt/FQMS path.
+// This explicit entry point is used by the CUDA parity fixture; production callers should
+// use decimate_qem(), which prefers the GPU path in CUDA builds and logs any CPU fallback.
+void decimate_qem_cpu(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
+                      int target_faces, std::vector<float>& ov, std::vector<int32_t>& of);
+
+// GPU QEM prototype. Available only in PIXAL3D_ENABLE_CUDA builds. It preserves the
+// input mesh on failure and returns false so the caller can select the CPU reference.
+#ifdef PIXAL3D_HAVE_GPU_DECIMATE
+bool decimate_qem_gpu(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
+                      int target_faces, std::vector<float>& ov, std::vector<int32_t>& of);
+#endif
+
+// Preferred QEM entry point: CUDA when the custom postprocess kernel is built, otherwise CPU.
 void decimate_qem(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
                   int target_faces, std::vector<float>& ov, std::vector<int32_t>& of);
 
