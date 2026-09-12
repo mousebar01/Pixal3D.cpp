@@ -1,5 +1,8 @@
 # CuMesh atlas / xatlas 源码调查
 
+> **历史归档：** 本文件保留用于追溯，不是当前实现状态、性能基线或支持矩阵。
+
+
 - **记录日期：** 2026-09-11
 - **状态：** 调查完成，尚未把 CuMesh clustering 接入正式流水线
 - **范围：** 官方 CuMesh `main` 源码、当前外层 `precluster -> xatlas` 调用链，以及临时 xatlas batching fixture

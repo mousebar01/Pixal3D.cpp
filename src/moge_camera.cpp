@@ -1,4 +1,5 @@
 #include "pixal3d/moge_camera.h"
+#include "pixal3d/cpu_threads.h"
 
 #include <algorithm>
 #include <array>
@@ -6,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -225,8 +227,18 @@ bool estimate_pixal3d_camera_with_moge_f32(
     }
     try {
         static Ort::Env environment(ORT_LOGGING_LEVEL_WARNING, "pixal3d-moge");
+        const CpuThreadPolicy cpu_policy = cpu_thread_policy_from_environment();
+        if (!cpu_policy.warning.empty()) {
+            std::cerr << "pixal3d: " << cpu_policy.warning << std::endl;
+        }
         Ort::SessionOptions session_options;
-        session_options.SetIntraOpNumThreads(4);
+        session_options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+        session_options.SetInterOpNumThreads(1);
+        session_options.SetIntraOpNumThreads(cpu_policy.threads);
+        std::cerr << "pixal3d: moge backend=onnxruntime cpu_threads="
+                  << cpu_policy.threads
+                  << " cpu_threads_source=" << cpu_policy.source
+                  << " inter_op_threads=1" << std::endl;
         Ort::Session session(environment, onnx_path.c_str(), session_options);
 
         Ort::AllocatorWithDefaultOptions allocator;

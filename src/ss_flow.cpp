@@ -1,6 +1,7 @@
 #include "pixal3d/ss_flow.h"
 
 #include "pixal3d/backend.h"
+#include "pixal3d/cpu_threads.h"
 #include "pixal3d/flow.h"
 #include "pixal3d/pack.h"
 
@@ -517,7 +518,7 @@ bool SSFlowModel::forward(const float * x,
     }
 
     if (!runtime.ctx) {
-        const double graph_build_start = backend_time_now_ms();
+        const ProfileTimer graph_build_timer(impl_->backend_manager.profile_mode() == ProfileMode::trace);
         const std::size_t graph_memory = ggml_tensor_overhead() * 32768 +
                                          ggml_graph_overhead_custom(32768, false);
         ggml_init_params graph_params{};
@@ -722,7 +723,9 @@ bool SSFlowModel::forward(const float * x,
             return false;
         }
         ggml_build_forward_expand(graph, result);
-        backend_log_timing("SS-flow", "graph_build", backend_time_now_ms() - graph_build_start);
+        if (graph_build_timer.enabled()) {
+            backend_log_timing("SS-flow", "graph_build", graph_build_timer.elapsed_ms());
+        }
         std::string scheduler_error;
         BackendScheduler scheduler(impl_->backend_manager, 32768, false, true,
                                    &scheduler_error, "SS-flow");
@@ -755,8 +758,8 @@ bool SSFlowModel::forward(const float * x,
         runtime.scheduler = std::move(scheduler);
     }
 
-    impl_->backend_manager.set_n_threads(4);
-    const double upload_start = backend_time_now_ms();
+    impl_->backend_manager.set_n_threads(cpu_thread_count());
+    const ProfileTimer upload_timer(impl_->backend_manager.profile_mode() == ProfileMode::trace);
     ggml_backend_tensor_set(runtime.x_t, x, 0,
                             static_cast<std::size_t>(hp.in_channels) * points * sizeof(float));
     ggml_backend_tensor_set(runtime.temb, embedding.data(), 0,
@@ -778,7 +781,9 @@ bool SSFlowModel::forward(const float * x,
                                 static_cast<std::size_t>(projected_channels) * points *
                                 sizeof(float));
     }
-    backend_log_timing("SS-flow", "input_upload", backend_time_now_ms() - upload_start);
+    if (upload_timer.enabled()) {
+        backend_log_timing("SS-flow", "input_upload", upload_timer.elapsed_ms());
+    }
     if (const char * trace = std::getenv("PIXAL3D_SS_FLOW_TRACE")) {
         if (*trace && std::strcmp(trace, "0") != 0) {
             std::fprintf(stderr, "pixal3d: SS-flow rope_upload=%s\n",
@@ -789,12 +794,14 @@ bool SSFlowModel::forward(const float * x,
     const ggml_status status = runtime.scheduler.compute(runtime.graph, &scheduler_error);
     const bool ok = status == GGML_STATUS_SUCCESS;
     if (ok) {
-        const double download_start = backend_time_now_ms();
+        const ProfileTimer download_timer(impl_->backend_manager.profile_mode() == ProfileMode::trace);
         ggml_backend_tensor_get(runtime.result, out, 0,
                                 static_cast<std::size_t>(hp.out_channels) * points *
                                 sizeof(float));
-        backend_log_timing("SS-flow", "output_download",
-                           backend_time_now_ms() - download_start);
+        if (download_timer.enabled()) {
+            backend_log_timing("SS-flow", "output_download",
+                           download_timer.elapsed_ms());
+        }
     } else {
         set_error(error, "SS-flow graph compute failed: " + scheduler_error);
     }

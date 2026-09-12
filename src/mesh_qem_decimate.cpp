@@ -22,7 +22,8 @@ namespace pixal3d {
 // a GPU backend was compiled in; falls through to the CPU path below on false / failure.
 #ifdef PIXAL3D_HAVE_GPU_DECIMATE
 bool decimate_qem_gpu(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
-                      int target_faces, std::vector<float>& ov, std::vector<int32_t>& of);
+                      int target_faces, std::vector<float>& ov, std::vector<int32_t>& of,
+                      std::string * failure_reason);
 #endif
 
 namespace {
@@ -226,14 +227,37 @@ void decimate_qem(const std::vector<float>& in_verts, int V0,
                   const std::vector<int32_t>& in_faces, int F0,
                   int target_faces, std::vector<float>& ov,
                   std::vector<int32_t>& of) {
+    if (F0 <= target_faces) {
+        ov = in_verts;
+        of = in_faces;
+        std::fprintf(stderr,
+                     "pixal3d: qem backend=none fallback=false input=V%d/F%d target=%d reason=already_at_target\n",
+                     V0, F0, target_faces);
+        return;
+    }
 #ifdef PIXAL3D_HAVE_GPU_DECIMATE
     // CUDA is the preferred postprocess backend in a CUDA build. The GPU
     // implementation returns false without modifying outputs on any device,
     // allocation, or kernel failure, so the fallback remains deterministic and
-    // visible rather than silently changing the mesh semantics.
-    if (decimate_qem_gpu(in_verts, V0, in_faces, F0, target_faces, ov, of)) return;
+    // visible rather than silently changing the mesh semantics. Keep the reason
+    // here because a CUDA-enabled build can still lack a usable runtime device,
+    // or can fail after a kernel/cub allocation and then take the CPU path.
+    std::string gpu_failure_reason;
+    if (decimate_qem_gpu(in_verts, V0, in_faces, F0, target_faces, ov, of,
+                         &gpu_failure_reason)) {
+        std::fprintf(stderr,
+                     "pixal3d: qem backend=gpu input=V%d/F%d target=%d output=V%zu/F%zu\n",
+                     V0, F0, target_faces, ov.size() / 3, of.size() / 3);
+        return;
+    }
+    if (gpu_failure_reason.empty()) gpu_failure_reason = "GPU implementation returned false";
     std::fprintf(stderr,
-                 "pixal3d: QEM GPU path unavailable; using explicit CPU fallback\n");
+                 "pixal3d: qem backend=cpu fallback=true input=V%d/F%d target=%d reason=%s\n",
+                 V0, F0, target_faces, gpu_failure_reason.c_str());
+#else
+    std::fprintf(stderr,
+                 "pixal3d: qem backend=cpu fallback=false input=V%d/F%d target=%d reason=gpu_qem_not_compiled\n",
+                 V0, F0, target_faces);
 #endif
     decimate_qem_cpu(in_verts, V0, in_faces, F0, target_faces, ov, of);
 }

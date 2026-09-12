@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cmath>
 #include <limits>
+#include <string>
 
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(GGML_USE_HIP)
   #include <hip/hip_runtime.h>
@@ -82,12 +83,28 @@ namespace {
 constexpr int BLK = 256;
 static inline int NB(long long n) { return (int)((n + BLK - 1) / BLK); }
 
+static bool report_gpu_error(std::string * failure_reason, const char * operation,
+                             gpuError_t error, const char * file, int line) {
+    const char * detail = gpuGetErrorString(error);
+    if (!detail || !*detail) detail = "unknown GPU error";
+    if (failure_reason) {
+        *failure_reason = std::string(operation) + ": " + detail;
+    }
+    fprintf(stderr, "[decimate_qem_gpu] %s:%d: %s: %s\n",
+            file, line, operation, detail);
+    return false;
+}
+
+static bool report_gpu_message(std::string * failure_reason, const char * message) {
+    if (failure_reason) *failure_reason = message;
+    fprintf(stderr, "[decimate_qem_gpu] %s\n", message);
+    return false;
+}
+
 #define GPU_OK(x) do { gpuError_t e_ = (x); if (e_ != gpuSuccess) { \
-    fprintf(stderr, "[decimate_qem_gpu] %s:%d: %s\n", __FILE__, __LINE__, gpuGetErrorString(e_)); \
-    return false; } } while (0)
+    return report_gpu_error(failure_reason, #x, e_, __FILE__, __LINE__); } } while (0)
 #define GPU_LAST() do { gpuError_t e_ = gpuGetLastError(); if (e_ != gpuSuccess) { \
-    fprintf(stderr, "[decimate_qem_gpu] %s:%d: kernel: %s\n", __FILE__, __LINE__, gpuGetErrorString(e_)); \
-    return false; } } while (0)
+    return report_gpu_error(failure_reason, "kernel launch", e_, __FILE__, __LINE__); } } while (0)
 
 struct QEM { float e[10]; };
 
@@ -268,7 +285,8 @@ __global__ void k_compact_faces(const int3* faces, const int* fkeep, const int* 
 }
 
 // ------------------------------- cub wrappers -------------------------------
-static bool cub_exclusive_sum(const int* in, int* out, int n, gpuStream_t s) {
+static bool cub_exclusive_sum(const int* in, int* out, int n, gpuStream_t s,
+                              std::string * failure_reason) {
     size_t bytes = 0;
     GPU_OK(gpucub::DeviceScan::ExclusiveSum(nullptr, bytes, in, out, n, s));
     void* tmp = nullptr; GPU_OK(gpuMalloc(&tmp, bytes ? bytes : 1));
@@ -277,7 +295,8 @@ static bool cub_exclusive_sum(const int* in, int* out, int n, gpuStream_t s) {
     GPU_OK(e);
     return true;
 }
-static bool cub_sort_keys(const uint64_t* in, uint64_t* out, int n, gpuStream_t s) {
+static bool cub_sort_keys(const uint64_t* in, uint64_t* out, int n, gpuStream_t s,
+                          std::string * failure_reason) {
     size_t bytes = 0;
     GPU_OK(gpucub::DeviceRadixSort::SortKeys(nullptr, bytes, in, out, n, 0, 64, s));
     void* tmp = nullptr; GPU_OK(gpuMalloc(&tmp, bytes ? bytes : 1));
@@ -286,7 +305,8 @@ static bool cub_sort_keys(const uint64_t* in, uint64_t* out, int n, gpuStream_t 
     GPU_OK(e);
     return true;
 }
-static bool cub_rle(const uint64_t* in, uint64_t* uniq, int* counts, int* num_runs, int n, gpuStream_t s) {
+static bool cub_rle(const uint64_t* in, uint64_t* uniq, int* counts, int* num_runs, int n,
+                    gpuStream_t s, std::string * failure_reason) {
     size_t bytes = 0;
     GPU_OK(gpucub::DeviceRunLengthEncode::Encode(nullptr, bytes, in, uniq, counts, num_runs, n, s));
     void* tmp = nullptr; GPU_OK(gpuMalloc(&tmp, bytes ? bytes : 1));
@@ -299,7 +319,8 @@ static bool cub_rle(const uint64_t* in, uint64_t* uniq, int* counts, int* num_ru
 // One simplify round entirely on the GPU. Reallocates d_verts/d_faces to the compacted
 // buffers and updates V/F. Returns false on any GPU error (caller frees + falls back).
 static bool simplify_round_gpu(float3*& d_verts, int& V, int3*& d_faces, int& F,
-                               float lam_len, float lam_skinny, float thresh, gpuStream_t s) {
+                               float lam_len, float lam_skinny, float thresh, gpuStream_t s,
+                               std::string * failure_reason) {
     const int E3 = F * 3;
 
     // --- vertex->face adjacency (CSR) ---
@@ -310,7 +331,7 @@ static bool simplify_round_gpu(float3*& d_verts, int& V, int3*& d_faces, int& F,
     GPU_OK(gpuMemsetAsync(d_cnt, 0, sizeof(int) * (size_t)(V + 1), s));
     k_count_faces<<<NB(F), BLK, 0, s>>>(d_faces, F, d_cnt);
     GPU_LAST();
-    if (!cub_exclusive_sum(d_cnt, d_off, V + 1, s)) return false;
+    if (!cub_exclusive_sum(d_cnt, d_off, V + 1, s, failure_reason)) return false;
     GPU_OK(gpuMemsetAsync(d_cnt, 0, sizeof(int) * (size_t)(V + 1), s));
     k_fill_v2f<<<NB(F), BLK, 0, s>>>(d_faces, F, d_v2f, d_off, d_cnt);
     GPU_LAST();
@@ -325,8 +346,9 @@ static bool simplify_round_gpu(float3*& d_verts, int& V, int3*& d_faces, int& F,
     GPU_OK(gpuMalloc(&d_num_runs,    sizeof(int)));
     k_expand_edges<<<NB(F), BLK, 0, s>>>(d_faces, F, d_edge_exp);
     GPU_LAST();
-    if (!cub_sort_keys(d_edge_exp, d_edge_sorted, E3, s)) return false;
-    if (!cub_rle(d_edge_sorted, d_edges, d_ecnt, d_num_runs, E3, s)) return false;
+    if (!cub_sort_keys(d_edge_exp, d_edge_sorted, E3, s, failure_reason)) return false;
+    if (!cub_rle(d_edge_sorted, d_edges, d_ecnt, d_num_runs, E3, s,
+                 failure_reason)) return false;
     int E = 0;
     GPU_OK(gpuMemcpyAsync(&E, d_num_runs, sizeof(int), gpuMemcpyDeviceToHost, s));
     GPU_OK(gpuStreamSynchronize(s));
@@ -379,7 +401,7 @@ static bool simplify_round_gpu(float3*& d_verts, int& V, int3*& d_faces, int& F,
         GPU_OK(gpuMalloc(&d_vscan, sizeof(int) * (size_t)(V + 1)));
         k_vkeep<<<NB(V), BLK, 0, s>>>(d_vdead, V, d_vkeep);
         GPU_LAST();
-        if (!cub_exclusive_sum(d_vkeep, d_vscan, V + 1, s)) ok = false;
+        if (!cub_exclusive_sum(d_vkeep, d_vscan, V + 1, s, failure_reason)) ok = false;
         int newV = 0;
         if (ok) { GPU_OK(gpuMemcpyAsync(&newV, d_vscan + V, sizeof(int), gpuMemcpyDeviceToHost, s));
                   GPU_OK(gpuStreamSynchronize(s)); }
@@ -396,7 +418,8 @@ static bool simplify_round_gpu(float3*& d_verts, int& V, int3*& d_faces, int& F,
             GPU_OK(gpuMalloc(&d_fscan, sizeof(int) * (size_t)(F + 1)));
             k_fkeep<<<NB(F), BLK, 0, s>>>(d_faces, d_fdead, d_vdead, d_vscan, F, d_fkeep);
             GPU_LAST();
-            if (!cub_exclusive_sum(d_fkeep, d_fscan, F + 1, s)) ok = false;
+            if (!cub_exclusive_sum(d_fkeep, d_fscan, F + 1, s,
+                                   failure_reason)) ok = false;
             if (ok) { GPU_OK(gpuMemcpyAsync(&newF, d_fscan + F, sizeof(int), gpuMemcpyDeviceToHost, s));
                       GPU_OK(gpuStreamSynchronize(s)); }
             if (ok) { GPU_OK(gpuMalloc(&d_newF, sizeof(int3) * (size_t)(newF > 0 ? newF : 1)));
@@ -432,24 +455,74 @@ static bool simplify_round_gpu(float3*& d_verts, int& V, int3*& d_faces, int& F,
 // C++-linkage entry point (declared in decimate_qem.cpp under PIXAL3D_HAVE_GPU_DECIMATE).
 bool decimate_qem_gpu(const std::vector<float>& in_verts, int V0,
                       const std::vector<int32_t>& in_faces, int F0,
-                      int target_faces, std::vector<float>& ov, std::vector<int32_t>& of) {
+                      int target_faces, std::vector<float>& ov, std::vector<int32_t>& of,
+                      std::string * failure_reason) {
+    if (failure_reason) failure_reason->clear();
     int devcount = 0;
-    if (gpuGetDeviceCount(&devcount) != gpuSuccess || devcount <= 0) return false;
-    if (V0 <= 0 || F0 <= 0) return false;
+    const gpuError_t device_count_error = gpuGetDeviceCount(&devcount);
+    if (device_count_error != gpuSuccess) {
+        return report_gpu_error(failure_reason, "gpuGetDeviceCount", device_count_error,
+                                __FILE__, __LINE__);
+    }
+    if (devcount <= 0) {
+        return report_gpu_message(failure_reason, "no CUDA/HIP device is available");
+    }
+    if (V0 <= 0 || F0 <= 0) {
+        return report_gpu_message(failure_reason, "input mesh has no vertices or faces");
+    }
     if (F0 <= target_faces) { ov = in_verts; of = in_faces; return true; }
 
     gpuStream_t s;
-    if (gpuStreamCreate(&s) != gpuSuccess) return false;
+    const gpuError_t stream_error = gpuStreamCreate(&s);
+    if (stream_error != gpuSuccess) {
+        return report_gpu_error(failure_reason, "gpuStreamCreate", stream_error,
+                                __FILE__, __LINE__);
+    }
 
     float3* d_verts = nullptr; int3* d_faces = nullptr;
     bool ok = true;
-    if (gpuMalloc(&d_verts, sizeof(float3) * (size_t)V0) != gpuSuccess) ok = false;
-    if (ok && gpuMalloc(&d_faces, sizeof(int3) * (size_t)F0) != gpuSuccess) ok = false;
-    if (ok && gpuMemcpyAsync(d_verts, in_verts.data(), sizeof(float3) * (size_t)V0,
-                             gpuMemcpyHostToDevice, s) != gpuSuccess) ok = false;
-    if (ok && gpuMemcpyAsync(d_faces, in_faces.data(), sizeof(int3) * (size_t)F0,
-                             gpuMemcpyHostToDevice, s) != gpuSuccess) ok = false;
-    if (ok && gpuStreamSynchronize(s) != gpuSuccess) ok = false;
+    if (ok) {
+        const gpuError_t error = gpuMalloc(&d_verts, sizeof(float3) * (size_t)V0);
+        if (error != gpuSuccess) {
+            report_gpu_error(failure_reason, "gpuMalloc(d_verts)", error, __FILE__, __LINE__);
+            ok = false;
+        }
+    }
+    if (ok) {
+        const gpuError_t error = gpuMalloc(&d_faces, sizeof(int3) * (size_t)F0);
+        if (error != gpuSuccess) {
+            report_gpu_error(failure_reason, "gpuMalloc(d_faces)", error, __FILE__, __LINE__);
+            ok = false;
+        }
+    }
+    if (ok) {
+        const gpuError_t error = gpuMemcpyAsync(d_verts, in_verts.data(),
+                                                sizeof(float3) * (size_t)V0,
+                                                gpuMemcpyHostToDevice, s);
+        if (error != gpuSuccess) {
+            report_gpu_error(failure_reason, "gpuMemcpyAsync(vertices)", error,
+                             __FILE__, __LINE__);
+            ok = false;
+        }
+    }
+    if (ok) {
+        const gpuError_t error = gpuMemcpyAsync(d_faces, in_faces.data(),
+                                                sizeof(int3) * (size_t)F0,
+                                                gpuMemcpyHostToDevice, s);
+        if (error != gpuSuccess) {
+            report_gpu_error(failure_reason, "gpuMemcpyAsync(faces)", error,
+                             __FILE__, __LINE__);
+            ok = false;
+        }
+    }
+    if (ok) {
+        const gpuError_t error = gpuStreamSynchronize(s);
+        if (error != gpuSuccess) {
+            report_gpu_error(failure_reason, "gpuStreamSynchronize(upload)", error,
+                             __FILE__, __LINE__);
+            ok = false;
+        }
+    }
 
     int V = V0, F = F0;
     if (ok) {
@@ -457,7 +530,8 @@ bool decimate_qem_gpu(const std::vector<float>& in_verts, int V0,
         const float lam_len = 1e-2f, lam_skinny = 1e-3f;
         int prevF = F, stalls = 0;
         for (int round = 0; round < 400 && F > target_faces; ++round) {
-            if (!simplify_round_gpu(d_verts, V, d_faces, F, lam_len, lam_skinny, thresh, s)) { ok = false; break; }
+            if (!simplify_round_gpu(d_verts, V, d_faces, F, lam_len, lam_skinny, thresh,
+                                    s, failure_reason)) { ok = false; break; }
             if (F <= target_faces) break;
             int removed = prevF - F;
             if (removed <= 0) { if (++stalls >= 2) { thresh *= 10.0f; stalls = 0; } }
@@ -470,21 +544,53 @@ bool decimate_qem_gpu(const std::vector<float>& in_verts, int V0,
     std::vector<float> hv; std::vector<int32_t> hf;
     if (ok && V > 0 && F > 0) {
         hv.resize((size_t)V * 3); hf.resize((size_t)F * 3);
-        if (gpuMemcpy(hv.data(), d_verts, sizeof(float3) * (size_t)V, gpuMemcpyDeviceToHost) != gpuSuccess) ok = false;
-        if (ok && gpuMemcpy(hf.data(), d_faces, sizeof(int3) * (size_t)F, gpuMemcpyDeviceToHost) != gpuSuccess) ok = false;
+        const gpuError_t vertices_error = gpuMemcpy(hv.data(), d_verts,
+                                                    sizeof(float3) * (size_t)V,
+                                                    gpuMemcpyDeviceToHost);
+        if (vertices_error != gpuSuccess) {
+            report_gpu_error(failure_reason, "gpuMemcpy(vertices to host)",
+                             vertices_error, __FILE__, __LINE__);
+            ok = false;
+        }
+        if (ok) {
+            const gpuError_t faces_error = gpuMemcpy(hf.data(), d_faces,
+                                                     sizeof(int3) * (size_t)F,
+                                                     gpuMemcpyDeviceToHost);
+            if (faces_error != gpuSuccess) {
+                report_gpu_error(failure_reason, "gpuMemcpy(faces to host)",
+                                 faces_error, __FILE__, __LINE__);
+                ok = false;
+            }
+        }
     } else {
+        if (failure_reason && failure_reason->empty()) {
+            *failure_reason = "GPU simplification produced an empty mesh";
+        }
         ok = false;
     }
 
     if (d_verts) gpuFree(d_verts);
     if (d_faces) gpuFree(d_faces);
     gpuStreamDestroy(s);
-    if (!ok) return false;
+    if (!ok) {
+        if (failure_reason && failure_reason->empty()) {
+            *failure_reason = "GPU QEM execution failed";
+        }
+        return false;
+    }
 
     // final compaction to referenced vertices only (matches CPU decimate_qem tail)
     std::vector<int> used((size_t)V, -1); int nV = 0;
     for (int f = 0; f < F; ++f)
-        for (int k = 0; k < 3; ++k) { int v = hf[3*f+k]; if (v < 0 || v >= V) return false; if (used[v] < 0) used[v] = nV++; }
+        for (int k = 0; k < 3; ++k) {
+            int v = hf[3*f+k];
+            if (v < 0 || v >= V) {
+                if (failure_reason) *failure_reason = "GPU output contains an invalid face index";
+                fprintf(stderr, "[decimate_qem_gpu] GPU output contains an invalid face index\n");
+                return false;
+            }
+            if (used[v] < 0) used[v] = nV++;
+        }
     ov.assign((size_t)nV * 3, 0.f);
     for (int i = 0; i < V; ++i) if (used[i] >= 0) { ov[3*used[i]] = hv[3*i]; ov[3*used[i]+1] = hv[3*i+1]; ov[3*used[i]+2] = hv[3*i+2]; }
     of.resize((size_t)F * 3);

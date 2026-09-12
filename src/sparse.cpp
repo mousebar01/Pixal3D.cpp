@@ -1,4 +1,5 @@
 #include "pixal3d/sparse.h"
+#include "pixal3d/cpu_threads.h"
 
 #include "sparse_profile.h"
 
@@ -391,7 +392,7 @@ bool sparse_linear(const SparseTensorF32 & input,
         int actual_threads = 1;
         const auto bias_begin = std::chrono::steady_clock::now();
 #if defined(_OPENMP)
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.feats.size()))
 #endif
         for (std::size_t point = 0; point < input.points(); ++point) {
 #if defined(_OPENMP)
@@ -407,7 +408,7 @@ bool sparse_linear(const SparseTensorF32 & input,
 
         const auto compute_begin = std::chrono::steady_clock::now();
 #if defined(_OPENMP)
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.feats.size()))
 #endif
         for (std::size_t point = 0; point < input.points(); ++point) {
             const float * source = input.feats.data() +
@@ -428,7 +429,7 @@ bool sparse_linear(const SparseTensorF32 & input,
         profile_record.record().profile_split_bias = true;
     } else {
 #if defined(_OPENMP)
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.feats.size()))
 #endif
         for (std::size_t point = 0; point < input.points(); ++point) {
             const float * source = input.feats.data() +
@@ -470,7 +471,7 @@ bool varlen_linear(const VarLenTensorF32 & input,
     }
     output.feats.assign(count, 0.0f);
  #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.feats.size()))
  #endif
     for (std::size_t token = 0; token < input.tokens(); ++token) {
         const float * source = input.feats.data() + token * static_cast<std::size_t>(input.channels);
@@ -508,7 +509,7 @@ bool sparse_layer_norm(const SparseTensorF32 & input,
     output.feats.resize(input.feats.size());
     const std::size_t channels = static_cast<std::size_t>(input.channels);
  #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.feats.size()))
  #endif
     for (std::size_t point = 0; point < input.points(); ++point) {
         const float * source = input.feats.data() + point * channels;
@@ -886,7 +887,7 @@ bool sparse_rotary_position_embedding(const SparseTensorF32 & input,
                      static_cast<float>(frequency_dim));
     }
  #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.feats.size()))
  #endif
     for (std::size_t point = 0; point < input.points(); ++point) {
         const int coordinates[3] = {
@@ -934,7 +935,7 @@ bool sparse_multihead_rms_norm(const SparseTensorF32 & input,
     output.feats.resize(input.feats.size());
     const float multiplier = std::sqrt(static_cast<float>(head_dim));
  #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.feats.size()))
  #endif
     for (std::size_t point = 0; point < input.points(); ++point) {
         const float * source = input.feats.data() + point * input.channels;
@@ -973,7 +974,7 @@ bool varlen_multihead_rms_norm(const VarLenTensorF32 & input,
     output.feats.resize(input.feats.size());
     const float multiplier = std::sqrt(static_cast<float>(head_dim));
  #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.feats.size()))
  #endif
     for (std::size_t token = 0; token < input.tokens(); ++token) {
         const float * source = input.feats.data() + token * input.channels;
@@ -1020,7 +1021,7 @@ bool sparse_submanifold_conv3d(const SparseTensorF32 & input,
                               input.coords[point * 4 + 2], input.coords[point * 4 + 3]}, point);
     }
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.feats.size()))
 #endif
     for (std::size_t point = 0; point < input.points(); ++point) {
         const Coord center{input.coords[point * 4 + 0], input.coords[point * 4 + 1],

@@ -99,6 +99,13 @@ bool invert4x4(const std::array<float, 16> & input,
     return true;
 }
 
+struct ProjectionConstants {
+    std::array<float, 16> world_to_camera{};
+    float coordinate_scale = 0.0f;
+    float focal_length_pixels = 0.0f;
+    float image_half = 0.0f;
+};
+
 struct ProjectedPoint {
     float x_pixel = 0.0f;
     float y_pixel = 0.0f;
@@ -109,9 +116,9 @@ struct ProjectedPoint {
 ProjectedPoint project_point(float x,
                              float y,
                              float z,
-                             const ProjectionCamera & camera,
-                             const ProjectionGridOptions & options,
-                             const std::array<float, 16> & world_to_camera) {
+                             const ProjectionConstants & constants,
+                             int image_resolution) {
+    const auto & world_to_camera = constants.world_to_camera;
     const float x_cam = world_to_camera[0] * x + world_to_camera[1] * y +
                         world_to_camera[2] * z + world_to_camera[3];
     const float y_cam = world_to_camera[4] * x + world_to_camera[5] * y +
@@ -120,34 +127,36 @@ ProjectedPoint project_point(float x,
                         world_to_camera[10] * z + world_to_camera[11];
 
     const float depth = -z_cam;
-    const float focal_length = 16.0f / std::tan(camera.camera_angle_x * 0.5f);
-    const float focal_length_pixels =
-        focal_length * static_cast<float>(options.image_resolution) / 32.0f;
     const float denominator = -z_cam + 1e-8f;
-    const float x_ndc = focal_length_pixels * x_cam / denominator;
-    const float y_ndc = focal_length_pixels * y_cam / denominator;
-    const float half = static_cast<float>(options.image_resolution) * 0.5f;
+    const float x_ndc = constants.focal_length_pixels * x_cam / denominator;
+    const float y_ndc = constants.focal_length_pixels * y_cam / denominator;
 
     ProjectedPoint result;
-    result.x_pixel = x_ndc + half;
-    result.y_pixel = -y_ndc + half;
+    result.x_pixel = x_ndc + constants.image_half;
+    result.y_pixel = -y_ndc + constants.image_half;
     result.depth = depth;
     result.valid = result.x_pixel >= 0.0f &&
-                   result.x_pixel < static_cast<float>(options.image_resolution) &&
+                   result.x_pixel < static_cast<float>(image_resolution) &&
                    result.y_pixel >= 0.0f &&
-                   result.y_pixel < static_cast<float>(options.image_resolution) &&
+                   result.y_pixel < static_cast<float>(image_resolution) &&
                    depth > 0.0f;
     return result;
 }
 
-float sample_bilinear_border(const float * fmap,
-                             int height,
-                             int width,
-                             int channels,
-                             float x_pixel,
-                             float y_pixel,
-                             int channel,
-                             int image_resolution) {
+struct BilinearWeights {
+    int x0 = 0;
+    int x1 = 0;
+    int y0 = 0;
+    int y1 = 0;
+    float wx = 0.0f;
+    float wy = 0.0f;
+};
+
+BilinearWeights bilinear_weights(float x_pixel,
+                                 float y_pixel,
+                                 int height,
+                                 int width,
+                                 int image_resolution) {
     // Python first maps image-space pixels to NDC using
     // (pixel + 0.5) / image_resolution * 2 - 1.  grid_sample with
     // align_corners=False maps that NDC value to this feature-map coordinate.
@@ -162,24 +171,35 @@ float sample_bilinear_border(const float * fmap,
     x = std::max(0.0f, std::min(x, static_cast<float>(width - 1)));
     y = std::max(0.0f, std::min(y, static_cast<float>(height - 1)));
 
-    const int x0 = static_cast<int>(std::floor(x));
-    const int y0 = static_cast<int>(std::floor(y));
-    const int x1 = std::min(x0 + 1, width - 1);
-    const int y1 = std::min(y0 + 1, height - 1);
-    const float wx = x - static_cast<float>(x0);
-    const float wy = y - static_cast<float>(y0);
+    BilinearWeights result;
+    result.x0 = static_cast<int>(std::floor(x));
+    result.y0 = static_cast<int>(std::floor(y));
+    result.x1 = std::min(result.x0 + 1, width - 1);
+    result.y1 = std::min(result.y0 + 1, height - 1);
+    result.wx = x - static_cast<float>(result.x0);
+    result.wy = y - static_cast<float>(result.y0);
+    return result;
+}
 
-    const auto at = [&](int iy, int ix) {
-        const std::size_t offset =
-            (static_cast<std::size_t>(iy) * static_cast<std::size_t>(width) +
-             static_cast<std::size_t>(ix)) * static_cast<std::size_t>(channels) +
-            static_cast<std::size_t>(channel);
-        return fmap[offset];
-    };
-
-    const float top = at(y0, x0) * (1.0f - wx) + at(y0, x1) * wx;
-    const float bottom = at(y1, x0) * (1.0f - wx) + at(y1, x1) * wx;
-    return top * (1.0f - wy) + bottom * wy;
+inline float sample_bilinear_channel(const float * fmap,
+                                     int width,
+                                     int channels,
+                                     int channel,
+                                     const BilinearWeights & weights) {
+    const std::size_t x0 = static_cast<std::size_t>(weights.x0);
+    const std::size_t x1 = static_cast<std::size_t>(weights.x1);
+    const std::size_t y0 = static_cast<std::size_t>(weights.y0);
+    const std::size_t y1 = static_cast<std::size_t>(weights.y1);
+    const std::size_t channel_stride = static_cast<std::size_t>(channels);
+    const std::size_t top = y0 * static_cast<std::size_t>(width) * channel_stride;
+    const std::size_t bottom = y1 * static_cast<std::size_t>(width) * channel_stride;
+    const float top_left = fmap[top + x0 * channel_stride + static_cast<std::size_t>(channel)];
+    const float top_right = fmap[top + x1 * channel_stride + static_cast<std::size_t>(channel)];
+    const float bottom_left = fmap[bottom + x0 * channel_stride + static_cast<std::size_t>(channel)];
+    const float bottom_right = fmap[bottom + x1 * channel_stride + static_cast<std::size_t>(channel)];
+    const float top_value = top_left * (1.0f - weights.wx) + top_right * weights.wx;
+    const float bottom_value = bottom_left * (1.0f - weights.wx) + bottom_right * weights.wx;
+    return top_value * (1.0f - weights.wy) + bottom_value * weights.wy;
 }
 
 bool validate_options(const ProjectionGridOptions & options,
@@ -212,7 +232,7 @@ bool validate_options(const ProjectionGridOptions & options,
 
 bool prepare_projection_view(const ProjectionView & view,
                              const ProjectionGridOptions & options,
-                             std::array<float, 16> & world_to_camera,
+                             ProjectionConstants & constants,
                              std::string * error) {
     if (!view.feature_map) {
         set_error(error, "feature_map is null");
@@ -227,10 +247,15 @@ bool prepare_projection_view(const ProjectionView & view,
     const std::array<float, 16> c2w = view.camera.has_transform
                                           ? view.camera.transform_matrix
                                           : front_matrix(view.camera.distance);
-    if (!invert4x4(c2w, world_to_camera)) {
+    if (!invert4x4(c2w, constants.world_to_camera)) {
         set_error(error, "camera transform matrix is singular");
         return false;
     }
+    constants.coordinate_scale = 1.0f / (view.camera.mesh_scale * 2.0f);
+    const float focal_length = 16.0f / std::tan(view.camera.camera_angle_x * 0.5f);
+    constants.focal_length_pixels =
+        focal_length * static_cast<float>(options.image_resolution) / 32.0f;
+    constants.image_half = static_cast<float>(options.image_resolution) * 0.5f;
     return true;
 }
 
@@ -238,8 +263,8 @@ bool project_one(const ProjectionView & view,
                  const ProjectionGridOptions & options,
                  ProjectedGrid & output,
                  std::string * error) {
-    std::array<float, 16> world_to_camera{};
-    if (!prepare_projection_view(view, options, world_to_camera, error)) return false;
+    ProjectionConstants constants;
+    if (!prepare_projection_view(view, options, constants, error)) return false;
 
     const std::size_t r = static_cast<std::size_t>(options.grid_resolution);
     const std::size_t point_count = r * r * r;
@@ -267,20 +292,21 @@ bool project_one(const ProjectionView & view,
 
                 // torch.matmul(points, rotation_matrix.T):
                 // (x, y, z) -> (x, -z, y), then scale by mesh_scale / 2.
-                const float scale = 1.0f / (view.camera.mesh_scale * 2.0f);
-                const float x = base_x * scale;
-                const float y = -base_z * scale;
-                const float z = base_y * scale;
+                const float x = base_x * constants.coordinate_scale;
+                const float y = -base_z * constants.coordinate_scale;
+                const float z = base_y * constants.coordinate_scale;
                 const ProjectedPoint p = project_point(
-                    x, y, z, view.camera, options, world_to_camera);
+                    x, y, z, constants, options.image_resolution);
                 output.valid[point_index] = p.valid ? 1 : 0;
+                const BilinearWeights weights = bilinear_weights(
+                    p.x_pixel, p.y_pixel, view.height, view.width,
+                    options.image_resolution);
 
                 float * dst = output.features.data() +
                               point_index * static_cast<std::size_t>(view.channels);
                 for (int c = 0; c < view.channels; ++c) {
-                    dst[c] = sample_bilinear_border(
-                        view.feature_map, view.height, view.width, view.channels,
-                        p.x_pixel, p.y_pixel, c, options.image_resolution);
+                    dst[c] = sample_bilinear_channel(
+                        view.feature_map, view.width, view.channels, c, weights);
                 }
             }
         }
@@ -349,8 +375,8 @@ bool project_grid_features_at_coords(
     view.width = width;
     view.channels = channels;
     view.camera = camera;
-    std::array<float, 16> world_to_camera{};
-    if (!prepare_projection_view(view, options, world_to_camera, error)) return false;
+    ProjectionConstants constants;
+    if (!prepare_projection_view(view, options, constants, error)) return false;
     if (coords.size() % 4 != 0) {
         set_error(error, "sparse projection coordinates must contain [batch,x,y,z] rows");
         return false;
@@ -389,17 +415,19 @@ bool project_grid_features_at_coords(
                                  ? 0.0f
                                  : -1.0f + 2.0f * static_cast<float>(iz) /
                                                static_cast<float>(options.grid_resolution - 1);
-        const float scale = 1.0f / (camera.mesh_scale * 2.0f);
         const ProjectedPoint projected = project_point(
-            base_x * scale, -base_z * scale, base_y * scale,
-            camera, options, world_to_camera);
+            base_x * constants.coordinate_scale,
+            -base_z * constants.coordinate_scale,
+            base_y * constants.coordinate_scale,
+            constants, options.image_resolution);
         valid[point] = projected.valid ? 1 : 0;
+        const BilinearWeights weights = bilinear_weights(
+            projected.x_pixel, projected.y_pixel, height, width,
+            options.image_resolution);
         float * dst = features.data() + point * static_cast<std::size_t>(channels);
         for (int channel = 0; channel < channels; ++channel) {
-            dst[channel] = sample_bilinear_border(
-                feature_map, height, width, channels,
-                projected.x_pixel, projected.y_pixel, channel,
-                options.image_resolution);
+            dst[channel] = sample_bilinear_channel(
+                feature_map, width, channels, channel, weights);
         }
     }
     return true;

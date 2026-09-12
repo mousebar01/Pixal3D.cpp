@@ -1,4 +1,5 @@
 #include "pixal3d/sparse_transformer.h"
+#include "pixal3d/cpu_threads.h"
 
 #include <cmath>
 #include <cstddef>
@@ -27,7 +28,7 @@ SparseTensorF32 sparse_slice(const SparseTensorF32 & input, int offset, int chan
     result.channels = channels;
     result.feats.resize(input.points() * static_cast<std::size_t>(channels));
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(input.feats.size()))
 #endif
     for (std::size_t point = 0; point < input.points(); ++point) {
         const float * source = input.feats.data() + point * input.channels + offset;
@@ -42,7 +43,7 @@ VarLenTensorF32 varlen_slice(const VarLenTensorF32 & input, int offset, int chan
     result.channels = channels;
     result.feats.resize(input.tokens() * static_cast<std::size_t>(channels));
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(input.feats.size()))
 #endif
     for (std::size_t token = 0; token < input.tokens(); ++token) {
         const float * source = input.feats.data() + token * input.channels + offset;
@@ -59,7 +60,7 @@ bool add_in_place(SparseTensorF32 & destination, const SparseTensorF32 & source,
         return false;
     }
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(destination.feats.size()))
 #endif
     for (std::size_t index = 0; index < destination.feats.size(); ++index) {
         destination.feats[index] += source.feats[index];
@@ -78,7 +79,7 @@ bool affine_modulate(const SparseTensorF32 & input,
         !require_pointer(timestep_modulation, "timestep_modulation", error)) return false;
     output = input;
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(input.feats.size()))
 #endif
     for (std::size_t point = 0; point < input.points(); ++point) {
         const int batch = input.coords[point * 4];
@@ -104,7 +105,7 @@ bool gate_in_place(SparseTensorF32 & input, const float * block_modulation,
         !require_pointer(timestep_modulation, "timestep_modulation", error)) return false;
 
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(input.feats.size()))
 #endif
     for (std::size_t point = 0; point < input.points(); ++point) {
         const int batch = input.coords[point * 4];
@@ -122,7 +123,7 @@ bool gate_in_place(SparseTensorF32 & input, const float * block_modulation,
 void gelu_tanh_in_place(SparseTensorF32 & input) {
     constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(input.feats.size()))
 #endif
     for (std::size_t index = 0; index < input.feats.size(); ++index) {
         float & value = input.feats[index];

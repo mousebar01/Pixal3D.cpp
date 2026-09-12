@@ -1,3 +1,5 @@
+#include "pixal3d/backend.h"
+#include "pixal3d/cpu_threads.h"
 #include "pixal3d/scaffold.h"
 #include "pixal3d/condition.h"
 #include "pixal3d/dino.h"
@@ -31,6 +33,7 @@ void print_usage(const char * program, std::ostream & out) {
         << "Usage:\n"
         << "  " << program << " --help\n"
         << "  " << program << " --version\n"
+        << "  " << program << " --list-devices\n"
         << "  " << program << " inspect-pack <pixal3d-pack.gguf>\n\n"
 
         << "  " << program << " estimate-model <shared.gguf> <flow.gguf>\n\n"
@@ -62,6 +65,9 @@ void print_usage(const char * program, std::ostream & out) {
         << " <shape_decoder|texture_decoder>\n\n"
         << "  " << program << " inspect-slat-flow <pixal3d-pack.gguf>"
         << " <shape_flow_512|shape_flow_1024|texture_flow_1024>\n\n"
+        << "Common run/encode option:\n"
+        << "  --cpu-threads N      CPU thread budget (default: PIXAL3D_CPU_THREADS, "
+           "OMP_NUM_THREADS, or 4)\n"
         << "The inspect command validates the Pixal3D/ggml pack boundary.\n";
 }
 
@@ -101,6 +107,12 @@ bool parse_float(const char * text, float & value) {
     }
 }
 
+bool parse_cpu_threads_option(const char * text, std::string * error) {
+    int threads = 0;
+    if (!pixal3d::parse_cpu_thread_count(text ? text : "", threads, error)) return false;
+    return pixal3d::set_cpu_thread_override(threads, error);
+}
+
 struct CameraEstimation {
     std::string moge_onnx_path = "weights/MoGe/moge-2-vitl-normal.onnx";
 };
@@ -114,7 +126,9 @@ bool parse_cascade_options(int argc, char ** argv, int first,
                            const char * command_name = "run") {
     for (int index = first; index < argc;) {
         const std::string option = argv[index++];
-        if (option == "--vision-resolution" && index < argc && image_config) {
+        if (option == "--cpu-threads" && index < argc) {
+            if (!parse_cpu_threads_option(argv[index++], error)) return false;
+        } else if (option == "--vision-resolution" && index < argc && image_config) {
             int resolution = 0;
             if (!parse_int(argv[index++], resolution) || resolution < 16 ||
                 resolution % 16 != 0) {
@@ -324,6 +338,19 @@ int main(int argc, char ** argv) {
     }
 
     const std::string command = argv[1];
+    if (command == "--list-devices") {
+        if (argc != 2) return 2;
+        for (const auto & device : pixal3d::backend_devices()) {
+            std::cout << "device=" << device.registry_index
+                      << " type=" << pixal3d::backend_device_type_name(device.type)
+                      << " name=" << device.name;
+            if (device.gpu_index >= 0) std::cout << " policy=gpu:" << device.gpu_index;
+            std::cout << " description=" << device.description
+                      << " memory_free_bytes=" << device.memory_free
+                      << " memory_total_bytes=" << device.memory_total << "\n";
+        }
+        return 0;
+    }
     if (command == "--version" || command == "-V") {
         std::cout << "pixal3d " << pixal3d::version() << "\n";
         return 0;
@@ -336,6 +363,13 @@ int main(int argc, char ** argv) {
         pixal3d::Pixal3DImageConditionBundleConfig bundle_config;
         for (int index = 6; index < argc;) {
             const std::string option = argv[index++];
+            if (option == "--cpu-threads") {
+                if (index >= argc || !parse_cpu_threads_option(argv[index++], nullptr)) {
+                    std::cerr << "error: --cpu-threads must be a positive integer\n";
+                    return 2;
+                }
+                continue;
+            }
             int * destination = nullptr;
             if (option == "--ss-resolution") {
                 destination = &bundle_config.ss_resolution;
@@ -426,7 +460,12 @@ int main(int argc, char ** argv) {
         }
         for (int index = 7; index < argc;) {
             const std::string option = argv[index++];
-            if (option == "--resolution" && index < argc) {
+            if (option == "--cpu-threads" && index < argc) {
+                if (!parse_cpu_threads_option(argv[index++], nullptr)) {
+                    std::cerr << "error: --cpu-threads must be a positive integer\n";
+                    return 2;
+                }
+            } else if (option == "--resolution" && index < argc) {
                 if (!parse_int(argv[index++], image_resolution) || image_resolution <= 0) {
                     std::cerr << "error: --resolution must be positive\n";
                     return 2;

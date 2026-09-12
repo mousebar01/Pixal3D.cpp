@@ -31,11 +31,85 @@ cmake --build build --parallel
 ./build/bin/pixal3d --version
 ```
 
-Options: `PIXAL3D_ENABLE_CUDA=ON` enables CUDA; `PIXAL3D_CUDA_TF32=ON` allows
-approximate TF32; `PIXAL3D_GGML_NATIVE=ON` reduces CPU portability;
+Options: `PIXAL3D_ENABLE_CUDA=ON` enables CUDA;
+`PIXAL3D_GGML_NATIVE=ON` reduces CPU portability;
 `PIXAL3D_BUILD_CLI=OFF` omits the CLI/tests; and `PIXAL3D_USE_BUNDLED_GGML=OFF`
-uses an installed ggml package. TF32 is OFF by default. Do not reuse a Docker
-build directory at a different path: configure CPU and CUDA builds separately.
+uses an installed ggml package. Do not reuse a Docker build directory at a
+different path: configure each backend in a separate build directory.
+
+For CUDA builds, keep the two architecture options separate:
+
+- `PIXAL3D_GGML_CUDA_ARCHITECTURES` configures the bundled ggml CUDA backend.
+  Leave it empty for ggml's portable default, or set it to `89`/`89-real`
+  for a local RTX 4090 D development build.
+- `PIXAL3D_CUDA_ARCHITECTURES` configures only Pixal3D's custom QEM CUDA
+  target. Setting it does not reduce the ggml CUDA compilation matrix.
+- `PIXAL3D_GGML_CCACHE=ON` opts into ccache/sccache when available. It is
+  disabled by default so the portable build behavior stays unchanged; it is
+  most useful for repeated builds, not the first cold compile.
+
+A local sm_89 development build can use a dedicated directory:
+
+```sh
+cmake -S . -B build-cuda-sm89 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DPIXAL3D_ENABLE_CUDA=ON \
+  -DPIXAL3D_GGML_CUDA_ARCHITECTURES=89 \
+  -DPIXAL3D_CUDA_ARCHITECTURES=89 \
+  -DPIXAL3D_GGML_CCACHE=ON \
+  -DBUILD_TESTING=ON
+cmake --build build-cuda-sm89 --parallel 8
+```
+
+Use this only with a CUDA toolkit that supports sm_89, such as the CUDA
+development container. `89` generates both real and virtual code; use
+`89-real` only after confirming that a local-only SASS build is sufficient.
+For release artifacts, keep a separately configured, validated multi-architecture
+build rather than replacing the portable default.
+
+The full compile-time investigation, including the current ggml architecture
+matrix and Ninja evidence, is recorded in
+`docs/cuda_build_time_investigation_2026-09-12.md`.
+
+### Additional ggml backends (experimental integration)
+
+The bundled build also exposes `PIXAL3D_ENABLE_VULKAN`,
+`PIXAL3D_ENABLE_METAL`, `PIXAL3D_ENABLE_SYCL`, and `PIXAL3D_ENABLE_HIP`.
+These map directly to the pinned ggml CMake options. Metal defaults to ON
+on Apple platforms; the other new options default to OFF. CPU stays enabled
+as the final scheduler fallback. Each enabled backend requires its upstream
+toolchain/SDK; enabling HIP does not enable the separate CUDA QEM prototype.
+For an installed ggml package, configure backends when building that package;
+the outer switches do not rebuild or add backends to it.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+  -DPIXAL3D_ENABLE_VULKAN=ON \
+  -DPIXAL3D_ONNXRUNTIME_ROOT=/path/to/onnxruntime
+cmake --build build --parallel
+./build/bin/pixal3d --list-devices
+```
+
+`--list-devices` reports registered names, descriptions, device classes, GPU
+policy ordinals, and memory in bytes without initializing execution backends.
+Zero memory means the backend did not report a value. GPU and IGPU share the
+`gpu:<index>` sequence; CPU and ACCEL do not consume GPU indices. Ordinals
+can change with build configuration and device visibility: inspect the list
+before selecting a device. This is single-primary-device selection, not
+multi-GPU model sharding. Dynamically loaded backend plugins are not loaded
+by this command or manager; this entry point uses registered linked backends.
+
+These switches are build integration, **not validated full-pipeline GPU
+support**. Vulkan/Metal/SYCL/HIP require independent all-F32 reference parity,
+forced-GPU placement, and transfer/residency validation before such a claim.
+Existing strict placement checks cover a core operation subset, not every
+eligible feature operation; host-side stages remain host-side.
+
+`PIXAL3D_CUDA_TF32` is currently **unsupported**: the pinned ggml does not
+implement `GGML_CUDA_DISABLE_TF32`. CUDA configuration emits a warning; neither
+value of this legacy option guarantees TF32 behavior or F32 parity. The former
+unused compile definition has been removed rather than claiming it controlled
+cuBLAS. No downstream ggml numerical patch is introduced here.
 
 ## CLI
 
@@ -71,6 +145,31 @@ The SLat components are `shape_decoder|texture_decoder` and
 ./build/bin/pixal3d run-cascade-mv build/weights/pixal3d-shared-f16.gguf build/weights/pixal3d-mv-flow-f32.gguf views.p3dmvcon output.glb --resolution 1024 --texture-size 512 --max-model-gib 32
 ```
 
+### CPU thread budget
+
+The process-level CPU budget is configured once and propagated to ggml,
+outer OpenMP regions, and MoGe/ONNX Runtime. It is **not** one shared physical
+worker pool: those runtimes keep their own barriers, teams, and thread-local
+state. The precedence is:
+
+```text
+--cpu-threads N > PIXAL3D_CPU_THREADS > OMP_NUM_THREADS (first value) > min(4, hardware_concurrency())
+```
+
+`--cpu-threads N` is available on `run-cascade`, `run-cascade-mv`, `run-image`,
+`encode-condition-stage`, and `encode-condition-bundle`. The environment form is
+useful for scripts and the CLI form overrides it for the current process:
+
+```sh
+PIXAL3D_CPU_THREADS=8 ./build/bin/pixal3d run-cascade ...
+./build/bin/pixal3d run-image ... --cpu-threads 8
+```
+
+Small outer loops stay serial when the work does not justify a full team. MoGe
+uses the same IntraOp budget and sequential inter-op execution (`inter_op=1`) to
+avoid introducing a second nested CPU budget. Use `PIXAL3D_PROFILE=summary` or
+`trace` when checking the effective configuration; profiling remains opt-in.
+
 Run options are `--seed`, `--resolution 1024`, `--max-tokens`, `--steps` (>0),
 `--occupancy-threshold`, `--max-structure-points` (>0), `--fov` (0..pi radians),
 `--distance` (>0), `--mesh-scale` (>0), `--max-model-gib`, and
@@ -86,7 +185,11 @@ unify face winding, drop floating fragments, Taubin-smooth the voxel
 stair-step noise, then a CuMesh-port QEM decimation to the reference 1,000,000
 face target (the reference `to_glb` decimation target), hole filling, and
 xatlas UV unwrap with a trilinear bake of the decoded texture volume - the
-same parameterization backend the reference wraps. A BVH over the
+same parameterization backend the reference wraps. In a CUDA build, QEM first
+tries the experimental CUDA implementation and logs an explicit CPU fallback
+when the device or kernel path is unavailable; it is not yet a production
+CPU/GPU-parity claim. xatlas charting, packing, rasterization, and inpaint remain
+host-side CPU work. A BVH over the
 pre-decimation surface snaps texels that fall between voxels back onto the
 surface, matching the reference cuBVH correction. The raw dual grid mesh is
 inconsistently wound and sliver heavy, which stalls plain quadric
@@ -133,6 +236,44 @@ Building the image path requires onnxruntime: point
 `PIXAL3D_ONNXRUNTIME_ROOT` at a prebuilt onnxruntime tree (containing
 `include/onnxruntime_cxx_api.h` and `lib/libonnxruntime.so`) when configuring
 CMake. Configuration fails if the required headers or library are unavailable.
+
+## Local web demo
+
+For a small local workbench around `run-image`, start the dependency-free Python
+bridge. It serves `demo/index.html`, exposes device/configuration APIs, accepts
+an image upload, and runs the native CLI asynchronously so the browser stays
+responsive while DINO, the cascade, QEM, and xatlas write progress to the log.
+The bridge binds to `127.0.0.1` by default and invokes the executable with
+`subprocess` argument arrays rather than a shell.
+
+```sh
+python3 scripts/serve_demo.py \
+  --pixal3d build/bin/pixal3d \
+  --shared-pack build/weights/pixal3d-shared-f16.gguf \
+  --flow-pack build/weights/pixal3d-base-flow-f32.gguf \
+  --dino-pack build/weights/dinov3-vitl16-pretrain-lvd1689m-f32.gguf \
+  --naf-pack weights/NAF/naf_release-f32.gguf \
+  --moge-onnx weights/MoGe/moge-2-vitl-normal.onnx
+# open http://127.0.0.1:8765/ in a browser
+```
+
+The model paths default to the layout above, so the flags can be omitted when
+the assets are in their default locations. Use `--port 0` to let the OS choose
+a free port, `--max-running-jobs 1` to keep large model jobs serialized (the
+default), `--max-upload-mb 16` to cap uploads, or `--job-timeout N` to kill a
+stuck native process after `N` seconds. The UI exposes `auto`, strict `cpu`,
+and discovered `gpu:<index>` policies, plus steps, texture size, seed,
+condition-vision size, and opt-in profiler modes. A 256 px condition input and
+256/512 px atlas are useful for a first preview; the final cascade target is
+still the validated `1024^3` path.
+
+Generated inputs and GLBs stay under the ignored `demo-runs/` directory. This is
+a development/demo bridge, not an internet-facing service. Each job currently
+starts one `pixal3d run-image` process, so model weights are **not** reused
+across jobs; a future resident C++ session is the appropriate optimization for
+high-throughput interactive use. The 3D viewer uses the browser `model-viewer`
+module from a CDN when available; the `.glb` download link remains usable when
+the viewer or network is unavailable.
 
 ### Mesh coordinate frames
 
@@ -302,9 +443,15 @@ with fallback reasons logged when a preferred GPU path is unavailable. `cpu`
 forces CPU-only execution. `gpu:<index>` fixes the primary GPU: core matmul,
 attention, gather, im2col, and convolution nodes cannot silently downgrade,
 while explicit CPU-resident work remains on the host. `PIXAL3D_SLAT_VERBOSE=1`
-logs SLat fallback reasons. Set `PIXAL3D_BACKEND_TRACE=1` to print final scheduler
-node placement, split/copy counts, per-backend compute buffers, and device memory
-snapshots (including persistent weight allocation). Sparse coordinate
+logs SLat fallback reasons. Set `PIXAL3D_PROFILE=summary` for opt-in
+stage/backend timing summaries, or `PIXAL3D_PROFILE=trace` for detailed
+scheduler placement, split/copy counts,
+per-backend compute buffers, device memory snapshots, and phase records. The
+default is `off`: profiling clocks, timing records, and profiler-only output are
+not collected. `PIXAL3D_PROFILE=off` takes precedence over legacy profiling
+variables. The legacy `PIXAL3D_BACKEND_TRACE=1` maps to `trace` when the global
+mode is unset. Essential errors, backend selection/fallback diagnostics, and
+correctness/placement checks are not profiling and remain enabled. Sparse coordinate
 expansion, subdivision selection, packing, and final host-side reference
 operations remain CPU-side. NAF GPU acceleration covers only the
 reflection/convolution stacks; GroupNorm, pooling, learned 2-D RoPE, and
@@ -312,19 +459,35 @@ neighborhood attention remain CPU-resident. SLat decoder sparse coordinate,
 subdivision, and packing work likewise remain CPU-side; its GPU path is
 partial, not a claim of whole-stage GPU execution.
 
-For the partial GPU SLat decoder, `PIXAL3D_SLAT_DECODER_PROFILE=1` emits
+For the partial GPU SLat decoder, `PIXAL3D_SLAT_DECODER_PROFILE=1` or
+`PIXAL3D_SLAT_DECODER_TRACE=1` preserves the legacy detailed report: it emits
 per-convolution topology fingerprints, cache hit/miss counts, timing for
 validation, gather-map construction/upload, graph allocation, GPU compute,
-output handling, and the CPU sparse operators that remain in the path.
-`PIXAL3D_SLAT_DECODER_TRACE=1` additionally emits the existing detailed
-per-convolution records (and `PIXAL3D_BACKEND_TRACE=1` enables backend timing
-records). The decoder now reuses the CPU neighbor gather map for the current
+output handling, and the CPU sparse operators that remain in the path. The
+legacy decoder variables are ignored when `PIXAL3D_PROFILE=off` is set. Use
+`PIXAL3D_PROFILE=summary` for only stage-level summary lines; it does not enable
+that detailed decoder report. `PIXAL3D_BACKEND_TRACE=1` remains a legacy alias
+for backend trace mode when the global mode is unset. The decoder now reuses the CPU neighbor gather map for the current
 coordinate topology by default; set
 `PIXAL3D_SLAT_DECODER_NEIGHBOR_CACHE=0` to force the uncached comparison path.
 Set `PIXAL3D_VALIDATE_SPARSE_MAP_CACHE=1` to rebuild the reference map on every
 cache hit and perform an exact 27-offset comparison. This validation mode is
 for debugging and benchmarking only: it intentionally adds CPU work and does
 not create persistent GPU index tensors.
+
+Profiler modes are intentionally opt-in because clock reads, record
+allocation, formatting, and some diagnostics can perturb short or GPU-bound
+runs. Disabled profiling does not add GPU synchronization or activation
+readback. `summary` records only bounded stage/backend aggregates; `trace` is
+for diagnosis and may be materially slower. The old stage-specific flags keep
+their detailed behavior for compatibility, but new scripts should prefer the
+single global variable:
+
+```sh
+PIXAL3D_PROFILE=off     ./build/bin/pixal3d run-cascade ...
+PIXAL3D_PROFILE=summary ./build/bin/pixal3d run-cascade ...
+PIXAL3D_PROFILE=trace   ./build/bin/pixal3d run-cascade ...
+```
 
 When decoder profiling is enabled, the report also includes
 `sparse_linear_breakdown`, one `sparse_linear_call` record per invocation, and
@@ -497,8 +660,8 @@ keep CPU, CUDA, and container build directories separate.
 
 ## Tests and validation
 
-CTest is authoritative for registered tests. The default testing build
-registers 19 tests covering CLI startup, projection, flow primitives and
+CTest is authoritative for registered tests. The default CPU testing build
+registers 25 tests covering CLI startup, projection, flow primitives and
 sampler, pack reading, DINO, backend management, image/condition helpers,
 inference utilities, occupancy coordinates, Dual Grid, bounded mesh hole
 filling, and the registered SLat fixtures. Run them with:
@@ -512,6 +675,17 @@ NAF, sparse, SS, SLat loader/concat, and cascade fixtures. Their Python oracle
 comparators under `scripts/` and `tests/` are manual tools requiring declared
 fixtures and often the external Python image. Building a `*_fixture` target does
 not run it under CTest.
+
+The performance audit for the projection hot loop, CPU mesh postprocess,
+vision graph rebuilds, and CLI process-boundary costs is recorded in
+`docs/performance_audit_2026-09-12.md`. It includes the measured local
+projection microbenchmark and historical QEM/xatlas phase timings, while
+separating verified fixes from follow-up work that still needs a dedicated
+benchmark.
+
+The current engineering-note index is `docs/README.md`. Historical session
+notes and exploratory research are kept under `docs/archive/` and are not the
+current support matrix or implementation contract.
 
 The bounded real-image smoke path uses deliberately small vision inputs, two
 steps, an occupancy threshold of `-100`, a one-point structure cap, and an
@@ -555,6 +729,10 @@ backend placement.
   CPU/GPU cooperation; forced GPU reports failures for required core nodes.
   CPU-resident preprocessing, sampling, sparse topology, and mesh extraction
   are intentionally not GPU-required.
+- Mesh postprocess has a separate boundary: CUDA builds may attempt experimental
+  GPU QEM and fall back to CPU with a reason, while vendored xatlas and UV bake
+  remain CPU-only. The QEM CUDA fixture is not a substitute for same-input
+  real-mesh topology, quality, and CPU/GPU parity validation.
 - All current model execution paths use the shared backend scheduler; any
   remaining backend-specific limitations are capability or stage-boundary
   constraints, not a reason to duplicate backend selection logic.
@@ -566,7 +744,8 @@ backend placement.
 
 ```text
 src/, include/       outer Pixal3D C++ library and CLI
-scripts/             download, conversion, preprocessing, and oracle helpers
+demo/                local web workbench static page
+scripts/             download, conversion, preprocessing, demo bridge, and oracle helpers
 tests/               C++ tests, fixtures, and Python comparisons
 ref/Pixal3D/         original Python reference
 ref/trellis2cpp/     bundled ggml stage-1 reference

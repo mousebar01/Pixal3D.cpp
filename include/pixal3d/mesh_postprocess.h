@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "pixal3d/tri_bvh.h"
@@ -49,9 +50,11 @@ void decimate_qem_cpu(const std::vector<float>& verts, int V, const std::vector<
 
 // GPU QEM prototype. Available only in PIXAL3D_ENABLE_CUDA builds. It preserves the
 // input mesh on failure and returns false so the caller can select the CPU reference.
+// When provided, failure_reason receives a human-readable CUDA/HIP/device reason.
 #ifdef PIXAL3D_HAVE_GPU_DECIMATE
 bool decimate_qem_gpu(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
-                      int target_faces, std::vector<float>& ov, std::vector<int32_t>& of);
+                      int target_faces, std::vector<float>& ov, std::vector<int32_t>& of,
+                      std::string * failure_reason = nullptr);
 #endif
 
 // Preferred QEM entry point: CUDA when the custom postprocess kernel is built, otherwise CPU.

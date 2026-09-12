@@ -88,6 +88,21 @@ int main() {
                "empty environment did not select auto policy")) return 1;
     set_env("PIXAL3D_TEST_STAGE_BACKEND", nullptr);
 
+    const auto inventory = pixal3d::backend_devices();
+    if (!check(inventory.size() == ggml_backend_dev_count(),
+               "device inventory does not match registry")) return 1;
+    int expected_gpu_index = 0;
+    for (std::size_t index = 0; index < inventory.size(); ++index) {
+        const auto & device = inventory[index];
+        const bool gpu = device.type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                         device.type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        if (!check(device.registry_index == index &&
+                       device.type == ggml_backend_dev_type(ggml_backend_dev_get(index)) &&
+                       device.gpu_index == (gpu ? expected_gpu_index++ : -1) &&
+                       !device.name.empty(),
+                   "device inventory class or GPU ordinal mismatch")) return 1;
+    }
+
     int gpu_count = 0;
     for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
         const enum ggml_backend_dev_type type =

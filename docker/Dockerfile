@@ -4,6 +4,9 @@
 #   --build-arg DEV_IMAGE=nvidia/cuda:12.4.1-devel-ubuntu22.04
 #   --build-arg RUNTIME_IMAGE=nvidia/cuda:12.4.1-runtime-ubuntu22.04
 #   --build-arg PIXAL3D_ENABLE_CUDA=ON
+#   --build-arg PIXAL3D_GGML_CUDA_ARCHITECTURES=89
+#   --build-arg PIXAL3D_GGML_CCACHE=ON
+#   --build-arg PIXAL3D_BUILD_PARALLEL=8
 
 ARG DEV_IMAGE=ubuntu:22.04
 ARG RUNTIME_IMAGE=ubuntu:22.04
@@ -18,6 +21,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        ccache \
         cmake \
         git \
         ninja-build \
@@ -36,6 +40,9 @@ FROM dev AS cpp-build
 ARG PIXAL3D_BUILD_TYPE=Release
 ARG PIXAL3D_ENABLE_CUDA=OFF
 ARG PIXAL3D_CUDA_TF32=OFF
+ARG PIXAL3D_GGML_CUDA_ARCHITECTURES=
+ARG PIXAL3D_GGML_CCACHE=OFF
+ARG PIXAL3D_BUILD_PARALLEL=
 ARG PIXAL3D_BUILD_TESTS=ON
 ARG PIXAL3D_RUN_TESTS=ON
 
@@ -46,10 +53,16 @@ RUN cmake -S . -B build -G Ninja \
         -DBUILD_SHARED_LIBS=OFF \
         -DPIXAL3D_ENABLE_CUDA=${PIXAL3D_ENABLE_CUDA} \
         -DPIXAL3D_CUDA_TF32=${PIXAL3D_CUDA_TF32} \
+        -DPIXAL3D_GGML_CUDA_ARCHITECTURES="${PIXAL3D_GGML_CUDA_ARCHITECTURES}" \
+        -DPIXAL3D_GGML_CCACHE=${PIXAL3D_GGML_CCACHE} \
         -DPIXAL3D_GGML_NATIVE=OFF \
         -DPIXAL3D_BUILD_CLI=ON \
         -DBUILD_TESTING=${PIXAL3D_BUILD_TESTS} \
-    && cmake --build build --parallel \
+    && if [ -n "${PIXAL3D_BUILD_PARALLEL}" ]; then \
+         cmake --build build --parallel "${PIXAL3D_BUILD_PARALLEL}"; \
+       else \
+         cmake --build build --parallel; \
+       fi \
     && if [ "${PIXAL3D_RUN_TESTS}" = "ON" ] && [ "${PIXAL3D_BUILD_TESTS}" = "ON" ] && [ "${PIXAL3D_ENABLE_CUDA}" != "ON" ]; then \
          (cd build && ctest --output-on-failure); \
        elif [ "${PIXAL3D_ENABLE_CUDA}" = "ON" ]; then \

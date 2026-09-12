@@ -1,6 +1,7 @@
 #include "pixal3d/dino_vit.h"
 
 #include "pixal3d/backend.h"
+#include "pixal3d/cpu_threads.h"
 #include "pixal3d/pack.h"
 
 #include "ggml-alloc.h"
@@ -497,7 +498,7 @@ bool DinoV3Model::encode(const float * pixels,
         return false;
     }
     std::cerr << "pixal3d: DINO graph allocated" << std::endl;
-    impl_->backend_manager.set_n_threads(4);
+    impl_->backend_manager.set_n_threads(cpu_thread_count());
     ggml_backend_tensor_set(patches, patch_values.data(), 0,
                             patch_values.size() * sizeof(float));
     ggml_backend_tensor_set(cos_t, cos_values.data(), 0,

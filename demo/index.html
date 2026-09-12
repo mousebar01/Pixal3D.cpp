@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111310">
+  <title>Pixal3D // local inference workbench</title>
+  <script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
+  <style>
+    :root {
+      --ink: #e9f0e1;
+      --muted: #8d9a89;
+      --dim: #5f6b5c;
+      --panel: rgba(24, 29, 23, .86);
+      --panel-strong: #1b211a;
+      --line: rgba(192, 224, 172, .14);
+      --lime: #d4f36c;
+      --lime-dark: #8cab31;
+      --orange: #ff9c66;
+      --blue: #8bc9ff;
+      --red: #ff7f76;
+      --shadow: 0 24px 80px rgba(0, 0, 0, .33);
+    }
+
+    * { box-sizing: border-box; }
+    html { min-height: 100%; background: #111310; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 78% 2%, rgba(184, 232, 99, .12), transparent 30rem),
+        radial-gradient(circle at 8% 42%, rgba(84, 139, 113, .11), transparent 32rem),
+        linear-gradient(135deg, #111310 0%, #161b15 54%, #0e110e 100%);
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+      letter-spacing: .01em;
+    }
+    body::before {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      content: "";
+      opacity: .24;
+      background-image: linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+                        linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+      background-size: 42px 42px;
+      mask-image: linear-gradient(to bottom, black, transparent 85%);
+    }
+    button, input, select { font: inherit; }
+    button { cursor: pointer; }
+
+    .shell { width: min(1440px, calc(100% - 48px)); margin: 0 auto; padding: 26px 0 42px; }
+    .topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 28px; }
+    .eyebrow, .mono, .field-label, .chip, .status-label, .log-title, .tiny {
+      font-family: "Courier New", monospace;
+      text-transform: uppercase;
+      letter-spacing: .13em;
+    }
+    .eyebrow { color: var(--lime); font-size: 11px; font-weight: 700; }
+    h1, h2, p { margin: 0; }
+    h1 {
+      max-width: 760px;
+      margin-top: 7px;
+      color: #f0f5e7;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(34px, 5vw, 74px);
+      font-weight: 500;
+      line-height: .96;
+      letter-spacing: -.045em;
+    }
+    .dek { max-width: 620px; margin-top: 14px; color: var(--muted); font-size: 15px; line-height: 1.55; }
+    .top-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 9px; padding-top: 6px; color: var(--muted); font-size: 11px; text-align: right; }
+    .top-meta strong { color: var(--ink); font-size: 13px; font-weight: 500; }
+    .runtime-pill { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 999px; padding: 8px 11px; background: rgba(11, 14, 11, .35); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); box-shadow: 0 0 0 4px rgba(95,107,92,.13); }
+    .dot.ready { background: var(--lime); box-shadow: 0 0 0 4px rgba(212,243,108,.13); }
+    .dot.bad { background: var(--red); box-shadow: 0 0 0 4px rgba(255,127,118,.13); }
+
+    .workbench { display: grid; grid-template-columns: minmax(210px, .72fr) minmax(420px, 1.8fr) minmax(260px, .9fr); gap: 14px; align-items: stretch; }
+    .panel { position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); box-shadow: var(--shadow); backdrop-filter: blur(18px); }
+    .panel::after { position: absolute; inset: 0; pointer-events: none; content: ""; border: 1px solid rgba(255,255,255,.025); border-radius: inherit; }
+    .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 18px 0; }
+    .panel-title { color: #dce7d5; font-size: 13px; font-weight: 700; letter-spacing: .04em; }
+    .panel-number { color: var(--dim); font: 12px "Courier New", monospace; }
+
+    .source-panel { min-height: 560px; padding-bottom: 18px; }
+    .drop-zone { display: flex; min-height: 358px; margin: 18px; border: 1px dashed rgba(212,243,108,.35); border-radius: 13px; align-items: center; justify-content: center; padding: 18px; background: linear-gradient(145deg, rgba(212,243,108,.06), rgba(212,243,108,.015)); transition: border-color .2s ease, background .2s ease, transform .2s ease; }
+    .drop-zone.dragover { border-color: var(--lime); background: rgba(212,243,108,.13); transform: translateY(-2px); }
+    .drop-zone.has-file { border-style: solid; border-color: rgba(139,201,255,.42); }
+    .drop-inner { width: 100%; text-align: center; }
+    .upload-mark { display: grid; width: 58px; height: 58px; margin: 0 auto 18px; place-items: center; border: 1px solid rgba(212,243,108,.35); border-radius: 50%; color: var(--lime); font-size: 25px; }
+    .drop-zone strong { display: block; color: #e8f2dd; font-size: 15px; font-weight: 600; }
+    .drop-zone p { margin-top: 9px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .browse { display: inline-flex; margin-top: 18px; border: 1px solid rgba(212,243,108,.48); border-radius: 999px; padding: 9px 14px; color: var(--lime); background: transparent; font-size: 12px; }
+    .browse:hover { background: rgba(212,243,108,.1); }
+    #fileInput { display: none; }
+    .preview { display: none; width: 100%; max-height: 305px; object-fit: contain; border-radius: 9px; background: #0b0d0b; }
+    .preview.visible { display: block; }
+    .file-meta { display: none; margin: -5px 18px 0; padding: 12px; border-top: 1px solid var(--line); color: var(--muted); font: 11px/1.45 "Courier New", monospace; overflow-wrap: anywhere; }
+    .file-meta.visible { display: block; }
+    .file-meta strong { color: var(--ink); font-weight: 400; }
+    .hint { margin: 22px 18px 0; padding: 12px 13px; border-left: 2px solid var(--orange); color: var(--muted); font-size: 11px; line-height: 1.55; }
+    .hint b { color: var(--orange); font-weight: 500; }
+
+    .viewer-panel { min-height: 560px; }
+    .viewer-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 17px 18px; border-bottom: 1px solid var(--line); }
+    .viewer-state { display: flex; align-items: center; gap: 9px; color: var(--muted); font: 11px "Courier New", monospace; letter-spacing: .04em; }
+    .viewer-state .dot { width: 6px; height: 6px; box-shadow: none; }
+    .download { display: none; color: var(--lime); font: 11px "Courier New", monospace; text-decoration: none; text-transform: uppercase; letter-spacing: .12em; }
+    .download.visible { display: inline-block; }
+    .download:hover { color: white; }
+    .viewer-stage { position: relative; min-height: 475px; overflow: hidden; background: radial-gradient(ellipse at 50% 43%, rgba(119,159,85,.23), transparent 46%), linear-gradient(160deg, #1b2319, #0d100d 75%); }
+    .viewer-stage::before { position: absolute; inset: 0; content: ""; opacity: .35; background: radial-gradient(ellipse at 50% 58%, transparent 0 19%, rgba(212,243,108,.06) 19.3% 19.5%, transparent 19.8% 28%, rgba(212,243,108,.04) 28.3% 28.5%, transparent 28.8%), linear-gradient(90deg, transparent 49.8%, rgba(212,243,108,.07) 50%, transparent 50.2%), linear-gradient(0deg, transparent 49.8%, rgba(212,243,108,.07) 50%, transparent 50.2%); }
+    .viewer-stage::after { position: absolute; left: 8%; right: 8%; bottom: 10%; height: 1px; content: ""; background: linear-gradient(90deg, transparent, rgba(212,243,108,.42), transparent); box-shadow: 0 0 34px 6px rgba(212,243,108,.11); }
+    model-viewer { position: absolute; inset: 0; width: 100%; height: 100%; --poster-color: transparent; background: transparent; opacity: 0; transition: opacity .35s ease; }
+    model-viewer.visible { opacity: 1; }
+    .viewer-empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 35px; text-align: center; }
+    .viewer-empty > div { max-width: 340px; }
+    .viewer-empty .glyph { color: var(--lime); font: 48px Georgia, serif; line-height: 1; opacity: .84; }
+    .viewer-empty h2 { margin-top: 18px; color: #e4eddc; font: 500 25px Georgia, serif; letter-spacing: -.03em; }
+    .viewer-empty p { margin-top: 10px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .viewer-empty.hidden { display: none; }
+    .viewer-footer { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); }
+    .stat { min-height: 66px; padding: 13px 15px; background: rgba(16,20,15,.75); }
+    .stat label { display: block; color: var(--dim); font: 10px "Courier New", monospace; text-transform: uppercase; letter-spacing: .12em; }
+    .stat strong { display: block; margin-top: 8px; color: #e3ecd9; font: 13px "Courier New", monospace; font-weight: 400; }
+
+    .settings-panel { min-height: 560px; padding-bottom: 18px; }
+    .settings-body { padding: 18px; }
+    .field { margin-bottom: 17px; }
+    .field-label { display: flex; align-items: center; justify-content: space-between; gap: 9px; margin-bottom: 8px; color: var(--dim); font-size: 10px; }
+    .field-label output { color: var(--lime); font-size: 10px; }
+    input[type="number"], input[type="text"], select { width: 100%; border: 1px solid var(--line); border-radius: 8px; outline: none; padding: 10px 11px; color: var(--ink); background: rgba(8, 11, 8, .64); font: 12px "Courier New", monospace; }
+    input[type="number"]:focus, input[type="text"]:focus, select:focus { border-color: rgba(212,243,108,.65); box-shadow: 0 0 0 3px rgba(212,243,108,.08); }
+    select { appearance: none; background-image: linear-gradient(45deg, transparent 50%, var(--lime) 50%), linear-gradient(135deg, var(--lime) 50%, transparent 50%); background-position: calc(100% - 15px) 14px, calc(100% - 11px) 14px; background-size: 4px 4px, 4px 4px; background-repeat: no-repeat; }
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    .advanced { margin: 3px 0 16px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .advanced summary { padding: 13px 0; color: var(--muted); cursor: pointer; font: 10px "Courier New", monospace; text-transform: uppercase; letter-spacing: .12em; list-style: none; }
+    .advanced summary::-webkit-details-marker { display: none; }
+    .advanced summary::after { float: right; color: var(--lime); content: "+"; }
+    .advanced[open] summary::after { content: "−"; }
+    .advanced .field:last-child { margin-bottom: 15px; }
+    .run-button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 10px; border: 0; border-radius: 10px; padding: 14px 15px; color: #16200d; background: var(--lime); font: 700 12px "Courier New", monospace; text-transform: uppercase; letter-spacing: .1em; transition: transform .2s ease, background .2s ease, opacity .2s ease; }
+    .run-button span:last-child { font-size: 18px; font-family: Georgia, serif; line-height: 0; }
+    .run-button:hover:not(:disabled) { background: #e4ff91; transform: translateY(-2px); }
+    .run-button:disabled { cursor: not-allowed; opacity: .38; }
+    .server-note { margin-top: 13px; color: var(--dim); font-size: 10px; line-height: 1.45; }
+    .server-note.bad { color: var(--red); }
+
+    .telemetry { display: grid; grid-template-columns: minmax(240px, .75fr) minmax(380px, 1.8fr); gap: 14px; margin-top: 14px; }
+    .progress-panel, .log-panel { min-height: 160px; padding: 18px; }
+    .progress-line { display: flex; align-items: baseline; justify-content: space-between; gap: 15px; margin-top: 22px; }
+    .progress-stage { color: #dce7d5; font: 14px Georgia, serif; }
+    .progress-number { color: var(--lime); font: 22px "Courier New", monospace; }
+    .bar { height: 5px; margin-top: 18px; overflow: hidden; border-radius: 999px; background: rgba(212,243,108,.1); }
+    .bar > span { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--lime-dark), var(--lime)); box-shadow: 0 0 18px rgba(212,243,108,.5); transition: width .35s ease; }
+    .progress-foot { display: flex; justify-content: space-between; gap: 12px; margin-top: 11px; color: var(--dim); font: 10px "Courier New", monospace; }
+    .log-panel { min-width: 0; }
+    .log-title { color: var(--dim); font-size: 10px; }
+    .logs { height: 92px; margin: 16px 0 0; overflow: auto; color: #aab8a4; font: 10px/1.55 "Courier New", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .logs::-webkit-scrollbar { width: 5px; }
+    .logs::-webkit-scrollbar-thumb { border-radius: 5px; background: rgba(212,243,108,.25); }
+    .footer { display: flex; justify-content: space-between; gap: 16px; margin-top: 18px; color: var(--dim); font: 10px "Courier New", monospace; letter-spacing: .05em; }
+    .footer a { color: var(--muted); text-decoration: none; }
+    .footer a:hover { color: var(--lime); }
+
+    @media (max-width: 1050px) {
+      .workbench { grid-template-columns: minmax(190px, .7fr) minmax(390px, 1.3fr); }
+      .settings-panel { grid-column: 1 / -1; min-height: auto; }
+      .settings-body { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0 14px; }
+      .settings-body .advanced, .settings-body .run-button, .settings-body .server-note { grid-column: 1 / -1; }
+    }
+    @media (max-width: 720px) {
+      .shell { width: min(100% - 24px, 560px); padding-top: 16px; }
+      .topbar { display: block; }
+      .top-meta { align-items: flex-start; margin-top: 20px; text-align: left; }
+      .workbench, .telemetry { display: block; }
+      .panel { margin-bottom: 12px; }
+      .source-panel, .viewer-panel { min-height: auto; }
+      .viewer-stage { min-height: 380px; }
+      .settings-body { display: block; }
+      .footer { display: block; line-height: 1.8; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">Pixal3D / local inference workbench</div>
+        <h1>Turn one image<br>into a small world.</h1>
+        <p class="dek">A thin local UI around the native C++ pipeline. Drop an image, choose a backend policy, and keep an eye on the expensive parts instead of guessing.</p>
+      </div>
+      <div class="top-meta">
+        <div class="runtime-pill"><span id="runtimeDot" class="dot"></span><strong id="runtimeText">checking runtime</strong></div>
+        <span id="deviceText">device inventory pending</span>
+      </div>
+    </header>
+
+    <main class="workbench">
+      <section class="panel source-panel">
+        <div class="panel-head"><span class="panel-title">01 / source frame</span><span class="panel-number">drop / inspect</span></div>
+        <div id="dropZone" class="drop-zone">
+          <div id="dropInner" class="drop-inner">
+            <div class="upload-mark">↥</div>
+            <strong>Drop a view to begin</strong>
+            <p>PNG, JPEG, or PNM<br>stays on this machine</p>
+            <button id="browseButton" class="browse" type="button">Choose image</button>
+          </div>
+          <img id="imagePreview" class="preview" alt="Selected input preview">
+        </div>
+        <input id="fileInput" type="file" accept="image/png,image/jpeg,.ppm,.pgm,.pbm,.pnm">
+        <div id="fileMeta" class="file-meta"></div>
+        <div class="hint"><b>Heads up.</b> The final mesh cleanup and UV bake are CPU-side today. A 256 px condition preview and 256 px atlas are good for a first pass.</div>
+      </section>
+
+      <section class="panel viewer-panel">
+        <div class="viewer-head">
+          <div id="viewerState" class="viewer-state"><span class="dot"></span><span>waiting for a generated asset</span></div>
+          <a id="downloadLink" class="download" href="#" download>download .glb ↗</a>
+        </div>
+        <div class="viewer-stage">
+          <div id="viewerEmpty" class="viewer-empty">
+            <div>
+              <div class="glyph">◇</div>
+              <h2>Your geometry will land here.</h2>
+              <p>When the job completes, the viewer becomes an orbitable GLB preview. The download link remains available even if your browser cannot load the 3D component.</p>
+            </div>
+          </div>
+          <model-viewer id="modelViewer" camera-controls auto-rotate rotation-per-second="18deg" shadow-intensity="1" exposure="0.9" interaction-prompt="none" alt="Generated Pixal3D model"></model-viewer>
+        </div>
+        <div class="viewer-footer">
+          <div class="stat"><label>vertices</label><strong id="verticesStat">—</strong></div>
+          <div class="stat"><label>triangles</label><strong id="trianglesStat">—</strong></div>
+          <div class="stat"><label>elapsed</label><strong id="elapsedStat">—</strong></div>
+        </div>
+      </section>
+
+      <aside class="panel settings-panel">
+        <div class="panel-head"><span class="panel-title">02 / run settings</span><span class="panel-number">native cli</span></div>
+        <div class="settings-body">
+          <div class="field">
+            <label class="field-label" for="backend">backend policy</label>
+            <select id="backend"><option value="auto">auto / prefer GPU</option><option value="cpu">cpu / strict</option><option value="gpu">gpu / first GPU</option></select>
+          </div>
+          <div class="two-col">
+            <div class="field"><label class="field-label" for="seed">seed</label><input id="seed" type="number" min="0" max="18446744073709551615" value="42"></div>
+            <div class="field"><label class="field-label" for="steps">steps</label><input id="steps" type="number" min="1" max="64" value="12"></div>
+          </div>
+          <div class="field">
+            <label class="field-label" for="textureSize">atlas size</label>
+            <select id="textureSize"><option value="256">256 / quick</option><option value="512" selected>512 / balanced</option><option value="1024">1024 / detail</option><option value="2048">2048 / slow</option></select>
+          </div>
+          <div class="field">
+            <label class="field-label" for="visionResolution">condition vision</label>
+            <select id="visionResolution"><option value="256" selected>256 / preview</option><option value="512">512 / standard</option><option value="0">production defaults</option></select>
+          </div>
+          <div class="field">
+            <label class="field-label" for="profile">profiler</label>
+            <select id="profile"><option value="off" selected>off / fastest</option><option value="summary">summary / phases</option><option value="trace">trace / diagnostics</option></select>
+          </div>
+          <details class="advanced">
+            <summary>advanced guards</summary>
+            <div class="field"><label class="field-label" for="maxPoints">max structure points <span>(0 = unset)</span></label><input id="maxPoints" type="number" min="0" max="100000000" value="0"></div>
+            <div class="two-col">
+              <div class="field"><label class="field-label" for="occupancy">occupancy threshold</label><input id="occupancy" type="text" inputmode="decimal" placeholder="unset"></div>
+              <div class="field"><label class="field-label" for="maxGib">model GiB cap</label><input id="maxGib" type="text" inputmode="decimal" placeholder="unset"></div>
+            </div>
+          </details>
+          <button id="generateButton" class="run-button" type="button" disabled><span>Generate asset</span><span>↗</span></button>
+          <p id="serverNote" class="server-note">Checking model packs and executable…</p>
+        </div>
+      </aside>
+    </main>
+
+    <section class="telemetry">
+      <div class="panel progress-panel">
+        <div class="panel-title">03 / stage telemetry</div>
+        <div class="progress-line"><span id="progressStage" class="progress-stage">No job running</span><span id="progressNumber" class="progress-number">0%</span></div>
+        <div class="bar"><span id="progressBar"></span></div>
+        <div class="progress-foot"><span id="jobIdText">local queue idle</span><span id="durationText">—</span></div>
+      </div>
+      <div class="panel log-panel">
+        <div class="log-title">native output / last 500 lines</div>
+        <pre id="logs" class="logs">The CLI log will appear here when a job starts.</pre>
+      </div>
+    </section>
+
+    <footer class="footer"><span>localhost only · generated files live under ignored <code>demo-runs/</code></span><span><a href="/api/config" target="_blank" rel="noreferrer">runtime config</a> · <a href="/api/devices" target="_blank" rel="noreferrer">device inventory</a></span></footer>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const dropZone = $("dropZone");
+    const dropInner = $("dropInner");
+    const fileInput = $("fileInput");
+    const imagePreview = $("imagePreview");
+    const fileMeta = $("fileMeta");
+    const generateButton = $("generateButton");
+    const modelViewer = $("modelViewer");
+    let selectedFile = null;
+    let currentJobId = null;
+    let pollTimer = null;
+    let runtimeReady = false;
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return "—";
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+      return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+    }
+    function formatSeconds(value) {
+      if (value === null || value === undefined) return "—";
+      if (value < 60) return `${value.toFixed(1)}s`;
+      return `${Math.floor(value / 60)}m ${(value % 60).toFixed(0).padStart(2, "0")}s`;
+    }
+    async function requestJson(url, options) {
+      const response = await fetch(url, options);
+      const payload = await response.json().catch(() => ({ error: response.statusText }));
+      if (!response.ok) throw new Error(payload.error || `request failed (${response.status})`);
+      return payload;
+    }
+    function setRuntime(ready, text, bad = false) {
+      runtimeReady = ready;
+      $("runtimeDot").className = `dot ${ready ? "ready" : bad ? "bad" : ""}`;
+      $("runtimeText").textContent = text;
+      generateButton.disabled = !ready || !selectedFile || Boolean(currentJobId);
+    }
+    function setFile(file) {
+      if (!file) return;
+      const suffix = file.name.toLowerCase().split(".").pop();
+      if (!["png", "jpg", "jpeg", "ppm", "pgm", "pbm", "pnm"].includes(suffix)) {
+        $("serverNote").textContent = "Use PNG, JPEG, or PNM input.";
+        $("serverNote").classList.add("bad");
+        return;
+      }
+      selectedFile = file;
+      $("serverNote").classList.remove("bad");
+      dropZone.classList.add("has-file");
+      dropInner.style.display = "none";
+      imagePreview.src = URL.createObjectURL(file);
+      imagePreview.classList.add("visible");
+      fileMeta.innerHTML = `<strong>${file.name}</strong><br>${formatBytes(file.size)} · ${file.type || "image file"}`;
+      fileMeta.classList.add("visible");
+      generateButton.disabled = !runtimeReady || Boolean(currentJobId);
+    }
+    function resetViewer() {
+      modelViewer.classList.remove("visible");
+      $("viewerEmpty").classList.remove("hidden");
+      $("downloadLink").classList.remove("visible");
+      $("verticesStat").textContent = "—";
+      $("trianglesStat").textContent = "—";
+      $("elapsedStat").textContent = "—";
+    }
+    function renderJob(job) {
+      const progress = Math.max(0, Math.min(100, Number(job.progress) || 0));
+      $("progressBar").style.width = `${progress}%`;
+      $("progressNumber").textContent = `${progress}%`;
+      $("progressStage").textContent = job.stage || "Working";
+      $("durationText").textContent = formatSeconds(job.elapsed_seconds);
+      $("jobIdText").textContent = job.id ? `job ${job.id.slice(0, 10)}…` : "local queue idle";
+      $("logs").textContent = (job.logs || []).join("\n") || "Waiting for native output…";
+      $("logs").scrollTop = $("logs").scrollHeight;
+      const dot = $("viewerState").querySelector(".dot");
+      if (job.status === "complete") {
+        dot.className = "dot ready";
+        $("viewerState").lastElementChild.textContent = "generated asset ready";
+        modelViewer.src = `${job.output_url}?v=${Date.now()}`;
+        modelViewer.classList.add("visible");
+        $("viewerEmpty").classList.add("hidden");
+        $("downloadLink").href = job.output_url;
+        $("downloadLink").classList.add("visible");
+        const outputLine = (job.logs || []).find((line) => line.includes("vertices"));
+        const vertexMatch = outputLine && outputLine.match(/vertices\s*:\s*([0-9]+)/);
+        const triangleMatch = outputLine && outputLine.match(/triangles\s*:\s*([0-9]+)/);
+        $("verticesStat").textContent = vertexMatch ? vertexMatch[1] : "ready";
+        $("trianglesStat").textContent = triangleMatch ? triangleMatch[1] : "ready";
+        $("elapsedStat").textContent = formatSeconds(job.elapsed_seconds);
+      } else if (job.status === "error") {
+        dot.className = "dot bad";
+        $("viewerState").lastElementChild.textContent = "job failed — inspect log";
+      } else {
+        dot.className = "dot";
+        $("viewerState").lastElementChild.textContent = "native job in progress";
+      }
+    }
+    async function pollJob(jobId) {
+      try {
+        const job = await requestJson(`/api/jobs/${encodeURIComponent(jobId)}`);
+        renderJob(job);
+        if (["complete", "error"].includes(job.status)) {
+          currentJobId = null;
+          generateButton.disabled = !runtimeReady || !selectedFile;
+          return;
+        }
+        pollTimer = setTimeout(() => pollJob(jobId), 850);
+      } catch (error) {
+        $("serverNote").textContent = error.message;
+        $("serverNote").classList.add("bad");
+        currentJobId = null;
+        generateButton.disabled = !runtimeReady || !selectedFile;
+      }
+    }
+    async function generate() {
+      if (!selectedFile || !runtimeReady || currentJobId) return;
+      if (pollTimer) clearTimeout(pollTimer);
+      resetViewer();
+      const form = new FormData();
+      form.append("image", selectedFile, selectedFile.name);
+      form.append("backend", $("backend").value);
+      form.append("profile", $("profile").value);
+      form.append("seed", $("seed").value);
+      form.append("steps", $("steps").value);
+      form.append("texture_size", $("textureSize").value);
+      form.append("vision_resolution", $("visionResolution").value);
+      form.append("max_structure_points", $("maxPoints").value);
+      if ($("occupancy").value.trim()) form.append("occupancy_threshold", $("occupancy").value.trim());
+      if ($("maxGib").value.trim()) form.append("max_model_gib", $("maxGib").value.trim());
+      currentJobId = "pending";
+      generateButton.disabled = true;
+      $("serverNote").textContent = "Queued. The native process owns the heavy work.";
+      $("serverNote").classList.remove("bad");
+      try {
+        const payload = await requestJson("/api/generate", { method: "POST", body: form });
+        currentJobId = payload.job_id;
+        renderJob(payload.job);
+        pollJob(currentJobId);
+      } catch (error) {
+        currentJobId = null;
+        generateButton.disabled = !runtimeReady || !selectedFile;
+        $("serverNote").textContent = error.message;
+        $("serverNote").classList.add("bad");
+      }
+    }
+    async function loadConfig() {
+      try {
+        const config = await requestJson("/api/config");
+        setRuntime(config.ready, config.ready ? "runtime ready" : "runtime incomplete", !config.ready);
+        $("serverNote").textContent = config.ready
+          ? "All model paths resolved. Jobs run locally and one at a time."
+          : `Missing: ${(config.missing || []).join(", ")}`;
+        if (!config.ready) $("serverNote").classList.add("bad");
+        if (config.defaults) {
+          $("backend").value = config.defaults.backend || "auto";
+          $("profile").value = config.defaults.profile || "off";
+        }
+      } catch (error) {
+        setRuntime(false, "server unavailable", true);
+        $("serverNote").textContent = error.message;
+        $("serverNote").classList.add("bad");
+      }
+    }
+    async function loadDevices() {
+      try {
+        const payload = await requestJson("/api/devices");
+        const devices = payload.devices || [];
+        const select = $("backend");
+        for (const device of devices) {
+          if (!device.policy || !String(device.policy).startsWith("gpu:")) continue;
+          if ([...select.options].some((option) => option.value === device.policy)) continue;
+          const option = document.createElement("option");
+          option.value = device.policy;
+          option.textContent = `${device.policy} / ${device.description || device.name}`;
+          select.appendChild(option);
+        }
+        const gpuCount = devices.filter((device) => ["GPU", "IGPU"].includes(device.type)).length;
+        $("deviceText").textContent = `${devices.length} registered device${devices.length === 1 ? "" : "s"} · ${gpuCount} GPU class`;
+      } catch (error) {
+        $("deviceText").textContent = "device inventory unavailable";
+      }
+    }
+
+    $("browseButton").addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => setFile(fileInput.files[0]));
+    ["dragenter", "dragover"].forEach((eventName) => dropZone.addEventListener(eventName, (event) => { event.preventDefault(); dropZone.classList.add("dragover"); }));
+    ["dragleave", "drop"].forEach((eventName) => dropZone.addEventListener(eventName, (event) => { event.preventDefault(); dropZone.classList.remove("dragover"); }));
+    dropZone.addEventListener("drop", (event) => setFile(event.dataTransfer.files[0]));
+    generateButton.addEventListener("click", generate);
+    loadConfig();
+    loadDevices();
+  </script>
+</body>
+</html>

@@ -2,6 +2,7 @@
 #include "pixal3d/sparse.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -49,6 +50,69 @@ int main() {
     require(projected.features.size() == 27 * 3, "projected feature shape");
     for (float value : projected.features) {
         require_close(value, 4.25f, 1e-6f, "constant border/bilinear sample");
+    }
+
+    // The sparse-coordinate fast path must be numerically identical to the
+    // dense path at the requested cells.  This catches drift when projection
+    // constants or border interpolation are changed independently in either
+    // implementation, while also checking that caller order is preserved.
+    const int sparse_height = 3;
+    const int sparse_width = 4;
+    const int sparse_channels = 2;
+    std::vector<float> sparse_map(
+        static_cast<std::size_t>(sparse_height * sparse_width * sparse_channels));
+    for (int y = 0; y < sparse_height; ++y) {
+        for (int x = 0; x < sparse_width; ++x) {
+            for (int channel = 0; channel < sparse_channels; ++channel) {
+                sparse_map[(static_cast<std::size_t>(y) * sparse_width + x) *
+                               sparse_channels + channel] =
+                    static_cast<float>(100 * y + 10 * x + channel);
+            }
+        }
+    }
+    ProjectionGridOptions sparse_options;
+    sparse_options.grid_resolution = 4;
+    sparse_options.image_resolution = 8;
+    ProjectedGrid sparse_dense;
+    require(pixal3d::project_grid_features(
+                sparse_map.data(), sparse_height, sparse_width, sparse_channels,
+                sparse_options, ProjectionCamera::front(1.1f, 2.3f, 0.9f),
+                sparse_dense, &error),
+            error);
+    const std::vector<std::int32_t> sparse_coords = {
+        0, 3, 1, 2,
+        0, 0, 0, 0,
+        0, 3, 1, 2,
+        0, 2, 3, 1,
+    };
+    std::vector<float> sparse_features;
+    std::vector<std::uint8_t> sparse_valid;
+    require(pixal3d::project_grid_features_at_coords(
+                sparse_map.data(), sparse_height, sparse_width, sparse_channels,
+                sparse_options, ProjectionCamera::front(1.1f, 2.3f, 0.9f),
+                sparse_coords, sparse_features, sparse_valid, &error),
+            error);
+    require(sparse_features.size() == sparse_coords.size() / 4 * sparse_channels,
+            "sparse projection feature shape");
+    require(sparse_valid.size() == sparse_coords.size() / 4,
+            "sparse projection validity shape");
+    for (std::size_t point = 0; point < sparse_coords.size() / 4; ++point) {
+        const std::size_t coord = point * 4;
+        const int x = sparse_coords[coord + 1];
+        const int y = sparse_coords[coord + 2];
+        const int z = sparse_coords[coord + 3];
+        const std::size_t dense_point =
+            (static_cast<std::size_t>(x) * sparse_options.grid_resolution +
+             static_cast<std::size_t>(y)) * sparse_options.grid_resolution +
+            static_cast<std::size_t>(z);
+        require(sparse_valid[point] == sparse_dense.valid[dense_point],
+                "sparse projection validity matches dense path");
+        for (int channel = 0; channel < sparse_channels; ++channel) {
+            require_close(
+                sparse_features[point * sparse_channels + channel],
+                sparse_dense.features[dense_point * sparse_channels + channel],
+                1e-6f, "sparse projection matches dense path");
+        }
     }
 
     // A 2x2 one-channel map sampled at the canonical image center exercises

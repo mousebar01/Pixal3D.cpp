@@ -1,5 +1,8 @@
 # Texture Output Appears Gray: Diagnosis Record
 
+> **历史归档：** 本文件保留用于追溯，不是当前实现状态、性能基线或支持矩阵。
+
+
 - **Recorded:** 2026-09-11
 - **Scope:** the end-to-end texture output for the fixed `armor_knight.png`
   image

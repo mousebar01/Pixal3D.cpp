@@ -5,6 +5,7 @@
 // unused decimation/projection entry points of the upstream module were
 // removed when the chain was absorbed into the project source.
 #include "pixal3d/mesh_postprocess.h"
+#include "pixal3d/profile.h"
 
 #include <xatlas.h>
 
@@ -518,15 +519,9 @@ int fill_small_holes(std::vector<int32_t>& faces, int max_loop) {
 BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
                   const std::vector<float>& pbr6, int texsize, const VoxelPbr* vox) {
     BakedMesh out;
-    const auto bake_start = std::chrono::steady_clock::now();
-    auto phase_start = bake_start;
-    const auto phase_log = [&bake_start, &phase_start](const char * label) {
-        const auto now = std::chrono::steady_clock::now();
-        const double exclusive = std::chrono::duration<double>(now - phase_start).count();
-        const double cumulative = std::chrono::duration<double>(now - bake_start).count();
-        std::fprintf(stderr, "pixal3d: uv_bake phase=%s exclusive=%.6f s cumulative=%.6f s\n",
-                     label, exclusive, cumulative);
-        phase_start = now;
+    ProfileScope profiling(profile_mode_from_environment(), "uv_bake");
+    const auto phase_log = [&profiling](const char * label) {
+        profiling.phase(label);
     };
     std::unique_ptr<VoxSampler> vs;
     if (vox && vox->ok()) vs.reset(new VoxSampler(*vox));
@@ -828,34 +823,83 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
         std::fprintf(stderr, "\n");
     }
 
+    // xatlas charges a substantial amount of host-side setup for every
+    // MeshDecl.  CuMesh keeps chart generation on the GPU but still feeds
+    // charts to CPU xatlas one by one; for this path the bigger safe win is
+    // to keep the chart boundaries while submitting one large MeshDecl.
+    // Materials are an xatlas-supported chart-group boundary, so every
+    // precluster receives a distinct material.  The old per-cluster path is
+    // retained as an explicit PIXAL3D_XATLAS_BATCH_MATERIAL=0 rollback.
     struct ClusterMesh {
         std::vector<float> v;
         std::vector<int32_t> fidx, l2orig;
+        std::vector<uint32_t> material;
     };
-    std::vector<ClusterMesh> cms(clusters.size());
-    {
-        std::vector<int> v2l((size_t)V, -1);
+    constexpr size_t kBatchMaterialMinClusters = 4096;
+    const bool batch_material =
+        env_bool("PIXAL3D_XATLAS_BATCH_MATERIAL", clusters.size() >= kBatchMaterialMinClusters) &&
+        clusters.size() > 1;
+    std::vector<ClusterMesh> cms;
+    if (batch_material) {
+        ClusterMesh batch;
+        size_t total_i = 0;
+        for (const auto &cluster : clusters) total_i += cluster.size() * 3;
+        const size_t vertex_reserve = std::min(static_cast<size_t>(V), total_i);
+        batch.v.reserve(vertex_reserve * 3);
+        batch.fidx.reserve(total_i);
+        batch.l2orig.reserve(vertex_reserve);
+        batch.material.reserve(total_i / 3);
+        std::vector<int32_t> orig_to_batch(static_cast<size_t>(V), -1);
+        auto remap_vertex = [&](int orig) -> int32_t {
+            int32_t &mapped = orig_to_batch[static_cast<size_t>(orig)];
+            if (mapped >= 0) return mapped;
+            mapped = static_cast<int32_t>(batch.l2orig.size());
+            batch.l2orig.push_back(orig);
+            batch.v.insert(batch.v.end(), &verts[3 * orig], &verts[3 * orig] + 3);
+            return mapped;
+        };
         for (size_t ci = 0; ci < clusters.size(); ++ci) {
-            ClusterMesh& cm = cms[ci];
-            const auto& cl = clusters[ci];
-            cm.fidx.resize(cl.size() * 3);
-            for (size_t i = 0; i < cl.size(); ++i) {
-                const int f = cl[i];
-                for (int j = 0; j < 3; ++j) {
-                    const int v = faces[3*f+j];
-                    if (v2l[v] < 0) {
-                        v2l[v] = (int)(cm.v.size() / 3);
-                        cm.v.insert(cm.v.end(), &verts[3*v], &verts[3*v] + 3);
-                        cm.l2orig.push_back(v);
-                    }
-                    cm.fidx[3*i+j] = v2l[v];
-                }
+            for (const int f : clusters[ci]) {
+                for (int j = 0; j < 3; ++j)
+                    batch.fidx.push_back(remap_vertex(faces[3 * f + j]));
+                batch.material.push_back(static_cast<uint32_t>(ci));
             }
-            for (int32_t ov : cm.l2orig) v2l[ov] = -1;
+        }
+        cms.push_back(std::move(batch));
+        if (env_bool("PIXAL3D_XATLAS_LOG_OPTIONS", false)) {
+            std::fprintf(stderr,
+                         "pixal3d: xatlas material batch enabled clusters=%zu faces=%zu vertices=%zu\n",
+                         clusters.size(), cms.front().fidx.size() / 3,
+                         cms.front().v.size() / 3);
+        }
+    } else {
+        cms.resize(clusters.size());
+        {
+            std::vector<int> v2l((size_t)V, -1);
+            for (size_t ci = 0; ci < clusters.size(); ++ci) {
+                ClusterMesh& cm = cms[ci];
+                const auto& cl = clusters[ci];
+                cm.fidx.resize(cl.size() * 3);
+                for (size_t i = 0; i < cl.size(); ++i) {
+                    const int f = cl[i];
+                    for (int j = 0; j < 3; ++j) {
+                        const int v = faces[3*f+j];
+                        if (v2l[v] < 0) {
+                            v2l[v] = (int)(cm.v.size() / 3);
+                            cm.v.insert(cm.v.end(), &verts[3*v], &verts[3*v] + 3);
+                            cm.l2orig.push_back(v);
+                        }
+                        cm.fidx[3*i+j] = v2l[v];
+                    }
+                }
+                for (int32_t ov : cm.l2orig) v2l[ov] = -1;
+            }
         }
     }
-    printf("  uv_bake: %zu merge clusters\n", clusters.size());
+    printf("  uv_bake: %zu merge clusters (%s xatlas mesh path)\n", clusters.size(),
+           batch_material ? "batched" : "per-cluster");
     fflush(stdout);
+
     phase_log("build_cluster_meshes");
 
     // Reference add_mesh passes positions only — no normals, no custom epsilon
@@ -869,6 +913,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
         md.indexCount = (uint32_t)cm.fidx.size();
         md.indexData = cm.fidx.data();
         md.indexFormat = xatlas::IndexFormat::UInt32;
+        md.faceMaterialData = cm.material.empty() ? nullptr : cm.material.data();
         if (xatlas::AddMesh(atlas, md, (uint32_t)cms.size()) != xatlas::AddMeshError::Success) {
             xatlas::Destroy(atlas);
             return out;
@@ -907,14 +952,16 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     // packing at the bake resolution; chart-to-chart bleed at 0 padding is
     // handled by the inpaint (as in the reference).
     xatlas::PackOptions po;
-    // Keep the reference defaults unless a profiling experiment explicitly
-    // opts in. xatlas documents blockAlign as a packing-speed optimization,
-    // but it changes chart placement, so it must never be an implicit quality
-    // or semantics change.
+    // Keep the reference packing semantics except for the measured
+    // large-mesh fast path: chart rotation search is disabled by default
+    // because it adds a second placement search for every chart.  Set
+    // PIXAL3D_XATLAS_ROTATE_CHARTS=1 to reproduce xatlas's stock default.
+    // xatlas documents blockAlign as a packing-speed optimization, but it
+    // changes chart placement and density, so it remains opt-in only.
     po.bilinear = env_bool("PIXAL3D_XATLAS_BILINEAR", po.bilinear);
     po.blockAlign = env_bool("PIXAL3D_XATLAS_BLOCK_ALIGN", po.blockAlign);
     po.bruteForce = env_bool("PIXAL3D_XATLAS_BRUTE_FORCE", po.bruteForce);
-    po.rotateCharts = env_bool("PIXAL3D_XATLAS_ROTATE_CHARTS", po.rotateCharts);
+    po.rotateCharts = env_bool("PIXAL3D_XATLAS_ROTATE_CHARTS", false);
     po.rotateChartsToAxis = env_bool("PIXAL3D_XATLAS_ROTATE_TO_AXIS", po.rotateChartsToAxis);
     po.maxChartSize = env_uint("PIXAL3D_XATLAS_MAX_CHART_SIZE", po.maxChartSize);
     po.resolution = env_uint("PIXAL3D_XATLAS_RESOLUTION", po.resolution);
@@ -927,6 +974,12 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     }
     xatlas::PackCharts(atlas, po);
     if (atlas->meshCount == 0 || atlas->width == 0) { xatlas::Destroy(atlas); return out; }
+    if (env_bool("PIXAL3D_XATLAS_LOG_OPTIONS", false)) {
+        std::fprintf(stderr,
+                     "pixal3d: xatlas result meshes=%u charts=%u tpu=%.9g atlas=%ux%u atlases=%u\n",
+                     atlas->meshCount, atlas->chartCount, atlas->texelsPerUnit,
+                     atlas->width, atlas->height, atlas->atlasCount);
+    }
     phase_log("xatlas_pack_charts");
 
     const int W = (int)atlas->width, H = (int)atlas->height;

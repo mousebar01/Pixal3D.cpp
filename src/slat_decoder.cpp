@@ -1,4 +1,5 @@
 #include "pixal3d/slat_decoder.h"
+#include "pixal3d/cpu_threads.h"
 
 #include "pixal3d/backend.h"
 #include "pixal3d/pack.h"
@@ -10,7 +11,6 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -57,7 +57,7 @@ bool add_in_place(SparseTensorF32 & destination, const SparseTensorF32 & source,
         return false;
     }
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(destination.feats.size()))
 #endif
     for (std::size_t index = 0; index < destination.feats.size(); ++index) {
         destination.feats[index] += source.feats[index];
@@ -70,7 +70,7 @@ void silu_in_place(SparseTensorF32 & input) {
         &detail::SparseProfileStats::silu_calls,
         &detail::SparseProfileStats::silu_ms);
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(input.feats.size()))
 #endif
     for (float & value : input.feats) {
         value *= 1.0f / (1.0f + std::exp(-value));
@@ -93,7 +93,7 @@ bool repeat_channels(const SparseTensorF32 & input, int output_channels,
     output.channels = output_channels;
     output.feats.resize(input.points() * static_cast<std::size_t>(output_channels));
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.feats.size()))
 #endif
     for (std::size_t point = 0; point < input.points(); ++point) {
         const float * source = input.feats.data() + point * input.channels;
@@ -139,14 +139,29 @@ bool environment_flag(const char * name, bool default_value = false) noexcept {
            std::strcmp(value, "off") != 0;
 }
 
-bool slat_decoder_trace_enabled() noexcept {
-    return environment_flag("PIXAL3D_SLAT_DECODER_TRACE");
-}
+struct SLatDecoderProfileSettings {
+    ProfileMode mode = ProfileMode::off;
+    bool collect = false;
+    bool trace = false;
+};
 
-bool slat_decoder_profile_enabled() noexcept {
-    return slat_decoder_trace_enabled() ||
-           environment_flag("PIXAL3D_SLAT_DECODER_PROFILE") ||
-           environment_flag("PIXAL3D_VALIDATE_SPARSE_MAP_CACHE");
+SLatDecoderProfileSettings slat_decoder_profile_settings() noexcept {
+    SLatDecoderProfileSettings settings;
+    const char * global = std::getenv("PIXAL3D_PROFILE");
+    const bool validate_cache = environment_flag("PIXAL3D_VALIDATE_SPARSE_MAP_CACHE");
+    if (global && *global) {
+        settings.mode = profile_mode_from_environment();
+        settings.trace = settings.mode == ProfileMode::trace;
+        settings.collect = settings.trace || validate_cache;
+        return settings;
+    }
+    const bool legacy_trace = environment_flag("PIXAL3D_SLAT_DECODER_TRACE");
+    const bool legacy_profile = environment_flag("PIXAL3D_SLAT_DECODER_PROFILE");
+    settings.mode = legacy_trace ? ProfileMode::trace :
+                    (legacy_profile ? ProfileMode::summary : ProfileMode::off);
+    settings.trace = legacy_trace;
+    settings.collect = legacy_trace || legacy_profile || validate_cache;
+    return settings;
 }
 
 bool slat_decoder_neighbor_cache_enabled() noexcept {
@@ -545,6 +560,9 @@ struct SLatDecoderTopologyProfile {
 };
 
 struct SLatDecoderProfile {
+    ProfileMode mode = ProfileMode::trace;
+    bool trace = true;
+    bool detailed = true;
     bool neighbor_cache_enabled = true;
     bool validate_neighbor_cache = false;
     std::size_t total_sparse_conv_calls = 0;
@@ -771,6 +789,7 @@ bool record_decoder_conv(SLatDecoderProfile * profile,
         ++profile->cache_misses;
         ++topology->cache_misses;
     }
+    if (!profile->detailed) return true;
     std::cerr << "pixal3d: SLat-decoder-conv conv_index="
               << profile->total_sparse_conv_calls
               << " points=" << input.points()
@@ -1020,7 +1039,10 @@ bool build_gpu_channel_to_spatial_layout(
 
 void log_decoder_profile(const SLatDecoderProfile & profile,
                          const detail::SparseProfileStats & sparse) {
-    std::cerr << "pixal3d: SLat-decoder-profile cache_enabled="
+    std::cerr << "pixal3d: SLat-decoder-profile mode="
+              << (profile.mode == ProfileMode::trace ? "trace" :
+                  (profile.mode == ProfileMode::summary ? "summary" : "validation"))
+              << " cache_enabled="
               << (profile.neighbor_cache_enabled ? 1 : 0)
               << " validate_cache=" << (profile.validate_neighbor_cache ? 1 : 0)
               << " total_sparse_conv_calls=" << profile.total_sparse_conv_calls
@@ -1311,11 +1333,13 @@ struct SLatDecoderGpuState {
     bool neighbor_cache_enabled = true;
     bool validate_neighbor_cache = false;
     SLatDecoderProfile * profile = nullptr;
+    bool trace_enabled = false;
 
     ~SLatDecoderGpuState() { close(); }
 
     void close() noexcept {
         profile = nullptr;
+        trace_enabled = false;
         has_neighbor_map = false;
         current_neighbor_map = NeighborGatherMap{};
         topology_generation = 0;
@@ -1335,9 +1359,11 @@ struct SLatDecoderGpuState {
     }
 
     void begin_invocation(SLatDecoderProfile * active_profile,
+                          bool trace,
                           bool cache_enabled,
                           bool validate_cache) {
         profile = active_profile;
+        trace_enabled = trace;
         neighbor_cache_enabled = cache_enabled;
         validate_neighbor_cache = validate_cache;
         has_neighbor_map = false;
@@ -1348,6 +1374,7 @@ struct SLatDecoderGpuState {
     void end_invocation(const detail::SparseProfileStats & sparse) noexcept {
         if (profile) log_decoder_profile(*profile, sparse);
         profile = nullptr;
+        trace_enabled = false;
         has_neighbor_map = false;
         current_neighbor_map = NeighborGatherMap{};
         topology_generation = 0;
@@ -1640,7 +1667,7 @@ struct SLatDecoderGpuState {
         decoder_profile_add_phase(profile, &SLatDecoderProfile::graph_build_ms,
                                   graph_build_begin);
 
-        const bool trace = slat_decoder_trace_enabled();
+        const bool trace = trace_enabled;
         const double allocation_begin = profile ? backend_time_now_ms() : 0.0;
         std::string scheduler_error;
         BackendScheduler scheduler(*backend_manager, 4096, false, true,
@@ -1792,7 +1819,7 @@ bool SLatDecoderGpuState::run_linear(
         return false;
     }
 
-    const bool trace = slat_decoder_trace_enabled();
+    const bool trace = trace_enabled;
     const double input_validation_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
     const bool input_valid = validate_decoder_sparse_tensor(
         input, (label + ".input").c_str(), error);
@@ -1973,7 +2000,7 @@ bool SLatDecoderGpuState::run_c2s_transition(
         return false;
     }
 
-    const bool trace = slat_decoder_trace_enabled();
+    const bool trace = trace_enabled;
     const double input_validation_begin = (profile || trace) ? backend_time_now_ms() : 0.0;
     const bool input_valid = validate_decoder_sparse_tensor(
         input, (label + ".input").c_str(), error);
@@ -2650,7 +2677,7 @@ bool SLatDecoderGpuState::run_convnext_level(
     decoder_profile_add_phase(profile, &SLatDecoderProfile::graph_build_ms,
                               graph_build_begin);
 
-    const bool trace = slat_decoder_trace_enabled();
+    const bool trace = trace_enabled;
     const double allocation_begin = profile ? backend_time_now_ms() : 0.0;
     std::string scheduler_error;
     BackendScheduler scheduler(*backend_manager, graph_capacity, false, true,
@@ -2793,15 +2820,20 @@ struct SLatDecoderInvocation {
     detail::SparseProfileScope sparse_scope;
 
     SLatDecoderInvocation(SLatDecoderGpuState & state,
+                          ProfileMode mode,
                           bool profiling,
+                          bool trace,
                           bool cache_enabled,
                           bool validate_cache)
         : gpu(state),
           sparse_scope(profiling ? &sparse : nullptr) {
+        profile.mode = mode;
+        profile.trace = trace;
+        profile.detailed = profiling;
         profile.neighbor_cache_enabled = cache_enabled;
         profile.validate_neighbor_cache = validate_cache;
-        profile.topologies.reserve(8);
-        gpu.begin_invocation(profiling ? &profile : nullptr,
+        if (profiling) profile.topologies.reserve(8);
+        gpu.begin_invocation(profiling ? &profile : nullptr, trace,
                              cache_enabled, validate_cache);
     }
 
@@ -2944,8 +2976,9 @@ bool SLatDecoderModel::Impl::decode_gpu_first(
     SparseTensorF32 & output,
     std::vector<SparseTensorF32> * predicted_subdivisions,
     std::string * error) {
+    const SLatDecoderProfileSettings profile_settings = slat_decoder_profile_settings();
     SLatDecoderInvocation invocation(
-        gpu, slat_decoder_profile_enabled(),
+        gpu, profile_settings.mode, profile_settings.collect, profile_settings.trace,
         slat_decoder_neighbor_cache_enabled(),
         slat_decoder_neighbor_cache_validation_enabled());
     SLatDecoderWeightsF32 weights;
@@ -3054,8 +3087,9 @@ bool SLatDecoderModel::Impl::decode_gpu(
         return decode_gpu_first(input, guide_subdivisions, output,
                                 predicted_subdivisions, error);
     }
+    const SLatDecoderProfileSettings profile_settings = slat_decoder_profile_settings();
     SLatDecoderInvocation invocation(
-        gpu, slat_decoder_profile_enabled(),
+        gpu, profile_settings.mode, profile_settings.collect, profile_settings.trace,
         slat_decoder_neighbor_cache_enabled(),
         slat_decoder_neighbor_cache_validation_enabled());
     SLatDecoderWeightsF32 weights;
@@ -3170,8 +3204,9 @@ bool SLatDecoderModel::Impl::upsample_coords_gpu_first(
     int upsample_times,
     SparseTensorF32 & output,
     std::string * error) {
+    const SLatDecoderProfileSettings profile_settings = slat_decoder_profile_settings();
     SLatDecoderInvocation invocation(
-        gpu, slat_decoder_profile_enabled(),
+        gpu, profile_settings.mode, profile_settings.collect, profile_settings.trace,
         slat_decoder_neighbor_cache_enabled(),
         slat_decoder_neighbor_cache_validation_enabled());
     SLatDecoderWeightsF32 weights;
@@ -3257,8 +3292,9 @@ bool SLatDecoderModel::Impl::upsample_coords_gpu(
     if (slat_decoder_gpu_first_enabled()) {
         return upsample_coords_gpu_first(input, upsample_times, output, error);
     }
+    const SLatDecoderProfileSettings profile_settings = slat_decoder_profile_settings();
     SLatDecoderInvocation invocation(
-        gpu, slat_decoder_profile_enabled(),
+        gpu, profile_settings.mode, profile_settings.collect, profile_settings.trace,
         slat_decoder_neighbor_cache_enabled(),
         slat_decoder_neighbor_cache_validation_enabled());
     SLatDecoderWeightsF32 weights;
@@ -3463,6 +3499,7 @@ bool SLatDecoderModel::decode(
     SparseTensorF32 & output,
     std::vector<SparseTensorF32> * predicted_subdivisions,
     std::string * error) {
+    ProfileScope profiling(slat_decoder_profile_settings().mode, "SLat-decoder.decode");
     if (!impl_) {
         set_error(error, "SLat decoder model is not loaded");
         return false;
@@ -3487,11 +3524,6 @@ bool SLatDecoderModel::decode(
     const bool force_cpu = policy.kind == BackendPolicyKind::cpu;
     const bool force_gpu = policy.kind == BackendPolicyKind::gpu;
     const bool verbose = std::getenv("PIXAL3D_SLAT_VERBOSE") != nullptr;
-    const auto decode_start = std::chrono::steady_clock::now();
-    const auto elapsed = [start = decode_start]() {
-        return std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - start).count();
-    };
     if (!force_cpu) {
         std::string gpu_error;
         if (impl_->init_gpu(&gpu_error)) {
@@ -3502,9 +3534,6 @@ bool SLatDecoderModel::decode(
                                   &gpu_error)) {
                 output = std::move(gpu_output);
                 if (predicted_subdivisions) *predicted_subdivisions = std::move(gpu_subdivisions);
-                std::cerr << "pixal3d: " << impl_->component
-                          << " SLat GPU decode took " << elapsed() << " s"
-                          << std::endl;
                 return true;
             }
         }
@@ -3545,8 +3574,7 @@ bool SLatDecoderModel::decode(
                                                   error);
     if (verbose) {
         std::cerr << "pixal3d: " << impl_->component
-                  << " SLat CPU reference decode finished in " << elapsed()
-                  << " s" << std::endl;
+                  << " SLat CPU reference decode finished" << std::endl;
     }
     return decoded;
 }
@@ -3580,6 +3608,7 @@ bool SLatDecoderModel::upsample_coords(const SparseTensorF32 & input,
                                        int upsample_times,
                                        SparseTensorF32 & output,
                                        std::string * error) {
+    ProfileScope profiling(slat_decoder_profile_settings().mode, "SLat-decoder.upsample_coords");
     output = SparseTensorF32{};
     if (!impl_ || impl_->component != "shape_decoder" ||
         impl_->hp.model_class != "FlexiDualGridVaeDecoder" ||

@@ -1,4 +1,5 @@
 #include "pixal3d/backend.h"
+#include "pixal3d/cpu_threads.h"
 
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -9,7 +10,6 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
-#include <chrono>
 #include <utility>
 
 namespace pixal3d {
@@ -82,8 +82,8 @@ std::string bytes_string(std::size_t bytes) {
 }
 
 bool trace_enabled() {
-    const char * value = std::getenv("PIXAL3D_BACKEND_TRACE");
-    return value && *value && std::strcmp(value, "0") != 0;
+    return profile_mode_from_environment(nullptr, "PIXAL3D_BACKEND_TRACE") ==
+           ProfileMode::trace;
 }
 
 } // namespace
@@ -99,9 +99,7 @@ const char * backend_device_type_name(enum ggml_backend_dev_type type) noexcept 
 }
 
 double backend_time_now_ms() noexcept {
-    using clock = std::chrono::steady_clock;
-    return std::chrono::duration<double, std::milli>(
-        clock::now().time_since_epoch()).count();
+    return profile_time_now_ms();
 }
 
 void backend_log_timing(const char * stage,
@@ -194,11 +192,34 @@ std::string BackendPolicy::name() const {
     return "unknown";
 }
 
+std::vector<BackendDeviceInfo> backend_devices() {
+    std::vector<BackendDeviceInfo> devices;
+    const std::size_t count = ggml_backend_dev_count();
+    devices.reserve(count);
+    int gpu_index = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(index);
+        const int ordinal = is_gpu_type(ggml_backend_dev_type(device)) ? gpu_index++ : -1;
+        devices.push_back(describe_device(device, index, ordinal));
+    }
+    return devices;
+}
+
 BackendManager::~BackendManager() {
     close();
 }
 
 void BackendManager::close() noexcept {
+    if (profile_mode_ != ProfileMode::off && (allocation_calls_ || compute_calls_)) {
+        std::cerr << "pixal3d: profile stage=backend policy=" << policy_.name()
+                  << " backend=" << primary_name_
+                  << " allocations=" << allocation_calls_ << " computes=" << compute_calls_
+                  << " allocation_ms=" << allocation_ms_ << " compute_ms=" << compute_ms_
+                  << std::endl;
+    }
+    allocation_calls_ = compute_calls_ = 0;
+    allocation_ms_ = compute_ms_ = 0.0;
+    profile_mode_ = ProfileMode::off;
     for (ggml_backend_t backend : backends_) {
         if (backend && ggml_backend_is_cpu(backend)) {
             ggml_backend_cpu_set_threadpool(backend, nullptr);
@@ -240,6 +261,7 @@ bool BackendManager::initialize(const BackendPolicy & policy,
     if (error) error->clear();
     close();
     policy_ = policy;
+    profile_mode_ = profile_mode_from_environment(nullptr, "PIXAL3D_BACKEND_TRACE");
 
     struct DeviceEntry {
         ggml_backend_dev_t device = nullptr;
@@ -251,12 +273,12 @@ bool BackendManager::initialize(const BackendPolicy & policy,
     inventory.reserve(device_count);
     std::size_t selected_gpu_entry = no_entry;
     std::size_t cpu_entry = no_entry;
-    int gpu_count = 0;
-    for (std::size_t index = 0; index < device_count; ++index) {
+    const auto device_infos = backend_devices();
+    for (std::size_t index = 0; index < device_infos.size(); ++index) {
         ggml_backend_dev_t device = ggml_backend_dev_get(index);
         const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
-        const int ordinal = is_gpu_type(type) ? gpu_count++ : -1;
-        inventory.push_back({device, describe_device(device, index, ordinal)});
+        const int ordinal = device_infos[index].gpu_index;
+        inventory.push_back({device, device_infos[index]});
         const DeviceEntry & entry = inventory.back();
         std::cerr << "pixal3d: backend device " << index << ": "
                   << entry.info.description << " ("
@@ -336,11 +358,16 @@ bool BackendManager::initialize(const BackendPolicy & policy,
         return false;
     }
     register_backend(cpu, cpu_backend, false);
-    configure_cpu_threadpool(GGML_DEFAULT_N_THREADS);
+    const CpuThreadPolicy cpu_policy = cpu_thread_policy_from_environment();
+    if (!cpu_policy.warning.empty()) {
+        std::cerr << "pixal3d: " << cpu_policy.warning << std::endl;
+    }
+    set_n_threads(cpu_policy.threads);
     initialized_ = true;
     std::cerr << "pixal3d: backend manager ready (policy=" << policy.name()
               << ", backends=" << backends_.size()
-              << ", cpu_threads=" << cpu_threadpool_n_threads_ << ")" << std::endl;
+              << ", cpu_threads=" << cpu_threadpool_n_threads_
+              << ", cpu_threads_source=" << cpu_policy.source << ")" << std::endl;
     return true;
 }
 
@@ -397,7 +424,7 @@ bool BackendManager::supports_op(const ggml_tensor * op,
 void BackendManager::log_buffer(const char * phase,
                                 ggml_backend_t backend,
                                 std::size_t buffer_bytes) const noexcept {
-    if (!trace_enabled() || !backend) return;
+    if (profile_mode_ != ProfileMode::trace || !backend) return;
     ggml_backend_dev_t device = ggml_backend_get_device(backend);
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
@@ -410,6 +437,21 @@ void BackendManager::log_buffer(const char * phase,
               << " free=" << bytes_string(free_bytes)
               << " total=" << bytes_string(total_bytes)
               << std::endl;
+}
+
+void BackendManager::record_timing(const char * stage, bool allocation, double elapsed_ms) const noexcept {
+    if (allocation) {
+        ++allocation_calls_;
+        allocation_ms_ += elapsed_ms;
+    } else {
+        ++compute_calls_;
+        compute_ms_ += elapsed_ms;
+    }
+    if (profile_mode_ == ProfileMode::trace) {
+        std::cerr << "pixal3d: backend timing stage=" << stage << " phase="
+                  << (allocation ? "scheduler_allocate" : "scheduler_compute")
+                  << " elapsed_ms=" << elapsed_ms << std::endl;
+    }
 }
 
 bool BackendManager::configure_cpu_threadpool(int n_threads) const noexcept {
@@ -609,15 +651,13 @@ bool BackendScheduler::allocate_graph(ggml_cgraph * graph, std::string * error) 
     for (ggml_tensor * node : required_nodes_) {
         ggml_backend_sched_set_tensor_backend(scheduler_, node, manager_->primary());
     }
-    const double allocation_start = backend_time_now_ms();
+    const ProfileTimer allocation_timer(manager_->profile_mode() != ProfileMode::off);
     if (!ggml_backend_sched_alloc_graph(scheduler_, graph)) {
-        backend_log_timing(stage_.c_str(), "scheduler_allocate",
-                           backend_time_now_ms() - allocation_start);
+        if (allocation_timer.enabled()) manager_->record_timing(stage_.c_str(), true, allocation_timer.elapsed_ms());
         set_error(error, "failed to allocate ggml graph on configured backends");
         return false;
     }
-    backend_log_timing(stage_.c_str(), "scheduler_allocate",
-                       backend_time_now_ms() - allocation_start);
+    if (allocation_timer.enabled()) manager_->record_timing(stage_.c_str(), true, allocation_timer.elapsed_ms());
     if (!validate_placement(graph, error)) return false;
     log_trace(graph, "allocated");
     return true;
@@ -635,10 +675,10 @@ ggml_status BackendScheduler::compute(ggml_cgraph * graph, std::string * error) 
     if (!preflight(graph, error) || !validate_placement(graph, error)) {
         return GGML_STATUS_FAILED;
     }
-    const double compute_start = backend_time_now_ms();
+    manager_->set_n_threads(cpu_thread_count());
+    const ProfileTimer compute_timer(manager_->profile_mode() != ProfileMode::off);
     const ggml_status status = ggml_backend_sched_graph_compute(scheduler_, graph);
-    backend_log_timing(stage_.c_str(), "scheduler_compute",
-                       backend_time_now_ms() - compute_start);
+    if (compute_timer.enabled()) manager_->record_timing(stage_.c_str(), false, compute_timer.elapsed_ms());
     if (status != GGML_STATUS_SUCCESS) {
         set_error(error, "ggml backend scheduler graph compute failed");
     }
@@ -671,7 +711,8 @@ ggml_backend_t BackendScheduler::tensor_backend(ggml_tensor * node) const noexce
 
 void BackendScheduler::log_trace(ggml_cgraph * graph,
                                   const char * phase) const noexcept {
-    if (!trace_enabled() || !scheduler_ || !manager_ || !graph) return;
+    if (!scheduler_ || !manager_ || !graph ||
+        manager_->profile_mode() != ProfileMode::trace) return;
     const std::string prefix = stage_.empty() ? "backend" : stage_;
     std::cerr << "pixal3d: scheduler stage=" << prefix
               << " phase=" << (phase && *phase ? phase : "snapshot")

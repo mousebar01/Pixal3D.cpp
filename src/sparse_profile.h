@@ -138,7 +138,7 @@ private:
 
 class SparseProfileTimer {
 public:
-    SparseProfileTimer() noexcept = default;
+    SparseProfileTimer() noexcept {}
 
     SparseProfileTimer(std::uint64_t * calls, double * elapsed_ms) noexcept
         : calls_(calls), elapsed_ms_(elapsed_ms), start_(clock::now()) {}

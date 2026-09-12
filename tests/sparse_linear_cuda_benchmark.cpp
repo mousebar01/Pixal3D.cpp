@@ -1,5 +1,6 @@
 #include "pixal3d/backend.h"
 #include "pixal3d/sparse.h"
+#include "pixal3d/cpu_threads.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -243,7 +244,7 @@ void cpu_reference_linear(const std::vector<float> & input,
     // row-major [out_channel, in_channel].  The inner reduction order matches
     // src/sparse.cpp exactly.
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(pixal3d::cpu_thread_count()) if(pixal3d::cpu_should_parallelize(output.size()))
 #endif
     for (std::size_t point = 0; point < points; ++point) {
         const float * source = input.data() + point * static_cast<std::size_t>(input_channels);

@@ -1,4 +1,5 @@
 #include "pixal3d/slat_flow.h"
+#include "pixal3d/cpu_threads.h"
 
 #include "pixal3d/backend.h"
 #include "pixal3d/flow.h"
@@ -63,7 +64,7 @@ bool concat_sparse_features(const SparseTensorF32 & left,
     output.channels = left.channels + right.channels;
     output.feats.resize(left.points() * static_cast<std::size_t>(output.channels));
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.feats.size()))
 #endif
     for (std::size_t point = 0; point < left.points(); ++point) {
         const float * lhs = left.feats.data() + point * static_cast<std::size_t>(left.channels);
@@ -93,7 +94,7 @@ bool row_linear(const std::vector<float> & input, std::size_t rows, int input_ch
     if (!checked_count(rows, output_channels, expected, error)) return false;
     output.assign(expected, 0.0f);
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.size()))
 #endif
     for (std::size_t row = 0; row < rows; ++row) {
         const float * source = input.data() + row * static_cast<std::size_t>(input_channels);
@@ -210,7 +211,7 @@ bool slat_flow_forward_f32(
                             weights.timestep_weight2, weights.timestep_bias2,
                             timestep_embedding_values, error)) return false;
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(timestep_embedding_values.size()))
 #endif
     for (std::size_t index = 0; index < timestep_embedding_values.size(); ++index) {
         timestep_embedding_values[index] = silu(timestep_embedding_values[index]);
@@ -867,7 +868,7 @@ bool SLatFlowModel::Impl::forward_gpu(
         cnd = nullptr;
         proj = nullptr;
         result = nullptr;
-        const double graph_build_start = backend_time_now_ms();
+        const ProfileTimer graph_build_timer(backend_manager.profile_mode() == ProfileMode::trace);
     // Chunked long-sequence attention adds graph nodes for every query chunk
     // in every transformer block.  Keep the compact graph for short inputs,
     // but size the metadata arena from the actual point count so shape_1024
@@ -1077,8 +1078,10 @@ bool SLatFlowModel::Impl::forward_gpu(
     result = ggml_cont(ctx, h);
     ggml_set_output(result);
     ggml_build_forward_expand(graph, result);
-    backend_log_timing(hp.component.c_str(), "graph_build",
-                       backend_time_now_ms() - graph_build_start);
+    if (graph_build_timer.enabled()) {
+        backend_log_timing(hp.component.c_str(), "graph_build",
+                       graph_build_timer.elapsed_ms());
+    }
     BackendScheduler scheduler(backend_manager, graph_capacity, false, true,
                                 &scheduler_error, hp.component.c_str());
     if (!scheduler.valid() ||
@@ -1143,7 +1146,7 @@ bool SLatFlowModel::Impl::forward_gpu(
         runtime_scheduler.set_eval_callback(nullptr, nullptr);
     }
 
-    const double upload_start = backend_time_now_ms();
+    const ProfileTimer upload_timer(backend_manager.profile_mode() == ProfileMode::trace);
     ggml_backend_tensor_set(runtime_x, runtime_channel_major_input.data(), 0,
                             runtime_channel_major_input.size() * sizeof(float));
     ggml_backend_tensor_set(runtime_temb, runtime_embedding.data(), 0,
@@ -1167,8 +1170,10 @@ bool SLatFlowModel::Impl::forward_gpu(
         ggml_backend_tensor_set(runtime_projection, projection_context->feats.data(), 0,
                                 projection_context->feats.size() * sizeof(float));
     }
-    backend_log_timing(hp.component.c_str(), "input_upload",
-                       backend_time_now_ms() - upload_start);
+    if (upload_timer.enabled()) {
+        backend_log_timing(hp.component.c_str(), "input_upload",
+                       upload_timer.elapsed_ms());
+    }
     if (std::getenv("PIXAL3D_SLAT_TRACE")) {
         std::cerr << "pixal3d: SLat GPU rope_upload="
                   << (rope_uploaded ? "yes" : "skip") << std::endl;
@@ -1187,11 +1192,13 @@ bool SLatFlowModel::Impl::forward_gpu(
         ok = false;
     }
     if (ok) {
-        const double download_start = backend_time_now_ms();
+        const ProfileTimer download_timer(backend_manager.profile_mode() == ProfileMode::trace);
         ggml_backend_tensor_get(runtime_result, runtime_output_scratch.data(), 0,
                                 runtime_output_scratch.size() * sizeof(float));
-        backend_log_timing(hp.component.c_str(), "output_download",
-                           backend_time_now_ms() - download_start);
+        if (download_timer.enabled()) {
+            backend_log_timing(hp.component.c_str(), "output_download",
+                           download_timer.elapsed_ms());
+        }
         output.batch_size = input_for_model->batch_size;
         output.channels = hp.out_channels;
         output.spatial_x = input_for_model->spatial_x;

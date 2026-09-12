@@ -1,6 +1,7 @@
 #include "pixal3d/ss_decoder.h"
 
 #include "pixal3d/backend.h"
+#include "pixal3d/cpu_threads.h"
 #include "pixal3d/pack.h"
 
 #include "ggml-alloc.h"
@@ -443,7 +444,7 @@ bool SSDecoderModel::decode(const float * latent,
 
     Impl::Runtime & runtime = impl_->runtime;
     if (!runtime.ctx) {
-        const double graph_build_start = backend_time_now_ms();
+        const ProfileTimer graph_build_timer(impl_->backend_manager.profile_mode() == ProfileMode::trace);
         const std::size_t graph_memory = ggml_tensor_overhead() * 8192 +
                                          ggml_graph_overhead_custom(8192, false);
         ggml_init_params graph_params{};
@@ -588,8 +589,10 @@ bool SSDecoderModel::decode(const float * latent,
             return false;
         }
         ggml_build_forward_expand(runtime.graph, runtime.output);
-        backend_log_timing("SS-decoder", "graph_build",
-                           backend_time_now_ms() - graph_build_start);
+        if (graph_build_timer.enabled()) {
+            backend_log_timing("SS-decoder", "graph_build",
+                           graph_build_timer.elapsed_ms());
+        }
         std::string scheduler_error;
         runtime.scheduler = BackendScheduler(impl_->backend_manager, 8192, false, true,
                                              &scheduler_error, "SS-decoder");
@@ -603,23 +606,27 @@ bool SSDecoderModel::decode(const float * latent,
         }
     }
 
-    impl_->backend_manager.set_n_threads(4);
-    const double upload_start = backend_time_now_ms();
+    impl_->backend_manager.set_n_threads(cpu_thread_count());
+    const ProfileTimer upload_timer(impl_->backend_manager.profile_mode() == ProfileMode::trace);
     ggml_backend_tensor_set(runtime.input, latent, 0,
                             static_cast<std::size_t>(hp.latent_channels) *
                             input_points * sizeof(float));
-    backend_log_timing("SS-decoder", "input_upload",
-                       backend_time_now_ms() - upload_start);
+    if (upload_timer.enabled()) {
+        backend_log_timing("SS-decoder", "input_upload",
+                       upload_timer.elapsed_ms());
+    }
     std::string scheduler_error;
     const ggml_status status = runtime.scheduler.compute(runtime.graph, &scheduler_error);
     bool ok = status == GGML_STATUS_SUCCESS;
     if (ok) {
-        const double download_start = backend_time_now_ms();
+        const ProfileTimer download_timer(impl_->backend_manager.profile_mode() == ProfileMode::trace);
         ggml_backend_tensor_get(runtime.output, output, 0,
                                 static_cast<std::size_t>(hp.out_channels) *
                                 output_points * sizeof(float));
-        backend_log_timing("SS-decoder", "output_download",
-                           backend_time_now_ms() - download_start);
+        if (download_timer.enabled()) {
+            backend_log_timing("SS-decoder", "output_download",
+                           download_timer.elapsed_ms());
+        }
     } else {
         set_error(error, "ss-decoder graph compute failed: " + scheduler_error);
     }

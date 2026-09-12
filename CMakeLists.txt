@@ -19,10 +19,19 @@ option(PIXAL3D_USE_BUNDLED_GGML
        "Use the top-level ggml submodule" ON)
 option(PIXAL3D_ENABLE_CUDA
        "Enable the ggml CUDA backend (requires a CUDA toolchain)" OFF)
+# These options map to the pinned ggml backend options, not stage support claims.
+foreach(backend VULKAN SYCL HIP)
+    option(PIXAL3D_ENABLE_${backend} "Enable the ggml ${backend} backend" OFF)
+endforeach()
+option(PIXAL3D_ENABLE_METAL "Enable the ggml Metal backend" ${APPLE})
 set(PIXAL3D_CUDA_ARCHITECTURES "" CACHE STRING
     "CUDA architectures for the custom postprocess kernels (empty uses the compiler default)")
+set(PIXAL3D_GGML_CUDA_ARCHITECTURES "" CACHE STRING
+    "CUDA architectures for bundled ggml (empty uses ggml's portable default)")
+option(PIXAL3D_GGML_CCACHE
+       "Use ccache or sccache for bundled ggml and outer compilation when available" OFF)
 option(PIXAL3D_CUDA_TF32
-       "Allow CUDA TF32 tensor operations (faster, but not F32-exact)" OFF)
+       "Unsupported legacy option; pinned ggml does not expose TF32 control" OFF)
 option(PIXAL3D_XATLAS_PROFILE
        "Enable xatlas internal CPU phase profiling" OFF)
 option(PIXAL3D_GGML_NATIVE
@@ -39,6 +48,38 @@ set(PIXAL3D_GGML_SOURCE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/ggml"
     CACHE PATH "Path to the project ggml submodule")
 
+if(PIXAL3D_GGML_CUDA_ARCHITECTURES)
+    if(NOT PIXAL3D_ENABLE_CUDA)
+        message(WARNING
+            "PIXAL3D_GGML_CUDA_ARCHITECTURES is set but "
+            "PIXAL3D_ENABLE_CUDA=OFF; the value will be ignored.")
+    elseif(NOT PIXAL3D_USE_BUNDLED_GGML)
+        message(WARNING
+            "PIXAL3D_GGML_CUDA_ARCHITECTURES only configures bundled ggml; "
+            "configure the installed ggml package separately.")
+    else()
+        # This project option is intentionally separate from
+        # PIXAL3D_CUDA_ARCHITECTURES, which only controls the custom QEM target.
+        # Set the CMake variable before add_subdirectory() so ggml's own CUDA
+        # backend consumes the same architecture list.
+        set(CMAKE_CUDA_ARCHITECTURES "${PIXAL3D_GGML_CUDA_ARCHITECTURES}"
+            CACHE STRING "CUDA architectures for bundled ggml" FORCE)
+        message(STATUS
+            "Pixal3D: bundled ggml CUDA architectures="
+            "${PIXAL3D_GGML_CUDA_ARCHITECTURES}")
+    endif()
+elseif(PIXAL3D_ENABLE_CUDA AND DEFINED CMAKE_CUDA_ARCHITECTURES)
+    message(STATUS
+        "Pixal3D: using caller-provided CMAKE_CUDA_ARCHITECTURES="
+        "${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+
+if(PIXAL3D_GGML_CCACHE AND NOT PIXAL3D_USE_BUNDLED_GGML)
+    message(WARNING
+        "PIXAL3D_GGML_CCACHE only configures bundled ggml; "
+        "configure the installed ggml package separately.")
+endif()
+
 if(PIXAL3D_USE_BUNDLED_GGML)
     if(NOT EXISTS "${PIXAL3D_GGML_SOURCE_DIR}/CMakeLists.txt")
         message(FATAL_ERROR
@@ -50,22 +91,35 @@ if(PIXAL3D_USE_BUNDLED_GGML)
     set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(GGML_NATIVE ${PIXAL3D_GGML_NATIVE} CACHE BOOL "" FORCE)
-    set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
+    set(GGML_CCACHE ${PIXAL3D_GGML_CCACHE} CACHE BOOL "" FORCE)
     set(GGML_CUDA ${PIXAL3D_ENABLE_CUDA} CACHE BOOL "" FORCE)
-    if(PIXAL3D_ENABLE_CUDA AND NOT PIXAL3D_CUDA_TF32)
-        # This definition must be visible while the ggml subdirectory is
-        # configured: its CUDA handle is created in the bundled backend.
-        add_compile_definitions(GGML_CUDA_DISABLE_TF32=1)
+    message(STATUS
+        "Pixal3D: bundled ggml ccache="
+        "${PIXAL3D_GGML_CCACHE}")
+    set(GGML_CPU ON CACHE BOOL "Required final fallback" FORCE)
+    foreach(backend VULKAN METAL SYCL HIP)
+        set(GGML_${backend} ${PIXAL3D_ENABLE_${backend}} CACHE BOOL "" FORCE)
+    endforeach()
+    if(PIXAL3D_ENABLE_CUDA)
+        message(WARNING
+            "PIXAL3D_CUDA_TF32 is unsupported by the pinned ggml: "
+            "GGML_CUDA_DISABLE_TF32 does not exist. This option does not "
+            "control TF32; validate numerical behavior independently.")
     endif()
     add_subdirectory("${PIXAL3D_GGML_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/ggml")
     set(PIXAL3D_GGML_TARGET ggml)
 else()
+    message(STATUS
+        "Pixal3D: installed ggml controls available graph backends; "
+        "PIXAL3D_ENABLE_* does not configure that package")
     find_package(ggml CONFIG REQUIRED)
     set(PIXAL3D_GGML_TARGET ggml::ggml)
 endif()
 
 add_library(pixal3d_core
     src/backend.cpp
+    src/cpu_threads.cpp
+    src/profile.cpp
     src/condition.cpp
     src/dino.cpp
     src/dino_vit.cpp
@@ -190,6 +244,9 @@ include(CTest)
 if(BUILD_TESTING AND PIXAL3D_BUILD_CLI)
     add_test(NAME pixal3d_help COMMAND pixal3d --help)
     add_test(NAME pixal3d_version COMMAND pixal3d --version)
+    add_test(NAME pixal3d_list_devices COMMAND pixal3d --list-devices)
+    set_tests_properties(pixal3d_list_devices PROPERTIES
+        LABELS "backend;cpu" PASS_REGULAR_EXPRESSION "type=CPU")
     add_executable(pixal3d_projection_test tests/test_projection.cpp)
     target_compile_features(pixal3d_projection_test PRIVATE cxx_std_17)
     target_link_libraries(pixal3d_projection_test PRIVATE pixal3d_core)
@@ -217,11 +274,24 @@ if(BUILD_TESTING AND PIXAL3D_BUILD_CLI)
     target_link_libraries(pixal3d_dino_test PRIVATE pixal3d_core)
     add_test(NAME pixal3d_dino COMMAND pixal3d_dino_test)
     set_tests_properties(pixal3d_dino PROPERTIES LABELS "unit;cpu")
+    add_executable(pixal3d_profile_test tests/profile_test.cpp)
+    target_compile_features(pixal3d_profile_test PRIVATE cxx_std_17)
+    target_link_libraries(pixal3d_profile_test PRIVATE pixal3d_core)
+    add_test(NAME pixal3d_profile COMMAND pixal3d_profile_test)
+    set_tests_properties(pixal3d_profile PROPERTIES LABELS "unit;cpu;backend;profile")
+    add_test(NAME pixal3d_profile_uv_bake COMMAND pixal3d_profile_test --mesh)
+    set_tests_properties(pixal3d_profile_uv_bake PROPERTIES LABELS "unit;cpu;parity;profile"
+        TIMEOUT 30)
     add_executable(pixal3d_backend_manager_test tests/backend_manager_test.cpp)
     target_compile_features(pixal3d_backend_manager_test PRIVATE cxx_std_17)
     target_link_libraries(pixal3d_backend_manager_test PRIVATE pixal3d_core)
     add_test(NAME pixal3d_backend_manager COMMAND pixal3d_backend_manager_test)
     set_tests_properties(pixal3d_backend_manager PROPERTIES LABELS "unit;backend;cpu")
+    add_executable(pixal3d_cpu_threads_test tests/cpu_threads_test.cpp)
+    target_compile_features(pixal3d_cpu_threads_test PRIVATE cxx_std_17)
+    target_link_libraries(pixal3d_cpu_threads_test PRIVATE pixal3d_core)
+    add_test(NAME pixal3d_cpu_threads COMMAND pixal3d_cpu_threads_test)
+    set_tests_properties(pixal3d_cpu_threads PROPERTIES LABELS "unit;cpu")
     if(PIXAL3D_ENABLE_CUDA)
         add_executable(pixal3d_backend_cuda_matmul_test
             tests/backend_cuda_matmul_test.cpp)

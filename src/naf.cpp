@@ -1,4 +1,5 @@
 #include "pixal3d/naf.h"
+#include "pixal3d/cpu_threads.h"
 
 #include "pixal3d/backend.h"
 #include "pixal3d/pack.h"
@@ -287,7 +288,7 @@ bool conv_reflect(const std::vector<float> & input,
     output.assign(output_size, 0.0f);
     const int radius = kernel / 2;
 #if defined(_OPENMP)
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.size()))
 #endif
     for (int oc = 0; oc < out_channels; ++oc) {
         for (int y = 0; y < height; ++y) {
@@ -337,7 +338,7 @@ bool group_norm(const std::vector<float> & input,
     const std::size_t plane = static_cast<std::size_t>(height) * width;
     output.resize(input.size());
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(input.size()))
 #endif
     for (int group = 0; group < groups; ++group) {
         const int first = group * channels_per_group;
@@ -386,7 +387,7 @@ bool adaptive_avg_pool(const std::vector<float> & input,
     const std::size_t output_plane = static_cast<std::size_t>(output_height) * output_width;
     output.assign(static_cast<std::size_t>(channels) * output_plane, 0.0f);
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.size()))
 #endif
     for (int channel = 0; channel < channels; ++channel) {
         for (int oy = 0; oy < output_height; ++oy) {
@@ -431,7 +432,7 @@ bool bilinear_resize(const std::vector<float> & input,
     const std::size_t output_plane = static_cast<std::size_t>(output_height) * output_width;
     output.assign(static_cast<std::size_t>(channels) * output_plane, 0.0f);
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.size()))
 #endif
     for (int channel = 0; channel < channels; ++channel) {
         for (int oy = 0; oy < output_height; ++oy) {
@@ -897,7 +898,7 @@ bool NafModel::upsample(const float * image,
     const std::size_t output_plane = static_cast<std::size_t>(output_height) * output_width;
     std::vector<float> q = pooled;
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(q.size()))
 #endif
     for (int head = 0; head < hp.heads_rope; ++head) {
         for (int y = 0; y < output_height; ++y) {
@@ -946,7 +947,7 @@ bool NafModel::upsample(const float * image,
     output.channels = low_channels;
     output.features.assign(static_cast<std::size_t>(output_height) * output_width * low_channels, 0.0f);
 #if defined(_OPENMP)
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(static) num_threads(cpu_thread_count()) if(cpu_should_parallelize(output.features.size()))
 #endif
     for (int y = 0; y < output_height; ++y) {
         for (int x = 0; x < output_width; ++x) {

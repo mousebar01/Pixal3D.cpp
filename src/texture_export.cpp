@@ -2,10 +2,10 @@
 
 #include "pixal3d/mesh_postprocess.h"
 #include "pixal3d/tri_bvh.h"
+#include "pixal3d/profile.h"
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -239,22 +239,19 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
     // validated end to end against the reference postprocess.
     std::vector<float> verts(mesh.vertices.begin(), mesh.vertices.end());
     std::vector<std::int32_t> faces(mesh.faces.begin(), mesh.faces.end());
-    const auto export_start = std::chrono::steady_clock::now();
-    auto phase_start = export_start;
-    const auto phase_log = [&export_start, &phase_start](const std::string & label) {
-        const auto now = std::chrono::steady_clock::now();
-        const double exclusive = std::chrono::duration<double>(now - phase_start).count();
-        const double cumulative = std::chrono::duration<double>(now - export_start).count();
-        std::cerr << "pixal3d: export phase=" << label
-                  << " exclusive=" << exclusive
-                  << " s cumulative=" << cumulative << " s" << std::endl;
-        phase_start = now;
+    ProfileScope profiling(profile_mode_from_environment(), "texture_export");
+    const auto phase_log = [&profiling](const char * label) {
+        profiling.phase(label);
     };
     weld_vertices(verts, faces, nullptr, 1.0f / 8192.0f);
     clean_mesh(static_cast<int>(verts.size() / 3), faces);
     drop_small_components(verts, faces, 0.02f);
     taubin_smooth(verts, faces, 5, 0.5f, -0.53f);
-    phase_log("weld+clean+smooth (" + std::to_string(faces.size() / 3) + " faces)");
+    if (profiling.tracing()) {
+        const std::string label = "weld+clean+smooth (" +
+                                  std::to_string(faces.size() / 3) + " faces)";
+        phase_log(label.c_str());
+    }
 
     // Snap BVH over the pre-decimation surface, the equivalent of the
     // reference cuBVH off-shell correction for texels between voxels.
@@ -270,15 +267,22 @@ bool write_pixal3d_glb(const DualGridMeshF32 & mesh,
                           static_cast<int>(options.simplify_target),
                           decimated_verts, decimated_faces);
     fill_small_holes(decimated_faces, 64);
-    phase_log("qem decimate (" + std::to_string(faces.size() / 3) + " -> " +
-              std::to_string(decimated_faces.size() / 3) + " faces)");
+    if (profiling.tracing()) {
+        const std::string label = "qem decimate (" +
+                                  std::to_string(faces.size() / 3) + " -> " +
+                                  std::to_string(decimated_faces.size() / 3) + " faces)";
+        phase_log(label.c_str());
+    }
 
     const BakedMesh baked = uv_bake(
         decimated_verts, static_cast<int>(decimated_verts.size() / 3),
         decimated_faces, static_cast<int>(decimated_faces.size() / 3),
         {}, options.texture_size, &vox);
-    phase_log("uv bake (" + std::to_string(baked.T) + "x" +
-              std::to_string(baked.T) + ")");
+    if (profiling.tracing()) {
+        const std::string label = "uv bake (" + std::to_string(baked.T) + "x" +
+                                  std::to_string(baked.T) + ")";
+        phase_log(label.c_str());
+    }
     if (!baked.ok()) {
         set_error(error, "texture bake produced no usable mesh");
         return false;

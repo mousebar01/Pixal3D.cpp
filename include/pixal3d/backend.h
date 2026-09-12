@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-backend.h"
+#include "pixal3d/profile.h"
 
 #include <cstddef>
 #include <string>
@@ -42,6 +43,10 @@ struct BackendDeviceInfo {
     std::size_t memory_total = 0;
 };
 
+// Registry inventory without initializing execution backends. GPU ordinals
+// match BackendPolicy; CPU and ACCEL devices never consume a GPU ordinal.
+std::vector<BackendDeviceInfo> backend_devices();
+
 // Shared backend ownership and policy for all Pixal3D stages.  The backend
 // list is ordered with the selected GPU/IGPU first (when present), ACCEL
 // devices next, and CPU last so it is directly usable by ggml_backend_sched.
@@ -60,6 +65,7 @@ public:
     void close() noexcept;
 
     bool initialized() const noexcept { return initialized_; }
+    ProfileMode profile_mode() const noexcept { return profile_mode_; }
     const BackendPolicy & policy() const noexcept { return policy_; }
     const std::vector<ggml_backend_t> & backends() const noexcept { return backends_; }
     const std::vector<BackendDeviceInfo> & devices() const noexcept { return devices_; }
@@ -92,7 +98,14 @@ public:
     }
 
 private:
+    friend class BackendScheduler;
     bool configure_cpu_threadpool(int n_threads) const noexcept;
+    void record_timing(const char * stage, bool allocation, double elapsed_ms) const noexcept;
+    ProfileMode profile_mode_ = ProfileMode::off;
+    mutable std::size_t allocation_calls_ = 0;
+    mutable std::size_t compute_calls_ = 0;
+    mutable double allocation_ms_ = 0.0;
+    mutable double compute_ms_ = 0.0;
 
     BackendPolicy policy_;
     std::vector<ggml_backend_t> backends_;
@@ -160,7 +173,8 @@ const char * backend_device_type_name(enum ggml_backend_dev_type type) noexcept;
 // graph placement or numerical behavior.
 double backend_time_now_ms() noexcept;
 
-// Emit one timing record when PIXAL3D_BACKEND_TRACE is enabled.
+// Emit one timing record when global/legacy backend trace is enabled.
+// Callers must gate timer collection too; this function only filters output.
 void backend_log_timing(const char * stage,
                         const char * phase,
                         double elapsed_ms) noexcept;
