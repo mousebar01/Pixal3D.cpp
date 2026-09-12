@@ -31,6 +31,26 @@
 namespace pixal3d {
 
 namespace {
+
+// Optional diagnostics for xatlas experiments. They are intentionally disabled
+// by default so the production path keeps the reference PackOptions and does
+// not pay for extra statistics.
+bool env_bool(const char *name, bool fallback) {
+    const char *value = std::getenv(name);
+    if (!value || !*value) return fallback;
+    return value[0] == '1' || value[0] == 'y' || value[0] == 'Y' ||
+           value[0] == 't' || value[0] == 'T';
+}
+
+uint32_t env_uint(const char *name, uint32_t fallback) {
+    const char *value = std::getenv(name);
+    if (!value || !*value) return fallback;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || parsed > UINT32_MAX) return fallback;
+    return static_cast<uint32_t>(parsed);
+}
+
 // Trilinear sampler over the sparse voxel PBR field. Missing corner voxels
 // drop out of the weighted sum (renormalized); a texel with no populated
 // corner stays unwritten and is filled by seam dilation, matching the
@@ -753,6 +773,61 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     }
     phase_log("precluster");
 
+    if (env_bool("PIXAL3D_XATLAS_CLUSTER_STATS", false)) {
+        std::vector<size_t> histogram(33, 0);
+        double total_area = 0.0;
+        double area_le_1 = 0.0, area_le_2 = 0.0, area_le_4 = 0.0, area_le_8 = 0.0;
+        size_t max_faces = 0;
+        for (const auto & cluster : clusters) {
+            const size_t face_count = cluster.size();
+            histogram[std::min(face_count, histogram.size() - 1)]++;
+            max_faces = std::max(max_faces, face_count);
+            double area = 0.0;
+            for (const int f : cluster) {
+                const int ia = faces[3 * f + 0];
+                const int ib = faces[3 * f + 1];
+                const int ic = faces[3 * f + 2];
+                const float ab[3] = {
+                    verts[3 * ib + 0] - verts[3 * ia + 0],
+                    verts[3 * ib + 1] - verts[3 * ia + 1],
+                    verts[3 * ib + 2] - verts[3 * ia + 2]};
+                const float ac[3] = {
+                    verts[3 * ic + 0] - verts[3 * ia + 0],
+                    verts[3 * ic + 1] - verts[3 * ia + 1],
+                    verts[3 * ic + 2] - verts[3 * ia + 2]};
+                const float cx = ab[1] * ac[2] - ab[2] * ac[1];
+                const float cy = ab[2] * ac[0] - ab[0] * ac[2];
+                const float cz = ab[0] * ac[1] - ab[1] * ac[0];
+                area += 0.5 * std::sqrt(static_cast<double>(cx) * cx +
+                                        static_cast<double>(cy) * cy +
+                                        static_cast<double>(cz) * cz);
+            }
+            total_area += area;
+            if (face_count <= 1) area_le_1 += area;
+            if (face_count <= 2) area_le_2 += area;
+            if (face_count <= 4) area_le_4 += area;
+            if (face_count <= 8) area_le_8 += area;
+        }
+        std::fprintf(stderr,
+                     "pixal3d: xatlas cluster stats clusters=%zu faces=%d max_faces=%zu total_area=%.9g\n",
+                     clusters.size(), static_cast<int>(big_faces.size()), max_faces, total_area);
+        std::fprintf(stderr,
+                     "pixal3d: xatlas cluster area <=1: %.6f (%.3f%%), <=2: %.6f (%.3f%%), <=4: %.6f (%.3f%%), <=8: %.6f (%.3f%%)\n",
+                     area_le_1, total_area > 0.0 ? 100.0 * area_le_1 / total_area : 0.0,
+                     area_le_2, total_area > 0.0 ? 100.0 * area_le_2 / total_area : 0.0,
+                     area_le_4, total_area > 0.0 ? 100.0 * area_le_4 / total_area : 0.0,
+                     area_le_8, total_area > 0.0 ? 100.0 * area_le_8 / total_area : 0.0);
+        std::fprintf(stderr, "pixal3d: xatlas cluster face histogram");
+        for (size_t i = 1; i < histogram.size(); ++i) {
+            if (histogram[i] == 0) continue;
+            if (i < histogram.size() - 1)
+                std::fprintf(stderr, " %zu:%zu", i, histogram[i]);
+            else
+                std::fprintf(stderr, " >=%zu:%zu", i, histogram[i]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+
     struct ClusterMesh {
         std::vector<float> v;
         std::vector<int32_t> fidx, l2orig;
@@ -832,6 +907,24 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     // packing at the bake resolution; chart-to-chart bleed at 0 padding is
     // handled by the inpaint (as in the reference).
     xatlas::PackOptions po;
+    // Keep the reference defaults unless a profiling experiment explicitly
+    // opts in. xatlas documents blockAlign as a packing-speed optimization,
+    // but it changes chart placement, so it must never be an implicit quality
+    // or semantics change.
+    po.bilinear = env_bool("PIXAL3D_XATLAS_BILINEAR", po.bilinear);
+    po.blockAlign = env_bool("PIXAL3D_XATLAS_BLOCK_ALIGN", po.blockAlign);
+    po.bruteForce = env_bool("PIXAL3D_XATLAS_BRUTE_FORCE", po.bruteForce);
+    po.rotateCharts = env_bool("PIXAL3D_XATLAS_ROTATE_CHARTS", po.rotateCharts);
+    po.rotateChartsToAxis = env_bool("PIXAL3D_XATLAS_ROTATE_TO_AXIS", po.rotateChartsToAxis);
+    po.maxChartSize = env_uint("PIXAL3D_XATLAS_MAX_CHART_SIZE", po.maxChartSize);
+    po.resolution = env_uint("PIXAL3D_XATLAS_RESOLUTION", po.resolution);
+    if (env_bool("PIXAL3D_XATLAS_LOG_OPTIONS", false)) {
+        std::fprintf(stderr,
+                     "pixal3d: xatlas pack options bilinear=%d block_align=%d brute_force=%d rotate=%d rotate_to_axis=%d max_chart_size=%u resolution=%u\n",
+                     po.bilinear ? 1 : 0, po.blockAlign ? 1 : 0, po.bruteForce ? 1 : 0,
+                     po.rotateCharts ? 1 : 0, po.rotateChartsToAxis ? 1 : 0,
+                     po.maxChartSize, po.resolution);
+    }
     xatlas::PackCharts(atlas, po);
     if (atlas->meshCount == 0 || atlas->width == 0) { xatlas::Destroy(atlas); return out; }
     phase_log("xatlas_pack_charts");
